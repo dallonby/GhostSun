@@ -41,7 +41,7 @@ impl Default for TuneParams {
         TuneParams {
             w_fit: 8.0,
             pca_k: 3.0,
-            mu_range: 1.5,
+            mu_range: 3.0,
             depth_gate: 0.10,
             transp_deadband: 0.012,
             transv_deadband: 0.004,
@@ -303,19 +303,32 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let use_profile = opts.profile_extraction && !opts.baseline;
 
     let (mut disk, flex, mut velocity_raw): (Image, Vec<f64>, Option<Image>) = if use_profile {
-        let maps = profile::extract_profile(&reader, &geom, &mean_img, transpose, opts.shift, &ptune);
+        let (maps, on_gpu) =
+            profile::extract_profile_auto(&reader, &geom, &mean_img, transpose, opts.shift, &ptune, opts.use_gpu);
+        vlog!(opts, "extraction [{}]", if on_gpu { "gpu" } else { "cpu" });
         // F3: flexure. Preferred source: telluric anchor lines (absolute,
         // immune to solar Doppler — keeps the full trend including the part
         // degenerate with rotation). Fallback: solar-line estimator
         // (nonlinear component only).
-        let flex = match profile::estimate_flexure_telluric(&maps, 3.0) {
+        let mut v_row: Option<Vec<f64>> = None;
+        let flex = match profile::estimate_flexure_telluric(&maps, &smile, 3.0) {
             Some(tf) => {
                 vlog!(
                     opts,
-                    "flexure: telluric-anchored, {} line(s) at offsets {:?} px",
+                    "flexure: telluric-anchored, {} line(s) at offsets {:?} px (dispersion {:.4} A/px)",
                     tf.n_lines,
-                    tf.line_offsets.iter().map(|o| *o as i64).collect::<Vec<_>>()
+                    tf.line_offsets.iter().map(|o| *o as i64).collect::<Vec<_>>(),
+                    tf.dispersion
                 );
+                if std::env::var("GS_NO_VROW").is_err() {
+                    v_row = profile::slit_velocity_from_telluric(
+                        &mean_img, &smile, geom.y1, geom.y2, &tf.line_offsets,
+                    );
+                    if let Some(vr) = &v_row {
+                        let amp = vr.iter().cloned().fold(0.0f64, |m, v| m.max(v.abs()));
+                        vlog!(opts, "slit-velocity (telluric-referenced smile): +-{:.2} px", amp);
+                    }
+                }
                 tf.flex
             }
             None => {
@@ -326,7 +339,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         let fmax = flex.iter().cloned().fold(0.0f64, |m, v| m.max(v.abs()));
         vlog!(opts, "flexure: max {:.3} px", fmax);
         // F2: velocity map (raw disk coords)
-        let vel = profile::velocity_map(&maps, &smile, &flex);
+        let vel = profile::velocity_map(&maps, &smile, &flex, v_row.as_deref());
         (maps.core, flex, Some(vel))
     } else {
         let exopts = ExtractOptions {

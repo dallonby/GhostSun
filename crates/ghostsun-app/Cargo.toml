@@ -6,7 +6,7 @@ license.workspace = true
 description = "GhostSun desktop app (Metal-accelerated on Apple Silicon)"
 
 [[bin]]
-name = "GhostSun"
+name = "ghostsun-app"
 path = "src/main.rs"
 
 [dependencies]

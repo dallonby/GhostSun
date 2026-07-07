@@ -44,12 +44,12 @@ pub struct ProfileTune {
 
 impl Default for ProfileTune {
     fn default() -> Self {
-        ProfileTune { w_fit: 8, pca_k: 3, mu_range: 1.5, depth_gate: 0.10 }
+        ProfileTune { w_fit: 8, pca_k: 3, mu_range: 3.0, depth_gate: 0.10 }
     }
 }
 
 /// Per-row line width from the mean image, smoothed over rows.
-fn fit_sigma_rows(mean_img: &Image, geom: &LineGeometry) -> Vec<f64> {
+pub(crate) fn fit_sigma_rows(mean_img: &Image, geom: &LineGeometry) -> Vec<f64> {
     let h = mean_img.h;
     let mut sig = vec![f64::NAN; h];
     for y in geom.y1..=geom.y2.min(h - 1) {
@@ -79,21 +79,21 @@ fn fit_sigma_rows(mean_img: &Image, geom: &LineGeometry) -> Vec<f64> {
     gaussian_smooth(&filled, 15.0)
 }
 
-struct ColumnFit {
-    core: Vec<f32>,
-    mu: Vec<f32>,
-    depth: Vec<f32>,
+pub(crate) struct ColumnFit {
+    pub(crate) core: Vec<f32>,
+    pub(crate) mu: Vec<f32>,
+    pub(crate) depth: Vec<f32>,
     /// mu-centered residual vectors (2w+1 per row), for PCA
-    resid: Vec<f32>,
+    pub(crate) resid: Vec<f32>,
     /// model scale C per row (to normalize residuals)
-    cscale: Vec<f32>,
+    pub(crate) cscale: Vec<f32>,
     /// continuum-weighted de-smiled mean spectrum of this frame
-    spec: Vec<f64>,
-    spec_w: f64,
+    pub(crate) spec: Vec<f64>,
+    pub(crate) spec_w: f64,
 }
 
 /// Fit one frame (columns of the output disk). Returns per-row results.
-fn fit_frame(
+pub(crate) fn fit_frame(
     frame: &Image,
     smile: &[f64],
     sigma_row: &[f64],
@@ -133,7 +133,7 @@ fn fit_frame(
         // scan mu candidates; (C, D) linear per candidate
         let mut best = (f64::MAX, center, 0.0f64, 0.0f64); // sse, mu, c, d
         let mut sses: Vec<(f64, f64)> = Vec::with_capacity(11);
-        let steps = 11;
+        let steps = 21;
         for k in 0..steps {
             let mu = center - tune.mu_range + 2.0 * tune.mu_range * k as f64 / (steps - 1) as f64;
             let (mut n, mut sg, mut sgg, mut sv, mut svg) = (0.0f64, 0.0, 0.0, 0.0, 0.0);
@@ -226,6 +226,27 @@ fn fit_frame(
 }
 
 /// Full profile-model extraction of the disk (plus mu/depth maps).
+/// Tries the GPU kernel first when allowed; CPU is fallback + reference.
+pub fn extract_profile_auto(
+    reader: &SerReader,
+    geom: &LineGeometry,
+    mean_img: &Image,
+    transpose: bool,
+    shift: f64,
+    tune: &ProfileTune,
+    use_gpu: bool,
+) -> (ProfileMaps, bool) {
+    if use_gpu {
+        if let Some(maps) =
+            crate::gpu_extract::extract_profile_gpu(reader, geom, mean_img, transpose, shift, tune)
+        {
+            return (maps, true);
+        }
+    }
+    (extract_profile(reader, geom, mean_img, transpose, shift, tune), false)
+}
+
+/// CPU reference implementation.
 pub fn extract_profile(
     reader: &SerReader,
     geom: &LineGeometry,
@@ -351,9 +372,15 @@ pub struct TelluricFlex {
     pub flex: Vec<f64>,
     pub n_lines: usize,
     pub line_offsets: Vec<f64>,
+    /// fitted spectral dispersion (A/px) from the anchor pattern
+    pub dispersion: f64,
 }
 
-pub fn estimate_flexure_telluric(maps: &ProfileMaps, core_sigma: f64) -> Option<TelluricFlex> {
+pub fn estimate_flexure_telluric(
+    maps: &ProfileMaps,
+    _smile: &[f64],
+    core_sigma: f64,
+) -> Option<TelluricFlex> {
     let n = maps.frame_spec.len();
     let m = maps.spec_offsets.len();
     if n < 100 || m < 30 {
@@ -412,8 +439,8 @@ pub fn estimate_flexure_telluric(maps: &ProfileMaps, core_sigma: f64) -> Option<
         for &t in &good {
             let sp = &maps.frame_spec[t];
             // local 5-pt window search around the nominal position
-            let lo = k0.saturating_sub(2).max(1);
-            let hi = (k0 + 3).min(m - 1);
+            let lo = k0.saturating_sub(4).max(1);
+            let hi = (k0 + 5).min(m - 1);
             let mut kmin = lo;
             let mut vmin = f64::MAX;
             for k in lo..hi {
@@ -448,34 +475,52 @@ pub fn estimate_flexure_telluric(maps: &ProfileMaps, core_sigma: f64) -> Option<
             }
         }
     }
-    // slope agreement: reject lines whose linear trend disagrees with the
-    // median trend (solar lines carry a rotation ramp)
-    let slopes: Vec<f64> = shifts
-        .iter()
-        .map(|sh| {
-            let pts: Vec<(f64, f64)> = (0..n)
-                .filter(|&t| sh[t].is_finite())
-                .map(|t| (t as f64, sh[t]))
-                .collect();
-            if pts.len() < 50 {
-                return f64::NAN;
-            }
-            let xs: Vec<f64> = pts.iter().map(|p| p.0).collect();
-            let ys: Vec<f64> = pts.iter().map(|p| p.1).collect();
-            let ws = vec![1.0; xs.len()];
-            crate::mathutil::polyfit_robust(&xs, &ys, &ws, 1, 3)
-                .map(|c| c[1] * n as f64)
-                .unwrap_or(f64::NAN)
+    // Solar-vs-telluric classification by WAVELENGTH MATCHING. Slope-based
+    // voting is degenerate whenever the scan runs along the rotation axis
+    // (rotation then lives along the slit, not across frames — observed on
+    // real N-S scans where every anchor shares the flexure slope). Instead
+    // fit a dispersion that matches the anchor offsets against the H2O
+    // telluric catalog around Halpha; anchors landing on H2O lines are
+    // telluric.
+    let h2o: [f64; 11] = [
+        6543.91, 6548.62, 6552.63, 6557.17, 6558.15, 6560.50, 6561.10,
+        6564.21, 6565.53, 6568.81, 6572.08,
+    ];
+    let solar_lines: [f64; 4] = [6546.24, 6551.68, 6559.58, 6569.21];
+    let halpha = 6562.801;
+    let offs: Vec<f64> = anchors.iter().map(|&k| maps.spec_offsets[k]).collect();
+    let mut best = (f64::MAX, 0.0f64);
+    let mut disp = 0.03;
+    while disp <= 0.25 {
+        let mut tot = 0.0;
+        for &o in &offs {
+            let lam = halpha + o * disp;
+            let d1 = h2o.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+            let d2 = solar_lines.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+            tot += d1.min(d2);
+        }
+        if tot < best.0 {
+            best = (tot, disp);
+        }
+        disp += 0.0005;
+    }
+    let disp = best.1;
+    let keep: Vec<usize> = (0..anchors.len())
+        .filter(|&a| {
+            let lam = halpha + offs[a] * disp;
+            let d_h2o = h2o.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+            let d_sol = solar_lines.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+            d_h2o < 0.15 && d_h2o < d_sol
         })
         .collect();
-    let mut sv: Vec<f64> = slopes.iter().cloned().filter(|v| v.is_finite()).collect();
-    if sv.is_empty() {
-        return None;
+    if std::env::var("GS_DEBUG").is_ok() {
+        eprintln!(
+            "[telluric] dispersion {:.4} A/px, anchors {:?} -> telluric {:?}",
+            disp,
+            offs.iter().map(|o| *o as i64).collect::<Vec<_>>(),
+            keep.iter().map(|&a| offs[a] as i64).collect::<Vec<_>>()
+        );
     }
-    let med_slope = crate::mathutil::median_inplace(&mut sv);
-    let keep: Vec<usize> = (0..anchors.len())
-        .filter(|&a| slopes[a].is_finite() && (slopes[a] - med_slope).abs() < 0.35)
-        .collect();
     if keep.is_empty() {
         return None;
     }
@@ -517,6 +562,7 @@ pub fn estimate_flexure_telluric(maps: &ProfileMaps, core_sigma: f64) -> Option<
         flex: out,
         n_lines: keep.len(),
         line_offsets: keep.iter().map(|&a| maps.spec_offsets[anchors[a]]).collect(),
+        dispersion: disp,
     })
 }
 
@@ -578,8 +624,10 @@ pub fn estimate_flexure(maps: &ProfileMaps, smile: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// F2: velocity map (px) = mu - smile - flex, depth-weighted robust smoothing.
-pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64]) -> Image {
+/// F2: velocity map (px) = mu - smile - flex + v_row, depth-weighted robust
+/// smoothing. `v_row` restores slit-direction solar velocity absorbed by
+/// the smile fit (see slit_velocity_from_telluric).
+pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64], v_row: Option<&[f64]>) -> Image {
     let w = maps.mu.w;
     let h = maps.mu.h;
     let mut v = Image::new(w, h);
@@ -587,7 +635,8 @@ pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64]) -> Image {
         for y in 0..h {
             let m = maps.mu.at(t, y);
             if m.is_finite() && maps.depth.at(t, y) > 0.15 {
-                v.set(t, y, (m as f64 - smile[y] - flex[t]) as f32);
+                let add = v_row.map(|r| r[y]).unwrap_or(0.0);
+                v.set(t, y, (m as f64 - smile[y] - flex[t] + add) as f32);
             } else {
                 v.set(t, y, f32::NAN);
             }
@@ -623,4 +672,94 @@ pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64]) -> Image {
         }
     }
     sm
+}
+
+
+/// Solar velocity along the SLIT, recovered via the telluric reference.
+///
+/// The smile polynomial is fitted to the Halpha trace, so any static solar
+/// velocity structure along the slit (e.g. rotation when the scan runs
+/// north-south) is absorbed into it and vanishes from the Dopplergram. A
+/// telluric line's per-row curve traces pure instrument curvature; the
+/// difference smile(y) - telluric_curve(y), mean-removed, is the missing
+/// solar term. Measured on the mean image (thousands of frames of SNR).
+pub fn slit_velocity_from_telluric(
+    mean_img: &Image,
+    smile: &[f64],
+    y1: usize,
+    y2: usize,
+    tell_offsets: &[f64],
+) -> Option<Vec<f64>> {
+    let h = mean_img.h;
+    let margin = ((y2 - y1) / 20).clamp(5, 40);
+    let (ya, yb) = (y1 + margin, y2.saturating_sub(margin));
+    if yb <= ya + 60 || tell_offsets.is_empty() {
+        return None;
+    }
+    let mut vy_acc = vec![0.0f64; h];
+    let mut n_used = 0usize;
+    for &off in tell_offsets {
+        let mut xs: Vec<f64> = Vec::new();
+        let mut ys: Vec<f64> = Vec::new();
+        for y in ya..yb {
+            let row = mean_img.row(y);
+            let x0 = smile[y] + off;
+            let lo = (x0 - 4.0).max(1.0) as usize;
+            let hi = ((x0 + 5.0) as usize).min(row.len() - 2);
+            if hi <= lo + 3 {
+                continue;
+            }
+            let mut kmin = lo;
+            let mut vmin = f32::MAX;
+            for k in lo..hi {
+                if row[k] < vmin {
+                    vmin = row[k];
+                    kmin = k;
+                }
+            }
+            if kmin == 0 || kmin + 1 >= row.len() {
+                continue;
+            }
+            let (vm, v0, vp) = (row[kmin - 1] as f64, row[kmin] as f64, row[kmin + 1] as f64);
+            let den = vm - 2.0 * v0 + vp;
+            if den <= 1e-9 {
+                continue;
+            }
+            let frac = (0.5 * (vm - vp) / den).clamp(-0.8, 0.8);
+            xs.push(y as f64);
+            ys.push(kmin as f64 + frac);
+        }
+        if xs.len() < 60 {
+            continue;
+        }
+        let ws = vec![1.0; xs.len()];
+        let Some(curve) = crate::mathutil::polyfit_robust(&xs, &ys, &ws, 2, 4) else {
+            continue;
+        };
+        // Only the LINEAR-in-y component is attributable to solar rotation:
+        // the quadratic difference between the Halpha smile and a telluric
+        // curve is wavelength-dependent instrument curvature (measured at
+        // +-2 px on real data — 4x larger than rotation!), and the constant
+        // is the wavelength separation. Averaging anchors that BRACKET
+        // Halpha cancels instrumental keystone (linear-in-lambda tilt) to
+        // first order while rotation, common to both, survives.
+        let diff: Vec<f64> = (ya..yb)
+            .map(|y| smile[y] - (crate::mathutil::polyval(&curve, y as f64) - off))
+            .collect();
+        let dy: Vec<f64> = (ya..yb).map(|y| y as f64).collect();
+        let dws = vec![1.0; diff.len()];
+        if let Some(lin) = crate::mathutil::polyfit_robust(&dy, &diff, &dws, 1, 3) {
+            for y in 0..h {
+                vy_acc[y] += lin[1] * (y as f64 - (ya + yb) as f64 / 2.0);
+            }
+            n_used += 1;
+        }
+    }
+    if n_used == 0 {
+        return None;
+    }
+    for v in vy_acc.iter_mut() {
+        *v /= n_used as f64;
+    }
+    Some(vy_acc)
 }

@@ -38,6 +38,9 @@ struct SynthArgs {
     /// enable Doppler velocity field (rotation + turbulence)
     #[arg(long)]
     doppler: bool,
+    /// rotation gradient along the slit (N-S scan geometry)
+    #[arg(long)]
+    doppler_ns: bool,
     /// spectral flexure amplitude in px (0 = off)
     #[arg(long, default_value_t = 0.0)]
     flexure: f64,
@@ -73,6 +76,7 @@ impl SynthArgs {
             radius: self.radius,
             clean: self.clean,
             doppler: self.doppler,
+            doppler_ns: self.doppler_ns,
             flexure_px: self.flexure,
             psf_seeing_px: self.psf,
             n_scans: self.scans,
@@ -375,6 +379,66 @@ fn main() {
                     );
                 }
                 None => println!("NLM : GPU unavailable"),
+            }
+            // profile extraction (needs a synthetic SER scan)
+            {
+                use ghostsun_core::{linefit, profile};
+                let dir = std::path::PathBuf::from("/tmp/gs_gpucheck");
+                std::fs::create_dir_all(&dir).unwrap();
+                let ser = std::env::var("GS_CHECK_SER").map(std::path::PathBuf::from).unwrap_or(dir.join("synth.ser"));
+                if !ser.exists() {
+                    let params = synth::SynthParams { n_frames: 600, ..Default::default() };
+                    synth::generate(&params, &ser, &dir.join("gt.png")).unwrap();
+                }
+                let reader = ghostsun_core::ser::SerReader::open(&ser).unwrap();
+                let transpose = reader.header.width > reader.header.height;
+                // mean image (subsampled)
+                let n = reader.header.frame_count;
+                let mut acc: Option<Vec<f64>> = None;
+                let (mut mw, mut mh) = (0usize, 0usize);
+                let mut cnt = 0.0;
+                let mut t = 0;
+                while t < n {
+                    let mut f = reader.frame(t);
+                    if transpose { f = f.transpose(); }
+                    if f.mean() > 500.0 {
+                        mw = f.w; mh = f.h;
+                        let a = acc.get_or_insert_with(|| vec![0.0; mw * mh]);
+                        for (i, &v) in f.data.iter().enumerate() { a[i] += v as f64; }
+                        cnt += 1.0;
+                    }
+                    t += 3;
+                }
+                let mut mean_img = Image::new(mw, mh);
+                for (i, v) in acc.unwrap().iter().enumerate() {
+                    mean_img.data[i] = (v / cnt) as f32;
+                }
+                let geo = linefit::fit_line_geometry(&mean_img, 2).unwrap();
+                let tune = profile::ProfileTune::default();
+                let t0 = std::time::Instant::now();
+                let cpu = profile::extract_profile(&reader, &geo, &mean_img, transpose, 0.0, &tune);
+                let t_cpu = t0.elapsed().as_secs_f64();
+                let t0 = std::time::Instant::now();
+                match ghostsun_core::gpu_extract::extract_profile_gpu(&reader, &geo, &mean_img, transpose, 0.0, &tune) {
+                    Some(gout) => {
+                        let t_gpu = t0.elapsed().as_secs_f64();
+                        let peak = 30000.0f64;
+                        let mut md_core = 0.0f64;
+                        let mut md_mu = 0.0f64;
+                        for i in 0..cpu.core.data.len() {
+                            md_core = md_core.max((cpu.core.data[i] - gout.core.data[i]).abs() as f64 / peak);
+                            let (a, b) = (cpu.mu.data[i], gout.mu.data[i]);
+                            if a.is_finite() && b.is_finite() {
+                                md_mu = md_mu.max((a - b).abs() as f64);
+                            }
+                        }
+                        println!(
+                            "EXTR: core max rel {:.2e}  mu max {:.2e} px  cpu {:.3}s  gpu {:.3}s  ({:.1}x)",
+                            md_core, md_mu, t_cpu, t_gpu, t_cpu / t_gpu
+                        );
+                    }
+                    None => println!("EXTR: GPU unavailable"),
+                }
             }
             // warp
             let geom = ellmod::Conic {

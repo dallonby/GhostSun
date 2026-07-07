@@ -36,6 +36,8 @@ pub struct SynthParams {
     pub clean: bool,
     /// enable a Doppler velocity field (rotation + turbulence)
     pub doppler: bool,
+    /// rotation gradient along the SLIT axis instead of the scan axis
+    pub doppler_ns: bool,
     /// spectral dispersion for velocity <-> px conversion
     pub dispersion_kms_per_px: f64,
     /// peak slow spectral drift of the line over the scan (px); 0 = off
@@ -66,6 +68,7 @@ impl Default for SynthParams {
             seed: 42,
             clean: false,
             doppler: false,
+            doppler_ns: false,
             dispersion_kms_per_px: 5.0,
             flexure_px: 0.0,
             psf_seeing_px: 0.0,
@@ -261,11 +264,16 @@ impl SunModel {
     /// Line-of-sight velocity in spectral px: solar rotation (linear in x)
     /// plus small-scale turbulence. Zero off-disk.
     pub fn velocity_px(&self, x: f64, y: f64, dispersion_kms_per_px: f64) -> f64 {
+        self.velocity_px_axis(x, y, dispersion_kms_per_px, false)
+    }
+
+    pub fn velocity_px_axis(&self, x: f64, y: f64, dispersion_kms_per_px: f64, ns: bool) -> f64 {
         let r = (x * x + y * y).sqrt();
         if r >= self.radius {
             return 0.0;
         }
-        let rot_kms = 2.0 * (x / self.radius); // +-2 km/s at the limbs
+        let along = if ns { y } else { x };
+        let rot_kms = 2.0 * (along / self.radius); // +-2 km/s at the limbs
         let turb_px = 0.15 * fbm(x, y, self.seed + 777, 3, 20.0);
         rot_kms / dispersion_kms_per_px + turb_px
     }
@@ -289,12 +297,12 @@ impl SunModel {
         img
     }
 
-    pub fn render_ground_truth_velocity(&self, size: usize, dispersion: f64) -> Image {
+    pub fn render_ground_truth_velocity(&self, size: usize, dispersion: f64, ns: bool) -> Image {
         let mut img = Image::new(size, size);
         let c = size as f64 / 2.0;
         for yy in 0..size {
             for xx in 0..size {
-                let v = self.velocity_px(xx as f64 - c, yy as f64 - c, dispersion);
+                let v = self.velocity_px_axis(xx as f64 - c, yy as f64 - c, dispersion, ns);
                 img.set(xx, yy, v as f32);
             }
         }
@@ -499,7 +507,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
                     icont += w * ic;
                     icore += w * ik;
                     if p.doppler {
-                        vel += w * model.velocity_px(sun_x + ox, sun_y + oy, p.dispersion_kms_per_px);
+                        vel += w * model.velocity_px_axis(sun_x + ox, sun_y + oy, p.dispersion_kms_per_px, p.doppler_ns);
                     }
                 }
                 let line_center = c0 + c1 * ycs + c2 * ycs * ycs + flex[t] + vel;
@@ -591,7 +599,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
         crate::output::write_png16(&dir.join("ground_truth_blurred.png"), &gtb, Some((0.0, gtb.max())))?;
     }
     if p.doppler {
-        let gtv = model.render_ground_truth_velocity(gt_size, p.dispersion_kms_per_px);
+        let gtv = model.render_ground_truth_velocity(gt_size, p.dispersion_kms_per_px, p.doppler_ns);
         let mut enc = Image::new(gtv.w, gtv.h);
         for i in 0..gtv.data.len() {
             enc.data[i] = ((gtv.data[i] as f64 / VEL_SCALE + 1.0) / 2.0 * 65535.0).clamp(0.0, 65535.0) as f32;

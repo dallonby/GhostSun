@@ -308,7 +308,7 @@ fn style(ctx: &egui::Context) {
     let mut st = (*ctx.style()).clone();
     st.spacing.item_spacing = egui::vec2(10.0, 8.0);
     st.spacing.button_padding = egui::vec2(12.0, 6.0);
-    st.spacing.slider_width = 170.0;
+    st.spacing.slider_width = 150.0;
     ctx.set_style(st);
 }
 
@@ -368,11 +368,16 @@ impl eframe::App for App {
             });
         });
 
-        egui::SidePanel::left("side").exact_width(300.0).show(ctx, |ui| {
+        egui::SidePanel::left("side")
+            .resizable(true)
+            .default_width(320.0)
+            .width_range(260.0..=520.0)
+            .show(ctx, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.add_space(8.0);
             if let Some(loaded) = &self.loaded {
                 egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
-                    ui.label(egui::RichText::new(&loaded.name).strong());
+                    ui.add(egui::Label::new(egui::RichText::new(&loaded.name).strong()).wrap());
                     ui.label(format!("{} × {} px", loaded.image.w, loaded.image.h));
                     if let Some(prep) = &loaded.prep {
                         ui.label(format!("disk radius {:.0} px", prep.disk.r));
@@ -382,13 +387,14 @@ impl eframe::App for App {
             }
 
             ui.heading("Hα rendering");
+            ui.spacing_mut().slider_width = (ui.available_width() - 120.0).max(120.0);
+            ui.label("prominence boost");
             let r1 = ui.add(
-                egui::Slider::new(&mut self.prom_boost, 1.0..=10.0)
-                    .text("prominence boost")
-                    .fixed_decimals(1),
+                egui::Slider::new(&mut self.prom_boost, 1.0..=10.0).fixed_decimals(1),
             );
+            ui.label("disk gamma");
             let r2 = ui.add(
-                egui::Slider::new(&mut self.gamma, 0.4..=1.2).text("disk gamma").fixed_decimals(2),
+                egui::Slider::new(&mut self.gamma, 0.4..=1.2).fixed_decimals(2),
             );
             if r1.changed() || r2.changed() {
                 self.color_dirty = true;
@@ -421,11 +427,20 @@ impl eframe::App for App {
             ui.add_space(8.0);
             ui.separator();
             ui.heading("Log");
-            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                for line in &self.log {
-                    ui.label(egui::RichText::new(line).small().monospace());
-                }
-            });
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    for line in &self.log {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(line).size(11.0).monospace().weak(),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
         });
 
         egui::CentralPanel::default()

@@ -9,10 +9,11 @@ use crate::image2d::Image;
 use std::sync::OnceLock;
 
 pub struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     nlm: wgpu::ComputePipeline,
     warp: wgpu::ComputePipeline,
+    pub(crate) extract: OnceLock<wgpu::ComputePipeline>,
 }
 
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
@@ -34,6 +35,11 @@ impl Gpu {
         limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
         limits.max_buffer_size = al.max_buffer_size;
         limits.max_compute_workgroups_per_dimension = al.max_compute_workgroups_per_dimension;
+        limits.max_storage_buffers_per_shader_stage = al.max_storage_buffers_per_shader_stage;
+        limits.max_bindings_per_bind_group = al.max_bindings_per_bind_group;
+        limits.max_compute_invocations_per_workgroup = al.max_compute_invocations_per_workgroup;
+        limits.max_compute_workgroup_size_x = al.max_compute_workgroup_size_x;
+        limits.max_compute_workgroup_storage_size = al.max_compute_workgroup_storage_size;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("ghostsun"),
@@ -59,7 +65,7 @@ impl Gpu {
         };
         let nlm = make(NLM_WGSL, "nlm");
         let warp = make(WARP_WGSL, "warp");
-        Some(Gpu { device, queue, nlm, warp })
+        Some(Gpu { device, queue, nlm, warp, extract: OnceLock::new() })
     }
 
     /// Run a compute pipeline: src f32 buffer + uniform params -> dst f32.

@@ -83,6 +83,18 @@ impl SerReader {
         Ok(SerReader { header, mmap, bytes_per_px })
     }
 
+    /// Raw bytes of `count` consecutive frames starting at `start`.
+    pub fn raw_frames(&self, start: usize, count: usize) -> &[u8] {
+        let (w, h) = (self.header.width, self.header.height);
+        let fsize = w * h * self.bytes_per_px;
+        let off = HEADER_SIZE + start * fsize;
+        &self.mmap[off..off + fsize * count]
+    }
+
+    pub fn bytes_per_px(&self) -> usize {
+        self.bytes_per_px
+    }
+
     /// Load frame as f32 image in native orientation.
     /// 8-bit data is scaled by 257 to occupy the 16-bit range like 16-bit data.
     pub fn frame(&self, idx: usize) -> Image {
