@@ -274,6 +274,9 @@ fn save_recon_outputs(dir: &Path, name: &str, rep: &pipeline::ReconReport, veloc
             write_velocity_png(&dir.join(format!("{name}_velocity.png")), v).unwrap();
             output::write_fits_f32(&dir.join(format!("{name}_velocity.fits")), v).unwrap();
         }
+        if let Some(wd) = &rep.wing_doppler {
+            output::write_fits_f32(&dir.join(format!("{name}_wingdopp.fits")), wd).unwrap();
+        }
     }
 }
 

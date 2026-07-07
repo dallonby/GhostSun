@@ -152,8 +152,11 @@ impl Default for ReconOptions {
 pub struct ReconReport {
     pub output: WarpOutput,
     pub raw_disk: Image,
-    /// F2: warped Doppler velocity map (px), when profile extraction is on
+    /// F2: warped line-core velocity map (px), when profile extraction is on
     pub velocity: Option<Image>,
+    /// Wing-difference Dopplergram (R-B)/(R+B) at +-wing offset — the
+    /// INTI-style, bisector-depth Doppler product (rotation-sensitive)
+    pub wing_doppler: Option<Image>,
     /// F3: estimated per-frame flexure (px)
     pub flex: Vec<f64>,
     /// F6: fitted PSF (sigma_x, sigma_y) when deconvolution ran
@@ -547,6 +550,57 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     vlog!(opts, "output: {}x{}", output.image.w, output.image.h);
     stage!("limb+ellipse+warp");
 
+    // Wing-difference Dopplergram: intensities at +-wing_offset from the
+    // (flexure-corrected) line center; the normalized difference cancels
+    // column gains and transversalium and is maximally shift-sensitive
+    // (wing slope), measuring at bisector depths where rotation is clean.
+    let wing_doppler: Option<Image> = if use_profile && !opts.baseline {
+        let wing = 6.0f64;
+        let offsets: Option<Vec<f64>> = if std::env::var("GS_WING_NOFLEX").is_ok() {
+            None // INTI-condition: wings extracted without flexure correction
+        } else if flex.iter().any(|f| f.abs() > 0.0) {
+            Some(flex.clone())
+        } else {
+            None
+        };
+        let mk = |sh: f64| {
+            reconstruct_disk(&reader, &geom, &ExtractOptions {
+                shift: opts.shift + sh,
+                baseline: false,
+                transpose_input: transpose,
+                window_sigma: 1.0,
+                frame_offsets: offsets.clone(),
+            })
+        };
+        let blue = mk(-wing);
+        let red = mk(wing);
+        let ithresh = crate::mathutil::percentile_f32(&blue.data, 80.0) * 0.25;
+        let mut wd = Image::new(blue.w, blue.h);
+        for i in 0..wd.data.len() {
+            let (b, r) = (blue.data[i] as f64, red.data[i] as f64);
+            if b + r > 2.0 * ithresh as f64 {
+                wd.data[i] = ((r - b) / (r + b)) as f32;
+            }
+        }
+        // align with the corrected core image
+        let mut wd = jitter::apply_shifts(&wd, &jitter_applied);
+        wd = jitter::apply_x_offsets(&wd, &xreg_applied);
+        vlog!(opts, "wing Dopplergram at +-{:.0} px", wing);
+        Some(wd)
+    } else {
+        None
+    };
+    let wing_doppler = wing_doppler.map(|wd| {
+        let wp_v = WarpParams { filtered_downscale: false, allow_negative: true, ..wp };
+        if opts.use_gpu {
+            crate::gpu::warp_single(&wd, &fit.geom, &wp_v)
+                .unwrap_or_else(|| warp_single(&wd, &fit.geom, &wp_v))
+                .image
+        } else {
+            warp_single(&wd, &fit.geom, &wp_v).image
+        }
+    });
+
     // warp the velocity map with identical geometry (unfiltered kernel: the
     // map is already smoothed and NaN-free)
     let velocity = velocity_raw.map(|v| {
@@ -592,6 +646,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         output,
         raw_disk,
         velocity,
+        wing_doppler,
         flex,
         psf_sigma,
         line_rms: geom.rms,
