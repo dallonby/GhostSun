@@ -438,27 +438,16 @@ pub fn estimate_flexure_telluric(
     for (a, &k0) in anchors.iter().enumerate() {
         for &t in &good {
             let sp = &maps.frame_spec[t];
-            // local 5-pt window search around the nominal position
-            let lo = k0.saturating_sub(4).max(1);
-            let hi = (k0 + 5).min(m - 1);
-            let mut kmin = lo;
-            let mut vmin = f64::MAX;
-            for k in lo..hi {
-                if (sp[k] as f64) < vmin {
-                    vmin = sp[k] as f64;
-                    kmin = k;
-                }
-            }
-            if kmin == 0 || kmin + 1 >= m {
+            let lo = k0.saturating_sub(7).max(1);
+            let hi = (k0 + 8).min(m - 1);
+            if hi <= lo + 9 {
                 continue;
             }
-            let (vm, v0, vp) = (sp[kmin - 1] as f64, sp[kmin] as f64, sp[kmin + 1] as f64);
-            let den = vm - 2.0 * v0 + vp;
-            if den <= 1e-12 {
-                continue;
+            let wx: Vec<f64> = (lo..hi).map(|k| maps.spec_offsets[k]).collect();
+            let wv: Vec<f64> = (lo..hi).map(|k| sp[k] as f64).collect();
+            if let Some(pos) = baseline_corrected_dip(&wx, &wv, maps.spec_offsets[k0], 2.5) {
+                shifts[a][t] = pos - maps.spec_offsets[k0];
             }
-            let frac = (0.5 * (vm - vp) / den).clamp(-0.8, 0.8);
-            shifts[a][t] = maps.spec_offsets[kmin] + frac - maps.spec_offsets[k0];
         }
         // center each line's series on its own median
         let mut valid: Vec<f64> = shifts[a].iter().cloned().filter(|v| v.is_finite()).collect();
@@ -523,6 +512,35 @@ pub fn estimate_flexure_telluric(
     }
     if keep.is_empty() {
         return None;
+    }
+    if std::env::var("GS_DUMP").is_ok() {
+        // per-frame series: Halpha median shift + each anchor's shift
+        let ha: Vec<f64> = (0..n)
+            .map(|t| {
+                let mut devs: Vec<f64> = (0..maps.mu.h)
+                    .filter(|&y| maps.depth.at(t, y) > 0.15 && maps.mu.at(t, y).is_finite())
+                    .map(|y| maps.mu.at(t, y) as f64 - _smile[y])
+                    .collect();
+                if devs.len() > 50 {
+                    crate::mathutil::median_inplace(&mut devs)
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+        let mut out = String::from("t,ha");
+        for &k in anchors.iter() {
+            out.push_str(&format!(",a{}", maps.spec_offsets[k] as i64));
+        }
+        out.push('\n');
+        for t in 0..n {
+            out.push_str(&format!("{},{:.4}", t, ha[t]));
+            for a in 0..anchors.len() {
+                out.push_str(&format!(",{:.4}", shifts[a][t]));
+            }
+            out.push('\n');
+        }
+        let _ = std::fs::write("/tmp/anchor_series.csv", out);
     }
     // combine: median over kept lines per frame, fill, light smoothing
     let mut flex = vec![f64::NAN; n];
@@ -630,11 +648,16 @@ pub fn estimate_flexure(maps: &ProfileMaps, smile: &[f64]) -> Vec<f64> {
 pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64], v_row: Option<&[f64]>) -> Image {
     let w = maps.mu.w;
     let h = maps.mu.h;
+    // Velocity is only meaningful where there is real absorption signal.
+    // Depth alone is NOT enough: an absorption fit on sky NOISE routinely
+    // fakes >15% depth, filling the background with +-3 px garbage that
+    // then wrecks display normalization. Gate on continuum intensity too.
+    let ithresh = crate::mathutil::percentile_f32(&maps.core.data, 80.0) * 0.25;
     let mut v = Image::new(w, h);
     for t in 0..w {
         for y in 0..h {
             let m = maps.mu.at(t, y);
-            if m.is_finite() && maps.depth.at(t, y) > 0.15 {
+            if m.is_finite() && maps.depth.at(t, y) > 0.15 && maps.core.at(t, y) > ithresh {
                 let add = v_row.map(|r| r[y]).unwrap_or(0.0);
                 v.set(t, y, (m as f64 - smile[y] - flex[t] + add) as f32);
             } else {
@@ -675,6 +698,61 @@ pub fn velocity_map(maps: &ProfileMaps, smile: &[f64], flex: &[f64], v_row: Opti
 }
 
 
+/// Sub-pixel minimum of a weak dip on a sloping/curved background: fit a
+/// robust quadratic BASELINE to the flank samples (|dx| > core), divide it
+/// out, then parabola on the corrected dip. Without this, the background
+/// slope (the Halpha wing under every telluric anchor) drags the minimum —
+/// the measured anchor then partially TRACKS solar Doppler shifts and the
+/// flexure subtraction cancels real rotation.
+fn baseline_corrected_dip(xs: &[f64], vs: &[f64], x0: f64, core_hw: f64) -> Option<f64> {
+    let flank_x: Vec<f64> = xs
+        .iter()
+        .zip(vs)
+        .filter(|(x, _)| (**x - x0).abs() > core_hw)
+        .map(|(x, _)| *x)
+        .collect();
+    let flank_v: Vec<f64> = xs
+        .iter()
+        .zip(vs)
+        .filter(|(x, _)| (**x - x0).abs() > core_hw)
+        .map(|(_, v)| *v)
+        .collect();
+    if flank_x.len() < 5 {
+        return None;
+    }
+    let ws = vec![1.0; flank_x.len()];
+    let base = crate::mathutil::polyfit_robust(&flank_x, &flank_v, &ws, 2, 3)?;
+    // corrected ratio over the full window
+    let ratio: Vec<f64> = xs
+        .iter()
+        .zip(vs)
+        .map(|(x, v)| {
+            let b = crate::mathutil::polyval(&base, *x);
+            if b > 1e-9 { v / b } else { 1.0 }
+        })
+        .collect();
+    // discrete min within the core region
+    let mut kmin = None;
+    let mut vmin = f64::MAX;
+    for (k, x) in xs.iter().enumerate() {
+        if (x - x0).abs() <= core_hw + 1.0 && ratio[k] < vmin {
+            vmin = ratio[k];
+            kmin = Some(k);
+        }
+    }
+    let k = kmin?;
+    if k == 0 || k + 1 >= ratio.len() {
+        return None;
+    }
+    let (vm, v0, vp) = (ratio[k - 1], ratio[k], ratio[k + 1]);
+    let den = vm - 2.0 * v0 + vp;
+    if den <= 1e-12 {
+        return None;
+    }
+    let step = xs[1] - xs[0];
+    Some(xs[k] + step * (0.5 * (vm - vp) / den).clamp(-0.8, 0.8))
+}
+
 /// Solar velocity along the SLIT, recovered via the telluric reference.
 ///
 /// The smile polynomial is fitted to the Halpha trace, so any static solar
@@ -704,30 +782,17 @@ pub fn slit_velocity_from_telluric(
         for y in ya..yb {
             let row = mean_img.row(y);
             let x0 = smile[y] + off;
-            let lo = (x0 - 4.0).max(1.0) as usize;
-            let hi = ((x0 + 5.0) as usize).min(row.len() - 2);
-            if hi <= lo + 3 {
+            let lo = (x0 - 7.0).max(1.0) as usize;
+            let hi = ((x0 + 8.0) as usize).min(row.len() - 2);
+            if hi <= lo + 9 {
                 continue;
             }
-            let mut kmin = lo;
-            let mut vmin = f32::MAX;
-            for k in lo..hi {
-                if row[k] < vmin {
-                    vmin = row[k];
-                    kmin = k;
-                }
+            let wx: Vec<f64> = (lo..hi).map(|k| k as f64).collect();
+            let wv: Vec<f64> = (lo..hi).map(|k| row[k] as f64).collect();
+            if let Some(pos) = baseline_corrected_dip(&wx, &wv, x0, 2.5) {
+                xs.push(y as f64);
+                ys.push(pos);
             }
-            if kmin == 0 || kmin + 1 >= row.len() {
-                continue;
-            }
-            let (vm, v0, vp) = (row[kmin - 1] as f64, row[kmin] as f64, row[kmin + 1] as f64);
-            let den = vm - 2.0 * v0 + vp;
-            if den <= 1e-9 {
-                continue;
-            }
-            let frac = (0.5 * (vm - vp) / den).clamp(-0.8, 0.8);
-            xs.push(y as f64);
-            ys.push(kmin as f64 + frac);
         }
         if xs.len() < 60 {
             continue;

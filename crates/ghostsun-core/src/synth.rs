@@ -377,6 +377,10 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
     let c1 = 0.008;
     let c2 = 6.0 / (yc_slit * yc_slit); // ~6 px sagitta at slit ends
     let sigma_line = 2.3;
+    // real Halpha has broad wings; weak tellurics SIT on those wings and
+    // their minima get dragged by the wing slope (the bias under test)
+    let wing_sigma = 13.0;
+    let wing_frac = 0.45;
     let line_depth_quiet: f64 = 0.82;
 
     let mut truth_out: Option<SynthTruth> = None;
@@ -518,7 +522,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
                     }
                     // fixed wavelength offsets from the smile; move with flexure only
                     let t1 = smile_here + flex[t] - 20.0;
-                    let t2 = smile_here + flex[t] + 26.0;
+                    let t2 = smile_here + flex[t] + 17.0;
                     (1.0 - 0.10 * (-((x - t1) * (x - t1)) / (2.0 * 1.5 * 1.5)).exp())
                         * (1.0 - 0.06 * (-((x - t2) * (x - t2)) / (2.0 * 1.5 * 1.5)).exp())
                 };
@@ -532,7 +536,9 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
                         .min(0.995);
                     for (x, px) in row.iter_mut().enumerate() {
                         let dx = x as f64 - line_center;
-                        let prof = 1.0 - depth * (-(dx * dx) / (2.0 * sigma_line * sigma_line)).exp();
+                        let g_core = (-(dx * dx) / (2.0 * sigma_line * sigma_line)).exp();
+                        let g_wing = (-(dx * dx) / (2.0 * wing_sigma * wing_sigma)).exp();
+                        let prof = 1.0 - depth * ((1.0 - wing_frac) * g_core + wing_frac * g_wing);
                         let signal = (icont * prof * gain * tell(x as f64)).max(0.0);
                         let noise = if p.clean {
                             0.0

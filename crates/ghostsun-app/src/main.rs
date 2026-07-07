@@ -277,8 +277,10 @@ fn gray_to_color(img: &Image, lo: f32, hi: f32) -> egui::ColorImage {
 }
 
 fn velocity_to_color(v: &Image) -> egui::ColorImage {
-    let abs: Vec<f32> = v.data.iter().map(|x| x.abs()).collect();
-    let mag = percentile_f32(&abs, 99.0).max(1e-3);
+    // normalize over measured (nonzero) pixels only — the background is
+    // masked to exactly zero and must not set the scale
+    let abs: Vec<f32> = v.data.iter().filter(|x| **x != 0.0).map(|x| x.abs()).collect();
+    let mag = if abs.is_empty() { 1.0 } else { percentile_f32(&abs, 98.0).max(1e-3) };
     let mut px = Vec::with_capacity(v.w * v.h);
     for &val in &v.data {
         let t = (val / mag).clamp(-1.0, 1.0);
