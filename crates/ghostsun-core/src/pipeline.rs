@@ -555,7 +555,10 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     // column gains and transversalium and is maximally shift-sensitive
     // (wing slope), measuring at bisector depths where rotation is clean.
     let wing_doppler: Option<Image> = if use_profile && !opts.baseline {
-        let wing = 6.0f64;
+        let wing = std::env::var("GS_WING_OFFSET")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(6.0);
         let offsets: Option<Vec<f64>> = if std::env::var("GS_WING_NOFLEX").is_ok() {
             None // INTI-condition: wings extracted without flexure correction
         } else if flex.iter().any(|f| f.abs() > 0.0) {
