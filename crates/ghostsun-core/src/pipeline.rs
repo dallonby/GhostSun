@@ -107,6 +107,8 @@ pub struct ReconOptions {
     pub burst_repair: bool,
     /// F11.5: temporal non-local-means smoothing
     pub temporal_nlm: bool,
+    /// M2: use Metal/wgpu compute kernels where available (CPU fallback)
+    pub use_gpu: bool,
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
     pub map_iterations: usize,
     pub tune: TuneParams,
@@ -137,6 +139,7 @@ impl Default for ReconOptions {
             x_registration: true,
             burst_repair: true,
             temporal_nlm: true,
+            use_gpu: true,
             map_iterations: 0,
             tune: TuneParams::default(),
             verbose: true,
@@ -182,6 +185,18 @@ macro_rules! vlog {
 }
 
 pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, String> {
+    let t_start = std::time::Instant::now();
+    let mut t_last = t_start;
+    macro_rules! stage {
+        ($name:expr) => {
+            {
+                let now = std::time::Instant::now();
+                vlog!(opts, "[t] {}: {:.2}s", $name, (now - t_last).as_secs_f64());
+                #[allow(unused_assignments)]
+                { t_last = now; }
+            }
+        };
+    }
     let reader = SerReader::open(ser_path).map_err(|e| format!("SER open: {e}"))?;
     let hdr = &reader.header;
     vlog!(opts, "SER: {}x{} x{} frames, {} bit", hdr.width, hdr.height, hdr.frame_count, hdr.bit_depth);
@@ -189,23 +204,27 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     // orientation: slit must be vertical (dispersion horizontal)
     let transpose = hdr.width > hdr.height;
 
-    // ---- mean image over frames with signal ----
+    // ---- mean image over frames with signal (rayon: this was the single
+    // largest stage at ~11 s on a 9100-frame scan when serial) ----
+    use rayon::prelude::*;
     let n = hdr.frame_count;
-    let mut frame_means = vec![0.0f64; n];
-    for t in 0..n {
-        let f = reader.frame(t);
-        let mut s = 0.0;
-        let mut c = 0.0;
-        let mut y = 0;
-        while y < f.h {
-            for &v in f.row(y) {
-                s += v as f64;
-                c += 1.0;
+    let frame_means: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|t| {
+            let f = reader.frame(t);
+            let mut s = 0.0;
+            let mut c = 0.0;
+            let mut y = 0;
+            while y < f.h {
+                for &v in f.row(y) {
+                    s += v as f64;
+                    c += 1.0;
+                }
+                y += 4;
             }
-            y += 4;
-        }
-        frame_means[t] = s / c;
-    }
+            s / c
+        })
+        .collect();
     let mut sorted = frame_means.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p90 = sorted[(sorted.len() as f64 * 0.9) as usize];
@@ -213,30 +232,48 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let good: Vec<usize> = (0..n).filter(|&t| frame_means[t] > good_thresh).collect();
     let use_frames: &[usize] = if good.len() > 50 { &good } else { &(0..n).collect::<Vec<_>>() };
     let mean_img = {
-        let mut acc: Option<Vec<f64>> = None;
-        let mut w = 0;
-        let mut h = 0;
-        for &t in use_frames {
-            let mut f = reader.frame(t);
-            if transpose {
-                f = f.transpose();
-            }
-            w = f.w;
-            h = f.h;
-            let a = acc.get_or_insert_with(|| vec![0.0; w * h]);
-            for (i, &v) in f.data.iter().enumerate() {
-                a[i] += v as f64;
+        // parallel partial sums over frame chunks, then reduce
+        let partials: Vec<(Vec<f64>, usize, usize)> = use_frames
+            .par_chunks(256)
+            .map(|chunk| {
+                let mut acc: Option<Vec<f64>> = None;
+                let mut w = 0;
+                let mut h = 0;
+                for &t in chunk {
+                    let mut f = reader.frame(t);
+                    if transpose {
+                        f = f.transpose();
+                    }
+                    w = f.w;
+                    h = f.h;
+                    let a = acc.get_or_insert_with(|| vec![0.0; w * h]);
+                    for (i, &v) in f.data.iter().enumerate() {
+                        a[i] += v as f64;
+                    }
+                }
+                (acc.unwrap_or_default(), w, h)
+            })
+            .collect();
+        let (w, h) = partials
+            .iter()
+            .find(|p| p.1 > 0)
+            .map(|p| (p.1, p.2))
+            .ok_or("no frames")?;
+        let mut total = vec![0.0f64; w * h];
+        for (a, _, _) in &partials {
+            for (i, v) in a.iter().enumerate() {
+                total[i] += v;
             }
         }
-        let a = acc.ok_or("no frames")?;
         let mut m = Image::new(w, h);
         let cnt = use_frames.len() as f64;
-        for (i, v) in a.iter().enumerate() {
+        for (i, v) in total.iter().enumerate() {
             m.data[i] = (v / cnt) as f32;
         }
         m
     };
     vlog!(opts, "mean image from {}/{} frames", use_frames.len(), n);
+    stage!("mean image");
 
     // ---- spectral line geometry ----
     let geom = if opts.baseline {
@@ -303,6 +340,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     };
     let raw_disk = disk.clone();
     vlog!(opts, "raw disk: {}x{}", disk.w, disk.h);
+    stage!("extraction");
 
     // continuum offset for the transparency reference
     let continuum_shift = {
@@ -337,6 +375,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             flatfield::apply_column_gains(&mut disk, &column_gain);
             let worst = column_gain.iter().cloned().fold(1.0f64, |m, v| if (v - 1.0).abs() > (m - 1.0).abs() { v } else { m });
             vlog!(opts, "transparency (continuum dp {:+.0}): worst gain {:.3}", continuum_shift, worst);
+            stage!("transparency");
         }
         // F8: block-coordinate refinement — registration and gain blocks are
         // re-estimated on the already-corrected disk; corrections compose.
@@ -367,6 +406,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                         jitter_applied[x] += dr.trajectory[x];
                     }
                 }
+                stage!("jitter+drift");
             }
             if opts.x_registration && pass == 0 {
                 let xr = jitter::correct_x(&disk, opts.tune.jitter_hp.round() as usize);
@@ -377,6 +417,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                     *v = jitter::apply_x_offsets(v, &xr.delta);
                 }
                 xreg_applied = xr.delta;
+                stage!("x-registration");
             }
             if opts.burst_repair && pass == 0 {
                 let rep = {
@@ -388,6 +429,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 };
                 vlog!(opts, "burst repair: {} column(s) repaired", rep.n_flagged);
                 burst_flags = rep.flags;
+                stage!("burst repair");
             }
             if opts.x_registration && pass == 0 {
                 // F9.4: photometric x-anchors — at the disk entry/exit ramps
@@ -422,12 +464,28 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             }
         }
         if opts.temporal_nlm {
-            disk = quality::temporal_nlm(
-                &disk,
-                opts.tune.nlm_radius.round().max(1.0) as usize,
-                opts.tune.nlm_h,
+            stage!("pre-NLM stages");
+            let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
+            let mut done_gpu = false;
+            if opts.use_gpu {
+                if let Some((sigma, h2, thresh)) = quality::nlm_params(&disk, opts.tune.nlm_h) {
+                    if let Some(out) = crate::gpu::temporal_nlm(&disk, radius, h2, sigma, thresh) {
+                        disk = out;
+                        done_gpu = true;
+                    }
+                }
+            }
+            if !done_gpu {
+                disk = quality::temporal_nlm(&disk, radius, opts.tune.nlm_h);
+            }
+            vlog!(
+                opts,
+                "temporal NLM [{}]: radius {} h {:.2}",
+                if done_gpu { "gpu" } else { "cpu" },
+                opts.tune.nlm_radius,
+                opts.tune.nlm_h
             );
-            vlog!(opts, "temporal NLM: radius {} h {:.2}", opts.tune.nlm_radius, opts.tune.nlm_h);
+            stage!("temporal NLM");
         }
     }
 
@@ -462,16 +520,31 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     };
     let mut output = if opts.baseline {
         warp_baseline(&disk, &fit.geom, &wp)
+    } else if opts.use_gpu {
+        match crate::gpu::warp_single(&disk, &fit.geom, &wp) {
+            Some(o) => {
+                vlog!(opts, "warp [gpu]");
+                o
+            }
+            None => warp_single(&disk, &fit.geom, &wp),
+        }
     } else {
         warp_single(&disk, &fit.geom, &wp)
     };
     vlog!(opts, "output: {}x{}", output.image.w, output.image.h);
+    stage!("limb+ellipse+warp");
 
     // warp the velocity map with identical geometry (unfiltered kernel: the
     // map is already smoothed and NaN-free)
     let velocity = velocity_raw.map(|v| {
         let wp_v = WarpParams { filtered_downscale: false, allow_negative: true, ..wp };
-        warp_single(&v, &fit.geom, &wp_v).image
+        if opts.use_gpu {
+            crate::gpu::warp_single(&v, &fit.geom, &wp_v)
+                .unwrap_or_else(|| warp_single(&v, &fit.geom, &wp_v))
+                .image
+        } else {
+            warp_single(&v, &fit.geom, &wp_v).image
+        }
     });
 
     let disk_fit = DiskFit { xc: output.xc, yc: output.yc, r: output.radius };
@@ -501,6 +574,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         vlog!(opts, "denoise: wavelet shrinkage k={:.2}", opts.tune.denoise_k);
     }
 
+    vlog!(opts, "[t] TOTAL: {:.2}s", t_start.elapsed().as_secs_f64());
     Ok(ReconReport {
         output,
         raw_disk,

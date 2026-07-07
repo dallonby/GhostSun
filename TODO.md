@@ -493,12 +493,21 @@ notes / chat log):
   Grayscale / Hα Color / Doppler views, live prominence-boost and gamma
   sliders (full-res re-render ~100 ms via the prep split), save colorized
   PNG, status readout (zoom, cursor px, intensity, r/R).
-- **M2 (NEXT):** WGSL compute kernels dispatched via wgpu/Metal for the
-  heavy stages, in expected-win order: temporal NLM (embarrassingly
-  parallel), profile-model extraction (per-(frame,row) fits), the filtered
-  warp, gaussian blur/RL iterations. Each kernel needs a CPU-vs-GPU
-  equivalence gate in `bench` (max abs diff < 1e-3 of signal) and a timing
-  report. Keep CPU paths as fallback + reference.
+- **M2 (DONE 2026-07-07, first increment):** `ghostsun-core::gpu` — wgpu
+  (Metal) compute kernels for temporal NLM and the composed Lanczos warp,
+  with `ghostsun gpucheck` equivalence gate (NLM 3.9e-7, warp 1.3e-4 max
+  relative diff; end-to-end real-scan GPU-vs-CPU 1.6e-5). Pipeline uses GPU
+  by default with silent CPU fallback (`--no-gpu`). Timing truth: the warp
+  is 8x faster on Metal; NLM is transfer-bound (CPU already ~1 s); the
+  biggest M2 win was CPU-side — parallelizing the mean-image pass
+  (11.4 s -> 0.6 s). Stage timings now print as `[t]` lines.
+- **M2.5 (NEXT):** GPU profile-model extraction — the dominant remaining
+  stage (~7 s): one thread per (frame, row): load 120-px spectrum, IIR
+  B-spline prefilter in-thread, 11-candidate mu scan + linear (C,D) solve.
+  Upload raw 8-bit frames (1 B/px) and scale in-shader; chunk ~256 frames
+  per dispatch. PCA stays CPU on a subsample; pass the basis into a second
+  dispatch for the projection add-back. Also port robust_loess (transversalium
+  + transparency trends, ~3.5 s) if profiling still shows it hot.
 - **M3:** app polish — histogram panel, tune-parameter editor, multi-scan
   stacking UI, batch queue, .app bundle + icon (cargo-bundle).
 

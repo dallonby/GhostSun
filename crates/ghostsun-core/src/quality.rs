@@ -287,29 +287,37 @@ pub fn repair_bursts(
 // self-attenuates.
 // ---------------------------------------------------------------------------
 
-pub fn temporal_nlm(disk: &Image, radius: usize, h_factor: f64) -> Image {
+/// Shared parameter derivation for CPU and GPU NLM implementations.
+pub fn nlm_params(disk: &Image, h_factor: f64) -> Option<(f64, f64, f32)> {
     let w = disk.w;
     let hgt = disk.h;
-    let cols: Vec<Vec<f32>> = (0..w).map(|x| disk.column(x)).collect();
     let thresh = percentile_f32(&disk.data, 80.0) * 0.15;
-
-    // noise scale: median |col(t) - col(t+1)| over signal pixels, sampled
     let mut diffs: Vec<f64> = Vec::new();
     let mut x = 8;
     while x + 1 < w && diffs.len() < 200_000 {
         for y in (0..hgt).step_by(3) {
-            let a = cols[x][y];
+            let a = disk.at(x, y);
             if a > thresh {
-                diffs.push((a as f64 - cols[x + 1][y] as f64).abs());
+                diffs.push((a as f64 - disk.at(x + 1, y) as f64).abs());
             }
         }
         x += 13;
     }
     if diffs.len() < 1000 {
-        return disk.clone();
+        return None;
     }
     let sigma = crate::mathutil::median_inplace(&mut diffs) * 1.4826 / std::f64::consts::SQRT_2;
     let h2 = (h_factor * sigma).powi(2).max(1e-12);
+    Some((sigma, h2, thresh))
+}
+
+pub fn temporal_nlm(disk: &Image, radius: usize, h_factor: f64) -> Image {
+    let w = disk.w;
+    let hgt = disk.h;
+    let cols: Vec<Vec<f32>> = (0..w).map(|x| disk.column(x)).collect();
+    let Some((sigma, h2, thresh)) = nlm_params(disk, h_factor) else {
+        return disk.clone();
+    };
     const P: isize = 3; // vertical patch half-size
     let pn = (2 * P + 1) as f64;
 

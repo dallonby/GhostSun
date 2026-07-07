@@ -6,6 +6,7 @@ pub mod denoise;
 pub mod ellipse;
 pub mod extract;
 pub mod flatfield;
+pub mod gpu;
 pub mod image2d;
 pub mod jitter;
 pub mod limb;

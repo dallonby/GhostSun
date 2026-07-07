@@ -147,6 +147,9 @@ enum Cmd {
         /// disable temporal NLM smoothing (F11.5)
         #[arg(long)]
         no_nlm: bool,
+        /// disable Metal/GPU compute kernels (CPU only)
+        #[arg(long)]
+        no_gpu: bool,
         /// extra block-coordinate refinement iterations (F8)
         #[arg(long, default_value_t = 0)]
         map_iterations: usize,
@@ -161,6 +164,8 @@ enum Cmd {
     Diskfit {
         image: PathBuf,
     },
+    /// Verify GPU kernels match CPU implementations (equivalence + timing)
+    Gpucheck,
     /// Render a colorized PNG (black background, prominences preserved)
     Colorize {
         /// input reconstruction (.fits from `recon`/`stack`, or 16-bit PNG)
@@ -286,7 +291,7 @@ fn main() {
         Cmd::Recon {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
-            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, map_iterations, tune, name,
+            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_gpu, map_iterations, tune, name,
         } => {
             std::fs::create_dir_all(&out_dir).unwrap();
             let mut opts = pipeline::ReconOptions {
@@ -306,6 +311,7 @@ fn main() {
                 x_registration: !no_xreg,
                 burst_repair: !no_burst_repair,
                 temporal_nlm: !no_nlm,
+                use_gpu: !no_gpu,
                 map_iterations,
                 ..Default::default()
             };
@@ -328,6 +334,80 @@ fn main() {
                     eprintln!("reconstruction failed: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Cmd::Gpucheck => {
+            use ghostsun_core::{gpu, quality, warp as warpmod, ellipse as ellmod};
+            // synthetic test image: smooth structure + disk + noise
+            let (w, h) = (2400usize, 1200usize);
+            let mut img = Image::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = x as f64 - 1200.0;
+                    let dy = y as f64 - 600.0;
+                    let r = (dx * dx / 4.0 + dy * dy).sqrt();
+                    let disk = if r < 500.0 { 20000.0 } else { 300.0 };
+                    let tex = 2000.0 * ((x as f64 / 17.0).sin() * (y as f64 / 23.0).cos());
+                    let noise = 150.0 * (((x * 7919 + y * 104729) % 1000) as f64 / 500.0 - 1.0);
+                    img.set(x, y, (disk + tex * if r < 500.0 { 1.0 } else { 0.0 } + noise).max(0.0) as f32);
+                }
+            }
+            let rel = |a: &Image, b: &Image| -> f64 {
+                let peak = 20000.0f64;
+                a.data
+                    .iter()
+                    .zip(&b.data)
+                    .map(|(x, y)| ((x - y).abs() as f64) / peak)
+                    .fold(0.0, f64::max)
+            };
+            // NLM
+            let (sigma, h2, thresh) = quality::nlm_params(&img, 1.8).expect("params");
+            let t0 = std::time::Instant::now();
+            let cpu = quality::temporal_nlm(&img, 3, 1.8);
+            let t_cpu = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            match gpu::temporal_nlm(&img, 3, h2, sigma, thresh) {
+                Some(gout) => {
+                    let t_gpu = t0.elapsed().as_secs_f64();
+                    println!(
+                        "NLM : max rel diff {:.2e}  cpu {:.3}s  gpu {:.3}s  ({:.1}x)",
+                        rel(&cpu, &gout), t_cpu, t_gpu, t_cpu / t_gpu
+                    );
+                }
+                None => println!("NLM : GPU unavailable"),
+            }
+            // warp
+            let geom = ellmod::Conic {
+                a: 1.0 / (1000.0f64 * 1000.0),
+                b: 0.00000002,
+                c: 1.0 / (505.0f64 * 505.0),
+                d: -2.0 * 1200.0 / (1000.0f64 * 1000.0),
+                e: -2.0 * 600.0 / (505.0f64 * 505.0),
+                f: 1200.0 * 1200.0 / (1000.0f64 * 1000.0) + 600.0 * 600.0 / (505.0f64 * 505.0) - 1.0,
+            }
+            .geometry()
+            .expect("geom");
+            let wp = warpmod::WarpParams {
+                rotation_deg: 1.5,
+                flip_x: false,
+                flip_y: false,
+                margin_frac: 0.15,
+                filtered_downscale: true,
+                allow_negative: false,
+            };
+            let t0 = std::time::Instant::now();
+            let cpu_w = warpmod::warp_single(&img, &geom, &wp);
+            let t_cpu = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
+            match gpu::warp_single(&img, &geom, &wp) {
+                Some(gout) => {
+                    let t_gpu = t0.elapsed().as_secs_f64();
+                    println!(
+                        "WARP: max rel diff {:.2e}  cpu {:.3}s  gpu {:.3}s  ({:.1}x)",
+                        rel(&cpu_w.image, &gout.image), t_cpu, t_gpu, t_cpu / t_gpu
+                    );
+                }
+                None => println!("WARP: GPU unavailable"),
             }
         }
         Cmd::Colorize { input, out, prom_boost, gamma } => {
