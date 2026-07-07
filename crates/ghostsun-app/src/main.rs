@@ -68,6 +68,7 @@ struct App {
     color_cache: Option<(Vec<u8>, usize, usize)>,
     opt_deconv: bool,
     opt_denoise: bool,
+    last_ser: Option<std::path::PathBuf>,
     pending_open: Option<PathBuf>,
 }
 
@@ -95,6 +96,7 @@ impl App {
             color_cache: None,
             opt_deconv: false,
             opt_denoise: false,
+            last_ser: None,
             pending_open: std::env::args().nth(1).map(PathBuf::from),
         }
     }
@@ -135,6 +137,7 @@ impl App {
     fn run_pipeline(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.running = true;
         self.log.clear();
+        self.last_ser = Some(path.clone());
         self.log.push(format!("processing {} ...", path.display()));
         let tx = self.tx.clone();
         let tx_log = self.tx.clone();
@@ -404,13 +407,24 @@ impl eframe::App for App {
             ui.add_space(10.0);
 
             ui.heading("Pipeline");
-            ui.checkbox(&mut self.opt_deconv, "PSF deconvolution");
-            ui.checkbox(&mut self.opt_denoise, "wavelet denoise");
             ui.label(
-                egui::RichText::new("Open a .ser scan to reconstruct;\n.fits / .png to view.")
+                egui::RichText::new("Options below apply when a .ser scan\nis reconstructed — not to loaded images.")
                     .small()
                     .weak(),
             );
+            ui.checkbox(&mut self.opt_deconv, "PSF deconvolution");
+            ui.checkbox(&mut self.opt_denoise, "wavelet denoise");
+            if let Some(ser) = self.last_ser.clone() {
+                if !self.running && ui.button("Reprocess scan with these options").clicked() {
+                    self.open_file(ser, ctx);
+                }
+            } else {
+                ui.label(
+                    egui::RichText::new("Open a .ser scan to reconstruct;\n.fits / .png files are view-only.")
+                        .small()
+                        .weak(),
+                );
+            }
             ui.add_space(10.0);
 
             if self.loaded.is_some() && ui.button("Save colorized PNG…").clicked() {
