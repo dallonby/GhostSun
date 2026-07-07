@@ -4,6 +4,7 @@
 
 use crate::image2d::Image;
 
+#[derive(Clone)]
 pub struct DiskFit {
     pub xc: f64,
     pub yc: f64,

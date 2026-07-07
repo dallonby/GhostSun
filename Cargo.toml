@@ -1,18 +1,15 @@
-[package]
-name = "ghostsun"
-version = "0.1.0"
-edition = "2021"
-description = "High-fidelity solar disk reconstruction from spectroheliograph SER scans"
-license = "MIT"
+[workspace]
+resolver = "2"
+members = [
+    "crates/ghostsun-core",
+    "crates/ghostsun-cli",
+    "crates/ghostsun-app",
+]
 
-[dependencies]
-rayon = "1.10"
-memmap2 = "0.9"
-clap = { version = "4", features = ["derive"] }
-nalgebra = "0.33"
-png = "0.17"
-rand = "0.8"
-rand_distr = "0.4"
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
 
 [profile.release]
 lto = "thin"

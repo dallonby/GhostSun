@@ -97,13 +97,21 @@ fn sky_model(img: &Image, disk: &DiskFit) -> (Vec<f64>, Vec<f64>) {
     )
 }
 
-/// Render an RGB colorized image. Returns (w, h, rgb bytes).
-pub fn colorize(img: &Image, opts: &ColorizeOptions) -> Option<(usize, usize, Vec<u8>)> {
+/// One-time per-image preparation for colorizing: disk geometry, sky
+/// model, normalization. Lets interactive UIs re-render with new tone
+/// options at full speed (the per-pixel pass is cheap).
+#[derive(Clone)]
+pub struct ColorizePrep {
+    pub disk: DiskFit,
+    bg: Vec<f64>,
+    sig: Vec<f64>,
+    scale: f64,
+}
+
+pub fn prepare(img: &Image) -> Option<ColorizePrep> {
     let init = coarse_disk(img)?;
     let (disk, _) = fit_disk_polar(img, &init)?;
     let (bg, sig) = sky_model(img, &disk);
-    let bin = 4usize;
-
     // disk normalization level (robust bright end of disk interior)
     let mut disk_vals: Vec<f32> = Vec::new();
     for y in (0..img.h).step_by(3) {
@@ -121,10 +129,26 @@ pub fn colorize(img: &Image, opts: &ColorizeOptions) -> Option<(usize, usize, Ve
     let peak = crate::mathutil::percentile_f32(&disk_vals, 99.7) as f64;
     let disk_bg = bg.first().cloned().unwrap_or(0.0);
     let scale = (peak - disk_bg).max(1e-6);
+    Some(ColorizePrep { disk, bg, sig, scale })
+}
 
-    let mut rgb = vec![0u8; img.w * img.h * 3];
-    for y in 0..img.h {
-        for x in 0..img.w {
+/// Render an RGB colorized image. Returns (w, h, rgb bytes).
+pub fn colorize(img: &Image, opts: &ColorizeOptions) -> Option<(usize, usize, Vec<u8>)> {
+    let prep = prepare(img)?;
+    Some(render_with(img, &prep, opts))
+}
+
+/// Fast per-pixel colorize pass with precomputed geometry (rayon over rows).
+pub fn render_with(img: &Image, prep: &ColorizePrep, opts: &ColorizeOptions) -> (usize, usize, Vec<u8>) {
+    use rayon::prelude::*;
+    let bin = 4usize;
+    let disk = &prep.disk;
+    let (bg, sig, scale) = (&prep.bg, &prep.sig, prep.scale);
+    let rows: Vec<Vec<u8>> = (0..img.h)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![0u8; img.w * 3];
+            for x in 0..img.w {
             let dx = x as f64 - disk.xc;
             let dy = y as f64 - disk.yc;
             let r = (dx * dx + dy * dy).sqrt();
@@ -155,11 +179,16 @@ pub fn colorize(img: &Image, opts: &ColorizeOptions) -> Option<(usize, usize, Ve
             let t = w_disk * t_disk + (1.0 - w_disk) * t_prom;
 
             let c = lut(t);
-            let i = (y * img.w + x) * 3;
-            rgb[i] = c[0];
-            rgb[i + 1] = c[1];
-            rgb[i + 2] = c[2];
-        }
+            row[x * 3] = c[0];
+            row[x * 3 + 1] = c[1];
+            row[x * 3 + 2] = c[2];
+            }
+            row
+        })
+        .collect();
+    let mut rgb = vec![0u8; img.w * img.h * 3];
+    for (y, row) in rows.iter().enumerate() {
+        rgb[y * img.w * 3..(y + 1) * img.w * 3].copy_from_slice(row);
     }
-    Some((img.w, img.h, rgb))
+    (img.w, img.h, rgb)
 }

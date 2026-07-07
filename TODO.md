@@ -480,6 +480,28 @@ notes / chat log):
   family instead of PCA; yields optical-depth and absorbing-material
   velocity maps.
 
+## Phase M — Apple Silicon / Metal port (started 2026-07-07)
+
+- **M0 (DONE):** workspace split — `ghostsun-core` (lib), `ghostsun` (CLI),
+  `ghostsun-app` (desktop). Core gained a `progress` callback on
+  ReconOptions and a split colorize API (`render::prepare` +
+  `render::render_with`) for live re-rendering.
+- **M1 (DONE):** desktop app (`crates/ghostsun-app`): eframe/egui on the
+  wgpu backend — native **Metal** on Apple Silicon. Dark solar theme,
+  open/drag-drop .ser/.fits/.png, background reconstruction with live log,
+  pan/zoom viewer (scroll = zoom-at-cursor, drag = pan, double-click = fit),
+  Grayscale / Hα Color / Doppler views, live prominence-boost and gamma
+  sliders (full-res re-render ~100 ms via the prep split), save colorized
+  PNG, status readout (zoom, cursor px, intensity, r/R).
+- **M2 (NEXT):** WGSL compute kernels dispatched via wgpu/Metal for the
+  heavy stages, in expected-win order: temporal NLM (embarrassingly
+  parallel), profile-model extraction (per-(frame,row) fits), the filtered
+  warp, gaussian blur/RL iterations. Each kernel needs a CPU-vs-GPU
+  equivalence gate in `bench` (max abs diff < 1e-3 of signal) and a timing
+  report. Keep CPU paths as fallback + reference.
+- **M3:** app polish — histogram panel, tune-parameter editor, multi-scan
+  stacking UI, batch queue, .app bundle + icon (cargo-bundle).
+
 ## Process checklist for every feature (copy into each PR)
 
 - [ ] Synth models the degradation; truth recorded; penalty measured with

@@ -1,0 +1,14 @@
+[package]
+name = "ghostsun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GhostSun command-line interface"
+
+[[bin]]
+name = "ghostsun"
+path = "src/main.rs"
+
+[dependencies]
+ghostsun-core = { path = "../ghostsun-core" }
+clap = { version = "4", features = ["derive"] }

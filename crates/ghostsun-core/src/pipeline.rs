@@ -111,6 +111,8 @@ pub struct ReconOptions {
     pub map_iterations: usize,
     pub tune: TuneParams,
     pub verbose: bool,
+    /// optional log/progress sink (UI); when set, vlog! goes here too
+    pub progress: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Default for ReconOptions {
@@ -138,6 +140,7 @@ impl Default for ReconOptions {
             map_iterations: 0,
             tune: TuneParams::default(),
             verbose: true,
+            progress: None,
         }
     }
 }
@@ -170,7 +173,11 @@ pub struct ReconReport {
 
 macro_rules! vlog {
     ($opts:expr, $($arg:tt)*) => {
-        if $opts.verbose { println!($($arg)*); }
+        {
+            let msg = format!($($arg)*);
+            if let Some(cb) = &$opts.progress { cb(&msg); }
+            if $opts.verbose { println!("{}", msg); }
+        }
     };
 }
 

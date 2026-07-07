@@ -1,0 +1,14 @@
+[package]
+name = "ghostsun-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Solar spectroheliograph reconstruction pipeline"
+
+[dependencies]
+rayon = "1.10"
+memmap2 = "0.9"
+nalgebra = "0.33"
+png = "0.17"
+rand = "0.8"
+rand_distr = "0.4"
