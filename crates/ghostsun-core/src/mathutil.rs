@@ -95,8 +95,24 @@ pub fn median_inplace(v: &mut [f64]) -> f64 {
 }
 
 pub fn median_f32(v: &[f32]) -> f32 {
-    let mut tmp: Vec<f64> = v.iter().map(|&x| x as f64).collect();
-    median_inplace(&mut tmp) as f32
+    if v.is_empty() {
+        return f32::NAN;
+    }
+    let mut tmp = v.to_vec();
+    let mid = tmp.len() / 2;
+    tmp.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    if tmp.len() % 2 == 1 {
+        tmp[mid]
+    } else {
+        // The lower partition is unordered, so find its maximum rather than
+        // sorting the entire sample just to obtain the second middle value.
+        let lower = tmp[..mid]
+            .iter()
+            .copied()
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap();
+        0.5 * (lower + tmp[mid])
+    }
 }
 
 pub fn percentile_f32(v: &[f32], p: f64) -> f32 {
@@ -104,9 +120,10 @@ pub fn percentile_f32(v: &[f32], p: f64) -> f32 {
         return f32::NAN;
     }
     let mut tmp: Vec<f32> = v.to_vec();
-    tmp.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let idx = ((p / 100.0) * (tmp.len() - 1) as f64).round() as usize;
-    tmp[idx.min(tmp.len() - 1)]
+    let idx = idx.min(tmp.len() - 1);
+    tmp.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+    tmp[idx]
 }
 
 /// Error function (Abramowitz & Stegun 7.1.26, |err| < 1.5e-7).

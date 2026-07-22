@@ -1,8 +1,10 @@
 # GhostSun for Windows 11
 
 GhostSun runs natively on 64-bit Intel/AMD editions of Windows 11. The desktop
-app uses Direct3D 12 or Vulkan through `wgpu`; its processing kernels fall back
-to the CPU if a compatible compute adapter is unavailable.
+app uses Direct3D 12 or Vulkan through `wgpu`. Profile extraction, temporal NLM,
+and geometric warping fall back to CPU implementations if compatible compute
+is unavailable; the optional residual column-state stage is GPU-only and is
+skipped.
 
 ## Run the packaged app
 
@@ -44,6 +46,7 @@ cargo run --package ghostsun-app
 ## Graphics troubleshooting
 
 Install the latest graphics driver from Intel, AMD, or NVIDIA if the window
-cannot start or rendering is corrupted. Processing automatically uses its CPU
-fallback when compute acceleration is unavailable; the desktop window itself
-still requires a Direct3D 12- or Vulkan-capable driver.
+cannot start or rendering is corrupted. Processing stages with CPU
+implementations fall back when compute acceleration is unavailable; GPU-only
+residual column-state correction is skipped. The desktop window itself still
+requires a Direct3D 12- or Vulkan-capable driver.

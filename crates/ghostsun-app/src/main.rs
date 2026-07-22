@@ -81,6 +81,7 @@ enum Job {
 
 struct Loaded {
     image: Arc<Image>,
+    before_demix: Option<Arc<Image>>,
     velocity: Option<Image>,
     prep: Option<render::ColorizePrep>,
     name: String,
@@ -106,8 +107,10 @@ struct App {
     color_cache: Option<(Vec<u8>, usize, usize)>,
     opt_deconv: bool,
     opt_denoise: bool,
+    opt_column_demix_strength: f64,
     last_ser: Option<std::path::PathBuf>,
     pending_open: Option<PathBuf>,
+    show_before_demix: bool,
 }
 
 impl App {
@@ -134,8 +137,10 @@ impl App {
             color_cache: None,
             opt_deconv: false,
             opt_denoise: false,
+            opt_column_demix_strength: 1.0,
             last_ser: None,
             pending_open: std::env::args().nth(1).map(PathBuf::from),
+            show_before_demix: false,
         }
     }
 
@@ -146,7 +151,7 @@ impl App {
             "fits" | "fit" => match output::read_fits_f32(&path) {
                 Ok(img) => {
                     let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-                    self.set_loaded(img, None, name);
+                    self.set_loaded(img, None, None, name);
                     self.log.push(format!("loaded {}", path.display()));
                 }
                 Err(e) => self.log.push(format!("FITS load failed: {e}")),
@@ -154,7 +159,7 @@ impl App {
             "png" => match output::read_png16(&path) {
                 Ok(img) => {
                     let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-                    self.set_loaded(img, None, name);
+                    self.set_loaded(img, None, None, name);
                 }
                 Err(e) => self.log.push(format!("PNG load failed: {e}")),
             },
@@ -162,9 +167,22 @@ impl App {
         }
     }
 
-    fn set_loaded(&mut self, image: Image, velocity: Option<Image>, name: String) {
+    fn set_loaded(
+        &mut self,
+        image: Image,
+        velocity: Option<Image>,
+        before_demix: Option<Image>,
+        name: String,
+    ) {
         let prep = render::prepare(&image);
-        self.loaded = Some(Loaded { image: Arc::new(image), velocity, prep, name });
+        self.loaded = Some(Loaded {
+            image: Arc::new(image),
+            before_demix: before_demix.map(Arc::new),
+            velocity,
+            prep,
+            name,
+        });
+        self.show_before_demix = false;
         self.texture = None;
         self.tex_mode = None;
         self.color_cache = None;
@@ -181,10 +199,13 @@ impl App {
         let tx_log = self.tx.clone();
         let egui_ctx = ctx.clone();
         let egui_ctx2 = ctx.clone();
+        let mut tune = pipeline::TuneParams::default();
+        tune.column_demix_strength = self.opt_column_demix_strength;
         let opts = pipeline::ReconOptions {
             verbose: false,
             deconv: self.opt_deconv,
             denoise: self.opt_denoise,
+            tune,
             progress: Some(Arc::new(move |m: &str| {
                 let _ = tx_log.send(Job::Log(m.to_string()));
                 egui_ctx.request_repaint();
@@ -246,7 +267,12 @@ impl App {
                     self.running = false;
                     self.log.push("done.".into());
                     let rep = *rep;
-                    self.set_loaded(rep.output.image, rep.velocity, "reconstruction".into());
+                    self.set_loaded(
+                        rep.output.image,
+                        rep.velocity,
+                        rep.demix_before,
+                        "reconstruction".into(),
+                    );
                 }
                 Job::Failed(e) => {
                     self.running = false;
@@ -274,7 +300,11 @@ impl App {
         }
         let color_image = match self.mode {
             ViewMode::Display => {
-                let img = &loaded.image;
+                let img = if self.show_before_demix {
+                    loaded.before_demix.as_deref().unwrap_or(loaded.image.as_ref())
+                } else {
+                    loaded.image.as_ref()
+                };
                 let lo = percentile_f32(&img.data, 0.05);
                 let hi = percentile_f32(&img.data, 99.95).max(lo + 1e-3);
                 gray_to_color(img, lo, hi)
@@ -343,10 +373,10 @@ fn style(ctx: &egui::Context) {
     v.extreme_bg_color = egui::Color32::from_rgb(10, 9, 8);
     v.faint_bg_color = egui::Color32::from_rgb(30, 26, 23);
     v.selection.bg_fill = ACCENT_DIM;
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     v.hyperlink_color = ACCENT;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT_DIM);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.5, ACCENT);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.5_f32, ACCENT);
     ctx.set_visuals(v);
     let mut st = (*ctx.style()).clone();
     st.spacing.item_spacing = egui::vec2(10.0, 8.0);
@@ -430,6 +460,28 @@ impl eframe::App for App {
             }
 
             ui.heading("Hα rendering");
+            if self.loaded.as_ref().and_then(|l| l.before_demix.as_ref()).is_some() {
+                ui.heading("Column-state comparison");
+                let changed = ui
+                    .checkbox(&mut self.show_before_demix, "Show before demixing")
+                    .changed();
+                ui.label(
+                    egui::RichText::new(if self.show_before_demix {
+                        "BEFORE: residual column pattern"
+                    } else {
+                        "AFTER: gain / offset / dx / dy / blur demixed"
+                    })
+                    .small()
+                    .weak(),
+                );
+                if changed {
+                    self.mode = ViewMode::Display;
+                    self.texture = None;
+                    self.tex_mode = None;
+                }
+                ui.add_space(10.0);
+            }
+
             ui.spacing_mut().slider_width = (ui.available_width() - 120.0).max(120.0);
             ui.label("prominence boost");
             let r1 = ui.add(
@@ -452,6 +504,16 @@ impl eframe::App for App {
             );
             ui.checkbox(&mut self.opt_deconv, "PSF deconvolution");
             ui.checkbox(&mut self.opt_denoise, "wavelet denoise");
+            ui.label("column correction strength");
+            ui.add(
+                egui::Slider::new(&mut self.opt_column_demix_strength, 0.0..=1.0)
+                    .fixed_decimals(2),
+            );
+            ui.label(
+                egui::RichText::new("0 = off, 1 = full; detection is automatic per scan; reprocess to apply")
+                    .small()
+                    .weak(),
+            );
             if let Some(ser) = self.last_ser.clone() {
                 if !self.running && ui.button("Reprocess scan with these options").clicked() {
                     self.open_file(ser, ctx);
@@ -547,7 +609,15 @@ impl eframe::App for App {
                         let px = u.x * tex_size.x;
                         let py = u.y * tex_size.y;
                         if px >= 0.0 && py >= 0.0 && px < tex_size.x && py < tex_size.y {
-                            let v = loaded.image.at(px as usize, py as usize);
+                            let inspect = if self.show_before_demix {
+                                loaded
+                                    .before_demix
+                                    .as_deref()
+                                    .unwrap_or(loaded.image.as_ref())
+                            } else {
+                                loaded.image.as_ref()
+                            };
+                            let v = inspect.at(px as usize, py as usize);
                             status += &format!("   ({:.0}, {:.0})  I = {:.0}", px, py, v);
                             if let Some(prep) = &loaded.prep {
                                 let dx = px as f64 - prep.disk.xc;

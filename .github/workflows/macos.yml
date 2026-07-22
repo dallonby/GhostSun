@@ -1,0 +1,26 @@
+name: macOS Metal build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Test workspace on macOS
+        run: cargo test --workspace --locked
+
+      - name: Build Metal desktop app
+        run: cargo build --release --locked --package ghostsun-app

@@ -383,6 +383,76 @@ fn main() {
                 }
                 None => println!("NLM : GPU unavailable"),
             }
+            // Column-state regression: inject a repeating gain tooth plus
+            // short additive-bias runs across otherwise untouched columns.
+            // A successful demixer must reduce the known error while its
+            // clean-scan evidence gate leaves the original bit-for-bit alone.
+            let mut striped = img.clone();
+            for x in 0..w {
+                let gain = match x % 6 {
+                    0 => 0.010,
+                    1 => -0.008,
+                    2 => 0.005,
+                    3 => -0.004,
+                    _ => 0.0,
+                };
+                let phase = x % 73;
+                let bias = if (24..=29).contains(&phase) {
+                    -160.0
+                } else if (51..=54).contains(&phase) {
+                    120.0
+                } else {
+                    0.0
+                };
+                for y in 0..h {
+                    let i = y * w + x;
+                    striped.data[i] = (striped.data[i] * (1.0 + gain) + bias).max(0.0);
+                }
+            }
+            let rmse = |a: &Image, b: &Image| -> f64 {
+                (a.data
+                    .iter()
+                    .zip(&b.data)
+                    .map(|(x, y)| {
+                        let d = (*x - *y) as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / a.data.len() as f64)
+                    .sqrt()
+            };
+            match (gpu::demix_columns(&striped, 1.0), gpu::demix_columns(&img, 1.0)) {
+                (Some((fixed, state)), Some((clean, _))) => {
+                    let before = rmse(&striped, &img);
+                    let after = rmse(&fixed, &img);
+                    let clean_delta = rmse(&clean, &img);
+                    let max_offset = state
+                        .offset
+                        .iter()
+                        .fold(0.0f64, |m, v| m.max(v.abs()));
+                    println!(
+                        "COL : injected RMSE {:.2} -> {:.2} ({:.1}% removed), clean delta {:.3}, offset +- {:.3}%",
+                        before,
+                        after,
+                        100.0 * (1.0 - after / before),
+                        clean_delta,
+                        100.0 * max_offset,
+                    );
+                    if let (Some((fixed2, _)), Some((clean2, _))) =
+                        (gpu::demix_columns(&striped, 0.5), gpu::demix_columns(&img, 0.5))
+                    {
+                        let after2 = rmse(&fixed2, &img);
+                        println!(
+                            "COL.5: injected RMSE {:.2} -> {:.2} ({:.1}% removed), clean delta {:.3}",
+                            before,
+                            after2,
+                            100.0 * (1.0 - after2 / before),
+                            rmse(&clean2, &img),
+                        );
+                    }
+                }
+                _ => println!("COL : GPU unavailable"),
+            }
             // profile extraction (needs a synthetic SER scan)
             {
                 use ghostsun_core::{linefit, profile};

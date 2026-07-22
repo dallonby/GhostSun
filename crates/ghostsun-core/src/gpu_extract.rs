@@ -121,10 +121,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     var mu_out = -3.0e30;
 
     if (is_on) {
-        let n = i32(p.spec_w);
-        for (var i = 0; i < n; i++) { cbuf[i] = raw_val(f, u32(i), y); }
+        // Only the stratified rows used for the per-frame wide spectrum need
+        // the entire detector row. Profile fitting touches a narrow interval
+        // around the line; the cubic B-spline IIR pole decays as 0.268^d, so
+        // 16 guard samples make a local prefilter numerically indistinguishable
+        // at the fit window while avoiding ~3/4 of the serial prefilter work.
+        let wide_spectrum_row = (y & 7u) == 0u;
+        let center_abs = smile[y] + p.shift;
+        var base: i32 = 0;
+        var n = i32(p.spec_w);
+        if (!wide_spectrum_row) {
+            let reach = p.wf + i32(ceil(p.mu_range)) + 16;
+            base = max(i32(floor(center_abs)) - reach, 0);
+            let end = min(i32(ceil(center_abs)) + reach + 1, i32(p.spec_w));
+            n = end - base;
+        }
+        for (var i = 0; i < n; i++) { cbuf[i] = raw_val(f, u32(base + i), y); }
         prefilter(n);
-        let center = smile[y] + p.shift;
+        let center = center_abs - f32(base);
         let sig = sigma_row[y];
         let nwin = 2 * p.wf + 1;
 
@@ -145,21 +159,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         for (var k = 0u; k < p.n_mu; k++) {
             let m = center - p.mu_range + 2.0 * p.mu_range * f32(k) / f32(p.n_mu - 1u);
             var sn = 0.0; var sg = 0.0; var sgg = 0.0; var sv = 0.0; var svg = 0.0;
+            var svv = 0.0;
             for (var i = 0; i < nwin; i++) {
                 let g = exp(-((xs[i] - m) * (xs[i] - m)) / (2.0 * sig * sig));
                 sn += 1.0; sg += g; sgg += g * g; sv += ss[i]; svg += ss[i] * g;
+                svv += ss[i] * ss[i];
             }
             let det = sn * sgg - sg * sg;
             var sse = 3.0e30;
             if (abs(det) >= 1e-9) {
                 let dd = (sv * sg - sn * svg) / det;
                 let cc = (sv + dd * sg) / sn;
-                sse = 0.0;
-                for (var i = 0; i < nwin; i++) {
-                    let g = exp(-((xs[i] - m) * (xs[i] - m)) / (2.0 * sig * sig));
-                    let r = ss[i] - (cc - dd * g);
-                    sse += r * r;
-                }
+                // Expanded sum((s - cc + dd*g)^2), using the moments
+                // already accumulated above. This removes a duplicate loop
+                // and a second set of expensive exponentials per candidate.
+                sse = svv - 2.0 * cc * sv + 2.0 * dd * svg
+                    + sn * cc * cc - 2.0 * cc * dd * sg + dd * dd * sgg;
             }
             sses[k] = sse;
             mus[k] = m;
@@ -215,10 +230,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         }
         core = max(t * core_model + (1.0 - t) * bspl, 0.0);
         depth_out = max(depth, 0.0) * t;
-        if (t > 0.5) { mu_out = mu; }
+        if (t > 0.5) { mu_out = mu + f32(base); }
 
-        // de-smiled spectrum contribution (rows with light)
-        if (c > 1.0) {
+        // De-smiled spectrum contribution.  A full spectrum at every slit
+        // row dominated this kernel (hundreds of B-spline evaluations and
+        // atomics per output pixel).  A 1-in-8 stratified sample still gives
+        // hundreds of illuminated rows per frame, far more than flexure and
+        // transparency estimation need, while cutting this work by ~8x.
+        // The line-depth gate excludes sky so the continuum bin is also a
+        // direct per-frame transparency statistic.
+        if (depth > p.depth_gate && wide_spectrum_row) {
             atomicAdd(&wg_cnt, 1u);
             for (var k = 0u; k < p.n_spec; k++) {
                 let x = clamp(smile[y] + spec_off[k], 1.0, f32(n - 2));

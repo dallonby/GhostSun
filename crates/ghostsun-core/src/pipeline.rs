@@ -30,6 +30,7 @@ pub struct TuneParams {
     pub burst_thresh: f64,    // burst detection threshold (x local floor)
     pub nlm_radius: f64,      // temporal NLM neighbor radius (frames)
     pub nlm_h: f64,           // temporal NLM strength (x noise sigma)
+    pub column_demix_strength: f64, // residual column-state correction (0..1)
     pub rl_iters: f64,        // Richardson-Lucy iterations
     pub rl_tv: f64,           // RL total-variation lambda
     pub rl_floor: f64,        // intrinsic limb-width floor (px)
@@ -49,6 +50,7 @@ impl Default for TuneParams {
             burst_thresh: 1.3,
             nlm_radius: 3.0,
             nlm_h: 1.8,
+            column_demix_strength: 1.0,
             rl_iters: 15.0,
             rl_tv: 0.01,
             rl_floor: 1.2,
@@ -70,6 +72,7 @@ impl TuneParams {
             "burst_thresh" => self.burst_thresh = v,
             "nlm_radius" => self.nlm_radius = v,
             "nlm_h" => self.nlm_h = v,
+            "column_demix_strength" => self.column_demix_strength = v,
             "rl_iters" => self.rl_iters = v,
             "rl_tv" => self.rl_tv = v,
             "rl_floor" => self.rl_floor = v,
@@ -151,6 +154,9 @@ impl Default for ReconOptions {
 #[allow(dead_code)]
 pub struct ReconReport {
     pub output: WarpOutput,
+    /// Final-view comparison image immediately before column-state demixing,
+    /// passed through the same NLM and geometric warp as `output`.
+    pub demix_before: Option<Image>,
     pub raw_disk: Image,
     /// F2: warped line-core velocity map (px), when profile extraction is on
     pub velocity: Option<Image>,
@@ -304,11 +310,46 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         depth_gate: opts.tune.depth_gate,
     };
     let use_profile = opts.profile_extraction && !opts.baseline;
+    // Continuum offset for the transparency reference.  Compute this before
+    // extraction so the profile spectrum can supply the same bin directly.
+    let continuum_shift = {
+        let iw = mean_img.w as f64;
+        let ymid = (geom.y1 + geom.y2) / 2;
+        let cx = polyval(&geom.coeffs, ymid as f64);
+        let room_left = cx - 6.0;
+        let room_right = iw - 7.0 - cx;
+        let mag = 25.0f64.min(room_left.max(room_right).max(8.0));
+        if room_right >= room_left { mag.min(room_right) } else { -mag.min(room_left) }
+    };
 
+    // The profile extractor already produces a de-smiled per-frame spectrum.
+    // Retain its continuum bin so transparency correction does not need a
+    // second full extraction of every SER frame.
+    let mut profile_continuum_flux: Option<Vec<f64>> = None;
     let (mut disk, flex, mut velocity_raw): (Image, Vec<f64>, Option<Image>) = if use_profile {
         let (maps, on_gpu) =
             profile::extract_profile_auto(&reader, &geom, &mean_img, transpose, opts.shift, &ptune, opts.use_gpu);
         vlog!(opts, "extraction [{}]", if on_gpu { "gpu" } else { "cpu" });
+        // The optimized GPU spectrum is disk-gated.  The CPU reference keeps
+        // its historic all-lit-row spectrum, so retain the legacy continuum
+        // extraction when GPU profile extraction is unavailable.
+        if on_gpu && !maps.spec_offsets.is_empty() {
+            if let Some((ki, _)) = maps
+                .spec_offsets
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    ((*a - continuum_shift).abs()).total_cmp(&((*b - continuum_shift).abs()))
+                })
+            {
+                profile_continuum_flux = Some(
+                    maps.frame_spec
+                        .iter()
+                        .map(|s| s.get(ki).copied().unwrap_or(0.0) as f64)
+                        .collect(),
+                );
+            }
+        }
         // F3: flexure. Preferred source: telluric anchor lines (absolute,
         // immune to solar Doppler — keeps the full trend including the part
         // degenerate with rotation). Fallback: solar-line estimator
@@ -358,35 +399,29 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     vlog!(opts, "raw disk: {}x{}", disk.w, disk.h);
     stage!("extraction");
 
-    // continuum offset for the transparency reference
-    let continuum_shift = {
-        let iw = mean_img.w as f64;
-        let ymid = (geom.y1 + geom.y2) / 2;
-        let cx = polyval(&geom.coeffs, ymid as f64);
-        let room_left = cx - 6.0;
-        let room_right = iw - 7.0 - cx;
-        let mag = 25.0f64.min(room_left.max(room_right).max(8.0));
-        if room_right >= room_left { mag.min(room_right) } else { -mag.min(room_left) }
-    };
-
     // ---- photometric & registration corrections ----
     let mut jitter_applied = vec![0.0f64; disk.w];
     let mut xreg_applied = vec![0.0f64; disk.w];
     let mut burst_flags = vec![false; disk.w];
     let mut column_gain = vec![1.0f64; disk.w];
+    let mut demix_before_raw: Option<Image> = None;
     if opts.baseline {
         correct_transversalium_baseline(&mut disk);
     } else {
         if opts.transparency_correction {
-            let cont_opts = ExtractOptions {
-                shift: opts.shift + continuum_shift,
-                baseline: false,
-                transpose_input: transpose,
-                window_sigma: 1.5, // wide window: continuum flux, noise-averaged
-                frame_offsets: if flex.iter().any(|f| f.abs() > 0.0) { Some(flex.clone()) } else { None },
+            let fluxv = if let Some(flux) = profile_continuum_flux.take() {
+                flux
+            } else {
+                let cont_opts = ExtractOptions {
+                    shift: opts.shift + continuum_shift,
+                    baseline: false,
+                    transpose_input: transpose,
+                    window_sigma: 1.5, // wide window: continuum flux, noise-averaged
+                    frame_offsets: if flex.iter().any(|f| f.abs() > 0.0) { Some(flex.clone()) } else { None },
+                };
+                let cont_disk = reconstruct_disk(&reader, &geom, &cont_opts);
+                flatfield::measure_column_flux(&cont_disk)
             };
-            let cont_disk = reconstruct_disk(&reader, &geom, &cont_opts);
-            let fluxv = flatfield::measure_column_flux(&cont_disk);
             column_gain = flatfield::transparency_gains(&fluxv, opts.tune.transp_deadband);
             flatfield::apply_column_gains(&mut disk, &column_gain);
             let worst = column_gain.iter().cloned().fold(1.0f64, |m, v| if (v - 1.0).abs() > (m - 1.0).abs() { v } else { m });
@@ -479,6 +514,38 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 vlog!(opts, "transversalium corrected [{pass}]");
             }
         }
+        // Joint residual self-calibration: after the explicit physical
+        // corrections, fit the remaining column-coherent signal to gain,
+        // additive bias, scan/slit displacement and blur modes. The GPU kernel uses the
+        // paired solar limbs as a high-weight round-disk constraint.
+        if opts.use_gpu
+            && opts.tune.column_demix_strength > 0.0
+            && std::env::var("GS_NO_COLUMN_DEMIX").is_err()
+        {
+            demix_before_raw = Some(disk.clone());
+            if let Some((out, state)) = crate::gpu::demix_columns(
+                &disk,
+                opts.tune.column_demix_strength as f32,
+            ) {
+                let max_abs = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let active = state.gain.iter().filter(|g| g.abs() > 0.002).count();
+                vlog!(
+                    opts,
+                    "column-state [gpu x{:.2}]: gain +-{:.2}% ({} active), offset +-{:.2}%, dx +-{:.3}, dy +-{:.3}, blur +-{:.3}",
+                    opts.tune.column_demix_strength,
+                    100.0 * max_abs(&state.gain),
+                    active,
+                    100.0 * max_abs(&state.offset),
+                    max_abs(&state.x_shift),
+                    max_abs(&state.y_shift),
+                    max_abs(&state.blur),
+                );
+                disk = out;
+                stage!("column-state demix");
+            } else {
+                demix_before_raw = None;
+            }
+        }
         if opts.temporal_nlm {
             stage!("pre-NLM stages");
             let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
@@ -547,6 +614,25 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     } else {
         warp_single(&disk, &fit.geom, &wp)
     };
+    // Real-time A/B viewer image. Apply the same NLM and the exact fitted
+    // geometry used by the demixed result, so toggling isolates the new
+    // column-state correction rather than changing registration or scale.
+    let demix_before = demix_before_raw.map(|mut before| {
+        if opts.temporal_nlm {
+            let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
+            if let Some((sigma, h2, thresh)) = quality::nlm_params(&before, opts.tune.nlm_h) {
+                before = crate::gpu::temporal_nlm(&before, radius, h2, sigma, thresh)
+                    .unwrap_or_else(|| quality::temporal_nlm(&before, radius, opts.tune.nlm_h));
+            }
+        }
+        if opts.use_gpu {
+            crate::gpu::warp_single(&before, &fit.geom, &wp)
+                .unwrap_or_else(|| warp_single(&before, &fit.geom, &wp))
+                .image
+        } else {
+            warp_single(&before, &fit.geom, &wp).image
+        }
+    });
     vlog!(opts, "output: {}x{}", output.image.w, output.image.h);
     stage!("limb+ellipse+warp");
 
@@ -647,6 +733,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     vlog!(opts, "[t] TOTAL: {:.2}s", t_start.elapsed().as_secs_f64());
     Ok(ReconReport {
         output,
+        demix_before,
         raw_disk,
         velocity,
         wing_doppler,
