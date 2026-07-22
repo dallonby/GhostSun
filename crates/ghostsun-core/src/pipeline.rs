@@ -107,7 +107,7 @@ pub struct ReconOptions {
     pub burst_repair: bool,
     /// F11.5: temporal non-local-means smoothing
     pub temporal_nlm: bool,
-    /// M2: use Metal/wgpu compute kernels where available (CPU fallback)
+    /// M2: use wgpu compute kernels where available (CPU fallback)
     pub use_gpu: bool,
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
     pub map_iterations: usize,

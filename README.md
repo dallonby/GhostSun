@@ -5,6 +5,10 @@ scans, in native Rust. A ground-up redesign of the algorithms in
 [INTI](https://github.com/Vdesnoux/inti), validated against a physically-modeled
 synthetic scan harness with known ground truth.
 
+GhostSun includes a native desktop app for macOS and Windows 11. It uses Metal
+on macOS and Direct3D 12/Vulkan on Windows through the same `wgpu` rendering and
+compute layer.
+
 ## Results
 
 Synthetic benchmark (identical input SER, registered PSNR/SSIM vs ground truth):
@@ -115,6 +119,19 @@ cargo run --release -- bench --dir testdata --ablations
   ledger (`bench --json ledger.jsonl`) for tuning everything measurably.
 
 ## Usage
+
+### Desktop app
+
+Open or drag a `.ser`, `.fits`, `.fit`, or `.png` file into GhostSun. A `.ser`
+scan is reconstructed in the background; FITS and PNG files open in view-only
+mode. The viewer provides grayscale, Hα color, and (when reconstructed)
+Doppler views.
+
+On macOS, run `cargo run --release --package ghostsun-app`. For Windows 11,
+download the `GhostSun-Windows-x64` build artifact or follow the
+[Windows build and usage guide](docs/windows.md).
+
+### Command line
 
 ```
 # reconstruct a real scan

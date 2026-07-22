@@ -3,7 +3,7 @@ name = "ghostsun-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GhostSun desktop app (Metal-accelerated on Apple Silicon)"
+description = "Cross-platform GhostSun desktop app (Metal and Direct3D 12 via wgpu)"
 
 [[bin]]
 name = "ghostsun-app"

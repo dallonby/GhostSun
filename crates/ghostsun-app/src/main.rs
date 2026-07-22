@@ -1,6 +1,6 @@
-//! GhostSun desktop app: Metal-accelerated (via wgpu) solar reconstruction
-//! viewer and processor for Apple Silicon and beyond.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! GhostSun desktop app: GPU-accelerated (via wgpu) solar reconstruction
+//! viewer and processor for macOS and Windows.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 use eframe::egui;
 use ghostsun_core::image2d::Image;
@@ -18,11 +18,49 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 940.0])
             .with_min_inner_size([980.0, 640.0])
-            .with_title("GhostSun"),
-        renderer: eframe::Renderer::Wgpu, // Metal on Apple Silicon
+            .with_title("GhostSun")
+            .with_icon(app_icon()),
+        // wgpu selects Metal on macOS and Direct3D 12/Vulkan on Windows.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native("GhostSun", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Generate a small native window/taskbar icon without a platform-specific
+/// asset bundle. Keeping it in RGBA form lets eframe use the same icon on
+/// macOS, Windows, and Linux.
+fn app_icon() -> egui::IconData {
+    const SIZE: u32 = 128;
+    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
+    let px = 1.0 / SIZE as f32;
+
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let dx = (x as f32 + 0.5) / SIZE as f32 - 0.5;
+            let dy = (y as f32 + 0.5) / SIZE as f32 - 0.5;
+            let radius = (dx * dx + dy * dy).sqrt();
+            let angle = dy.atan2(dx);
+
+            let disk = ((0.285 - radius) / px).clamp(0.0, 1.0);
+            let ray_band = ((radius - 0.345) / (2.0 * px)).clamp(0.0, 1.0)
+                * ((0.465 - radius) / (2.0 * px)).clamp(0.0, 1.0);
+            let ray_direction = (((angle * 8.0).cos() - 0.91) / 0.09).clamp(0.0, 1.0);
+            let rays = ray_band * ray_direction;
+            let alpha = disk.max(rays);
+
+            if alpha > 0.0 {
+                let glow = (1.0 - radius / 0.285).clamp(0.0, 1.0);
+                let i = ((y * SIZE + x) * 4) as usize;
+                rgba[i] = 255;
+                rgba[i + 1] = (126.0 + 68.0 * glow) as u8;
+                rgba[i + 2] = (28.0 + 32.0 * glow) as u8;
+                rgba[i + 3] = (255.0 * alpha) as u8;
+            }
+        }
+    }
+
+    egui::IconData { rgba, width: SIZE, height: SIZE }
 }
 
 // ---------------------------------------------------------------------------

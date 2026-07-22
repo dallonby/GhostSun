@@ -151,7 +151,7 @@ enum Cmd {
         /// disable temporal NLM smoothing (F11.5)
         #[arg(long)]
         no_nlm: bool,
-        /// disable Metal/GPU compute kernels (CPU only)
+        /// disable GPU compute kernels (CPU only)
         #[arg(long)]
         no_gpu: bool,
         /// extra block-coordinate refinement iterations (F8)
@@ -386,7 +386,7 @@ fn main() {
             // profile extraction (needs a synthetic SER scan)
             {
                 use ghostsun_core::{linefit, profile};
-                let dir = std::path::PathBuf::from("/tmp/gs_gpucheck");
+                let dir = std::env::temp_dir().join("gs_gpucheck");
                 std::fs::create_dir_all(&dir).unwrap();
                 let ser = std::env::var("GS_CHECK_SER").map(std::path::PathBuf::from).unwrap_or(dir.join("synth.ser"));
                 if !ser.exists() {

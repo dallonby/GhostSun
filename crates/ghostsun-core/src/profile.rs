@@ -540,7 +540,7 @@ pub fn estimate_flexure_telluric(
             }
             out.push('\n');
         }
-        let _ = std::fs::write("/tmp/anchor_series.csv", out);
+        let _ = std::fs::write(std::env::temp_dir().join("anchor_series.csv"), out);
     }
     // combine: median over kept lines per frame, fill, light smoothing
     let mut flex = vec![f64::NAN; n];

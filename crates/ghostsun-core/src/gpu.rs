@@ -1,4 +1,5 @@
-//! M2: GPU compute kernels via wgpu — Metal on Apple Silicon.
+//! M2: GPU compute kernels via wgpu — Metal on macOS and Direct3D 12/Vulkan
+//! on Windows.
 //!
 //! Every kernel is a direct port of its CPU counterpart and must pass the
 //! `ghostsun gpucheck` equivalence gate (max relative difference against
