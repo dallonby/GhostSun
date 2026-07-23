@@ -758,22 +758,31 @@ fn profile_plot(
     let profile = profile.to_vec();
     let cands = candidates.to_vec();
     let labels = labels.to_vec();
-    let ytop = profile.iter().cloned().fold(f32::MIN, f32::max) as f64;
+    let ymin = profile.iter().cloned().fold(f32::MAX, f32::min) as f64;
+    let ymax = profile.iter().cloned().fold(f32::MIN, f32::max) as f64;
+    let span = (ymax - ymin).max(1.0);
     let mut clicked = None;
-    Plot::new(id).height(height).allow_scroll(false).show_axes([false, true]).show(ui, |p| {
+    let mut plot = Plot::new(id).height(height).allow_scroll(false).show_axes([false, true]);
+    if !labels.is_empty() {
+        // Reserve headroom above the profile so the labels aren't clipped.
+        plot = plot.include_y(ymin).include_y(ymax + 0.34 * span);
+    }
+    plot.show(ui, |p| {
         let pts: PlotPoints = profile.iter().enumerate().map(|(x, &y)| [x as f64, y as f64]).collect();
         p.line(Line::new(pts).color(color).name("profile"));
         // Faint marker at each detected candidate line.
         for &c in &cands {
             p.vline(VLine::new(c).color(egui::Color32::from_gray(80)));
         }
-        // Identified lines: green marker + element/λ label.
+        // Identified lines: green marker + element/λ label, staggered in the
+        // headroom so neighbours don't overprint and nothing clips at the top.
         let label_col = egui::Color32::from_rgb(140, 235, 165);
-        for (x, txt) in &labels {
+        for (k, (x, txt)) in labels.iter().enumerate() {
             p.vline(VLine::new(*x).color(label_col));
+            let ly = ymax + span * (0.06 + 0.13 * (k % 2) as f64);
             p.text(
-                Text::new(PlotPoint::new(*x, ytop), egui::RichText::new(txt).size(11.0).color(label_col))
-                    .anchor(egui::Align2::LEFT_BOTTOM),
+                Text::new(PlotPoint::new(*x, ly), egui::RichText::new(txt).size(11.0).color(label_col))
+                    .anchor(egui::Align2::CENTER_BOTTOM),
             );
         }
         if let Some(f) = fit {
