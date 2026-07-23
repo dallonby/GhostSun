@@ -32,6 +32,109 @@ pub struct ExtractOptions {
     pub frame_offsets: Option<Vec<f64>>,
 }
 
+/// Fast, sparse continuum preview used to solve frame-to-frame motion before
+/// the expensive profile extraction. Only three spectral samples are read for
+/// each slit row, directly from the memory-mapped SER; no frame allocation or
+/// spectral prefilter is required.
+pub fn reconstruct_continuum_preview(
+    reader: &SerReader,
+    geom: &LineGeometry,
+    transpose: bool,
+    spectral_shift: f64,
+) -> Image {
+    let n = reader.header.frame_count;
+    let slit_h = if transpose {
+        reader.header.width
+    } else {
+        reader.header.height
+    };
+    let spec_w = if transpose {
+        reader.header.height
+    } else {
+        reader.header.width
+    };
+    let native_w = reader.header.width;
+    let bpp = reader.bytes_per_px();
+    // Collapse the three linearly interpolated binomial taps into four
+    // native pixels. This is algebraically identical to
+    // .25*S(p-1) + .50*S(p) + .25*S(p+1), but avoids two raw loads and the
+    // indexing closures in the hot loop.
+    let taps: Vec<(usize, [f32; 4])> = (0..slit_h)
+        .map(|y| {
+            let p = (polyval(&geom.coeffs, y as f64) + spectral_shift)
+                .clamp(1.0, (spec_w - 2) as f64);
+            let x0 = p.floor() as usize;
+            let f = (p - x0 as f64) as f32;
+            (
+                x0,
+                [
+                    0.25 * (1.0 - f),
+                    0.50 - 0.25 * f,
+                    0.25 + 0.25 * f,
+                    0.25 * f,
+                ],
+            )
+        })
+        .collect();
+
+    let cols: Vec<Vec<f32>> = (0..n)
+        .into_par_iter()
+        .map(|t| {
+            let raw = reader.raw_frames(t, 1);
+            let mut col = vec![0.0f32; slit_h];
+            if bpp == 2 {
+                for y in 0..slit_h {
+                    let (x0, weights) = taps[y];
+                    let spectral = [
+                        x0 - 1,
+                        x0,
+                        x0 + 1,
+                        (x0 + 2).min(spec_w - 1),
+                    ];
+                    let mut value = 0.0f32;
+                    for k in 0..4 {
+                        let index = if transpose {
+                            spectral[k] * native_w + y
+                        } else {
+                            y * native_w + spectral[k]
+                        };
+                        value += weights[k]
+                            * u16::from_le_bytes([raw[2 * index], raw[2 * index + 1]]) as f32;
+                    }
+                    col[y] = value;
+                }
+            } else {
+                for y in 0..slit_h {
+                    let (x0, weights) = taps[y];
+                    let spectral = [
+                        x0 - 1,
+                        x0,
+                        x0 + 1,
+                        (x0 + 2).min(spec_w - 1),
+                    ];
+                    let mut value = 0.0f32;
+                    for k in 0..4 {
+                        let index = if transpose {
+                            spectral[k] * native_w + y
+                        } else {
+                            y * native_w + spectral[k]
+                        };
+                        value += weights[k] * raw[index] as f32;
+                    }
+                    col[y] = value * 257.0;
+                }
+            }
+            col
+        })
+        .collect();
+
+    let mut preview = Image::new(n, slit_h);
+    for (t, col) in cols.iter().enumerate() {
+        preview.set_column(t, col);
+    }
+    preview
+}
+
 /// Reconstruct the disk: output image has width = n_frames, height = slit_h.
 pub fn reconstruct_disk(reader: &SerReader, geom: &LineGeometry, opts: &ExtractOptions) -> Image {
     let n = reader.header.frame_count;

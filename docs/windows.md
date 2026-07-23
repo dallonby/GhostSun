@@ -9,10 +9,17 @@ skipped.
 ## Run the packaged app
 
 1. Download the `GhostSun-Windows-x64` artifact from the repository's latest
-   **Windows 11 build** workflow run.
+   **Desktop builds** workflow run, or download the ZIP from a tagged release.
 2. Extract the downloaded ZIP completely.
 3. Double-click `GhostSun.exe`.
 4. Open or drag in a `.ser`, `.fits`, `.fit`, or `.png` file.
+5. For SER data, review the pipeline settings and click **Process**.
+
+After a timestamped SER has been processed, **Orient from GONG** can download
+the nearest public GONG H-alpha reference and feature-match the result to solar
+north-up, east-left. This optional action needs an internet connection and a
+valid UTC timestamp in the SER header. References are cached under the current
+Windows temporary directory.
 
 The executable is currently unsigned, so Windows SmartScreen may show an
 "unrecognized app" warning. Verify `GhostSun.exe` against `SHA256SUMS.txt`
@@ -20,6 +27,18 @@ before choosing **More info > Run anyway**.
 
 The app does not need an installer or the Rust toolchain. Keep it anywhere you
 can write files; loaded scans and exported images can be located elsewhere.
+
+## ToupTek cameras
+
+The Focus view uses ToupTek's 64-bit SDK at runtime. GhostSun searches beside
+`GhostSun.exe`, the system DLL paths, and common 64-bit N.I.N.A., SharpCap, and
+ASCOM installations. Click **Refresh** in the Focus view after connecting the
+camera; the status line now distinguishes a missing SDK from an SDK that loaded
+but detected no hardware.
+
+For another SDK location, set `GHOSTSUN_TOUPCAM_LIB` to the full path of the
+64-bit `toupcam.dll` before starting GhostSun. Do not point it at the x86 DLL.
+The standalone package does not redistribute the vendor SDK.
 
 ## Build on Windows
 

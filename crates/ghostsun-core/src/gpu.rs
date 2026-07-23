@@ -141,9 +141,12 @@ impl Gpu {
 
 // One workgroup owns one acquisition column. The latent clean column is
 // predicted by a symmetric, multi-baseline temporal consensus.
-// Thousands of slit samples then robustly constrain five small nuisance modes:
+// Thousands of slit samples then robustly constrain six small nuisance modes:
 // multiplicative gain, additive bias, scan displacement, slit displacement,
-// and isotropic blur.  The normal equations are reduced and solved inside the
+// and separate scan/slit-axis blur.  Keeping the blur tensor in native
+// acquisition coordinates is important: the final affine warp may make a
+// slit-axis column appear diagonal, but it is still corrected along its true
+// sampling axis here.  The normal equations are reduced and solved inside the
 // workgroup.  Photometric terms are inverted on the original column (rather
 // than replacing it with the prediction), so its fine detail is retained.
 const COLUMN_DEMIX_WGSL: &str = r#"
@@ -162,23 +165,30 @@ var<workgroup> s01: array<f32, 256>;
 var<workgroup> s02: array<f32, 256>;
 var<workgroup> s03: array<f32, 256>;
 var<workgroup> s04: array<f32, 256>;
+var<workgroup> s05: array<f32, 256>;
 var<workgroup> s11: array<f32, 256>;
 var<workgroup> s12: array<f32, 256>;
 var<workgroup> s13: array<f32, 256>;
 var<workgroup> s14: array<f32, 256>;
+var<workgroup> s15: array<f32, 256>;
 var<workgroup> s22: array<f32, 256>;
 var<workgroup> s23: array<f32, 256>;
 var<workgroup> s24: array<f32, 256>;
+var<workgroup> s25: array<f32, 256>;
 var<workgroup> s33: array<f32, 256>;
 var<workgroup> s34: array<f32, 256>;
+var<workgroup> s35: array<f32, 256>;
 var<workgroup> s44: array<f32, 256>;
+var<workgroup> s45: array<f32, 256>;
+var<workgroup> s55: array<f32, 256>;
 var<workgroup> sb0: array<f32, 256>;
 var<workgroup> sb1: array<f32, 256>;
 var<workgroup> sb2: array<f32, 256>;
 var<workgroup> sb3: array<f32, 256>;
 var<workgroup> sb4: array<f32, 256>;
+var<workgroup> sb5: array<f32, 256>;
 var<workgroup> scount: array<f32, 256>;
-var<workgroup> coeff: array<f32, 5>;
+var<workgroup> coeff: array<f32, 6>;
 
 fn at(x: i32, y: i32) -> f32 {
     let xx = u32(clamp(x, 0, i32(p.w) - 1));
@@ -205,11 +215,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let edge = x < 8 || x + 8 >= i32(p.w);
     let inv_level = 1.0 / max(p.level, 1.0e-6);
 
-    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0; var a04 = 0.0;
-    var a11 = 0.0; var a12 = 0.0; var a13 = 0.0; var a14 = 0.0;
-    var a22 = 0.0; var a23 = 0.0; var a24 = 0.0;
-    var a33 = 0.0; var a34 = 0.0; var a44 = 0.0;
-    var b0 = 0.0; var b1 = 0.0; var b2 = 0.0; var b3 = 0.0; var b4 = 0.0;
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0; var a04 = 0.0; var a05 = 0.0;
+    var a11 = 0.0; var a12 = 0.0; var a13 = 0.0; var a14 = 0.0; var a15 = 0.0;
+    var a22 = 0.0; var a23 = 0.0; var a24 = 0.0; var a25 = 0.0;
+    var a33 = 0.0; var a34 = 0.0; var a35 = 0.0;
+    var a44 = 0.0; var a45 = 0.0; var a55 = 0.0;
+    var b0 = 0.0; var b1 = 0.0; var b2 = 0.0; var b3 = 0.0; var b4 = 0.0; var b5 = 0.0;
     var count = 0.0;
 
     if (!edge) {
@@ -224,7 +235,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 let ref_p = prediction(x, y + 1);
                 let dx = 0.5 * (xp - xm);
                 let dy = 0.5 * (ref_p - ref_m);
-                let lap = xm + xp + ref_m + ref_p - 4.0 * pred;
+                // Keep the two principal curvatures separate. A slit-axis
+                // blur becomes a slanted PSF after ellipse shear/rotation;
+                // combining it with the scan curvature prevents the fit from
+                // identifying and inverting that directional component.
+                let curv_x = xm + xp - 2.0 * pred;
+                let curv_y = ref_m + ref_p - 2.0 * pred;
                 let residual = obs - pred;
 
                 // Normalize all columns of the tiny design matrix to the same
@@ -236,10 +252,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 let f0 = photometric_gate * clamp(pred * inv_level, 0.0, 8.0);
                 let f1 = photometric_gate * clamp(dx * inv_level, -4.0, 4.0);
                 let f2 = photometric_gate * clamp(dy * inv_level, -4.0, 4.0);
-                let f3 = photometric_gate * clamp(lap * inv_level, -4.0, 4.0);
+                let f3 = photometric_gate * clamp(curv_x * inv_level, -4.0, 4.0);
+                let f4 = photometric_gate * clamp(curv_y * inv_level, -4.0, 4.0);
                 // A constant detector/extraction bias is visible even outside
                 // the disk.  Low-signal rows constrain only this mode.
-                let f4 = 1.0;
+                let f5 = 1.0;
                 let rr = residual * inv_level;
                 // The two high-gradient limb intersections are a physical
                 // round-disk constraint shared by the whole column. Give
@@ -255,34 +272,40 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                     let signal_weight = select(0.20, 1.0 + 2.0 * limb, illuminated);
                     wt = z * z * signal_weight;
                 }
-                a00 += wt*f0*f0; a01 += wt*f0*f1; a02 += wt*f0*f2; a03 += wt*f0*f3; a04 += wt*f0*f4;
-                a11 += wt*f1*f1; a12 += wt*f1*f2; a13 += wt*f1*f3; a14 += wt*f1*f4;
-                a22 += wt*f2*f2; a23 += wt*f2*f3; a24 += wt*f2*f4;
-                a33 += wt*f3*f3; a34 += wt*f3*f4; a44 += wt*f4*f4;
-                b0 += wt*f0*rr; b1 += wt*f1*rr; b2 += wt*f2*rr; b3 += wt*f3*rr; b4 += wt*f4*rr;
+                a00 += wt*f0*f0; a01 += wt*f0*f1; a02 += wt*f0*f2; a03 += wt*f0*f3; a04 += wt*f0*f4; a05 += wt*f0*f5;
+                a11 += wt*f1*f1; a12 += wt*f1*f2; a13 += wt*f1*f3; a14 += wt*f1*f4; a15 += wt*f1*f5;
+                a22 += wt*f2*f2; a23 += wt*f2*f3; a24 += wt*f2*f4; a25 += wt*f2*f5;
+                a33 += wt*f3*f3; a34 += wt*f3*f4; a35 += wt*f3*f5;
+                a44 += wt*f4*f4; a45 += wt*f4*f5; a55 += wt*f5*f5;
+                b0 += wt*f0*rr; b1 += wt*f1*rr; b2 += wt*f2*rr; b3 += wt*f3*rr; b4 += wt*f4*rr; b5 += wt*f5*rr;
                 if (wt > 0.05) { count += 1.0; }
             }
         }
     }
 
-    s00[lid]=a00; s01[lid]=a01; s02[lid]=a02; s03[lid]=a03; s04[lid]=a04;
-    s11[lid]=a11; s12[lid]=a12; s13[lid]=a13; s14[lid]=a14;
-    s22[lid]=a22; s23[lid]=a23; s24[lid]=a24;
-    s33[lid]=a33; s34[lid]=a34; s44[lid]=a44;
-    sb0[lid]=b0; sb1[lid]=b1; sb2[lid]=b2; sb3[lid]=b3; sb4[lid]=b4; scount[lid]=count;
+    s00[lid]=a00; s01[lid]=a01; s02[lid]=a02; s03[lid]=a03; s04[lid]=a04; s05[lid]=a05;
+    s11[lid]=a11; s12[lid]=a12; s13[lid]=a13; s14[lid]=a14; s15[lid]=a15;
+    s22[lid]=a22; s23[lid]=a23; s24[lid]=a24; s25[lid]=a25;
+    s33[lid]=a33; s34[lid]=a34; s35[lid]=a35;
+    s44[lid]=a44; s45[lid]=a45; s55[lid]=a55;
+    sb0[lid]=b0; sb1[lid]=b1; sb2[lid]=b2; sb3[lid]=b3; sb4[lid]=b4; sb5[lid]=b5; scount[lid]=count;
     workgroupBarrier();
 
     var stride = WG / 2u;
     while (stride > 0u) {
         if (lid < stride) {
             s00[lid]+=s00[lid+stride]; s01[lid]+=s01[lid+stride];
-            s02[lid]+=s02[lid+stride]; s03[lid]+=s03[lid+stride]; s04[lid]+=s04[lid+stride];
+            s02[lid]+=s02[lid+stride]; s03[lid]+=s03[lid+stride];
+            s04[lid]+=s04[lid+stride]; s05[lid]+=s05[lid+stride];
             s11[lid]+=s11[lid+stride]; s12[lid]+=s12[lid+stride];
-            s13[lid]+=s13[lid+stride]; s14[lid]+=s14[lid+stride];
-            s22[lid]+=s22[lid+stride]; s23[lid]+=s23[lid+stride]; s24[lid]+=s24[lid+stride];
-            s33[lid]+=s33[lid+stride]; s34[lid]+=s34[lid+stride]; s44[lid]+=s44[lid+stride];
+            s13[lid]+=s13[lid+stride]; s14[lid]+=s14[lid+stride]; s15[lid]+=s15[lid+stride];
+            s22[lid]+=s22[lid+stride]; s23[lid]+=s23[lid+stride];
+            s24[lid]+=s24[lid+stride]; s25[lid]+=s25[lid+stride];
+            s33[lid]+=s33[lid+stride]; s34[lid]+=s34[lid+stride]; s35[lid]+=s35[lid+stride];
+            s44[lid]+=s44[lid+stride]; s45[lid]+=s45[lid+stride]; s55[lid]+=s55[lid+stride];
             sb0[lid]+=sb0[lid+stride]; sb1[lid]+=sb1[lid+stride];
-            sb2[lid]+=sb2[lid+stride]; sb3[lid]+=sb3[lid+stride]; sb4[lid]+=sb4[lid+stride];
+            sb2[lid]+=sb2[lid+stride]; sb3[lid]+=sb3[lid+stride];
+            sb4[lid]+=sb4[lid+stride]; sb5[lid]+=sb5[lid+stride];
             scount[lid]+=scount[lid+stride];
         }
         workgroupBarrier();
@@ -290,23 +313,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     }
 
     if (lid == 0u) {
-        coeff[0]=0.0; coeff[1]=0.0; coeff[2]=0.0; coeff[3]=0.0; coeff[4]=0.0;
+        coeff[0]=0.0; coeff[1]=0.0; coeff[2]=0.0;
+        coeff[3]=0.0; coeff[4]=0.0; coeff[5]=0.0;
         if (!edge && scount[0] >= 128.0) {
             // Ridge strengths encode conservative priors: residual gain is
             // easiest to identify; geometry is bounded below; blur requires
             // substantially more evidence before it is changed.
-            var m = array<array<f32, 6>, 5>(
-                array<f32, 6>(s00[0]+2.0, s01[0], s02[0], s03[0], s04[0], sb0[0]),
-                array<f32, 6>(s01[0], s11[0]+12.0, s12[0], s13[0], s14[0], sb1[0]),
-                array<f32, 6>(s02[0], s12[0], s22[0]+12.0, s23[0], s24[0], sb2[0]),
-                array<f32, 6>(s03[0], s13[0], s23[0], s33[0]+40.0, s34[0], sb3[0]),
-                array<f32, 6>(s04[0], s14[0], s24[0], s34[0], s44[0]+4.0, sb4[0])
+            var m = array<array<f32, 7>, 6>(
+                array<f32, 7>(s00[0]+2.0, s01[0], s02[0], s03[0], s04[0], s05[0], sb0[0]),
+                array<f32, 7>(s01[0], s11[0]+12.0, s12[0], s13[0], s14[0], s15[0], sb1[0]),
+                array<f32, 7>(s02[0], s12[0], s22[0]+12.0, s23[0], s24[0], s25[0], sb2[0]),
+                array<f32, 7>(s03[0], s13[0], s23[0], s33[0]+20.0, s34[0], s35[0], sb3[0]),
+                array<f32, 7>(s04[0], s14[0], s24[0], s34[0], s44[0]+20.0, s45[0], sb4[0]),
+                array<f32, 7>(s05[0], s15[0], s25[0], s35[0], s45[0], s55[0]+4.0, sb5[0])
             );
-            // Five-variable Gauss-Jordan solve with partial pivoting.
-            for (var k = 0u; k < 5u; k++) {
+            // Six-variable Gauss-Jordan solve with partial pivoting.
+            for (var k = 0u; k < 6u; k++) {
                 var pivot = k;
                 var pv = abs(m[k][k]);
-                for (var r = k + 1u; r < 5u; r++) {
+                for (var r = k + 1u; r < 6u; r++) {
                     if (abs(m[r][k]) > pv) { pivot = r; pv = abs(m[r][k]); }
                 }
                 if (pivot != k) {
@@ -314,22 +339,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
                 }
                 if (abs(m[k][k]) > 1.0e-8) {
                     let d = m[k][k];
-                    for (var j = k; j < 6u; j++) { m[k][j] /= d; }
-                    for (var r = 0u; r < 5u; r++) {
+                    for (var j = k; j < 7u; j++) { m[k][j] /= d; }
+                    for (var r = 0u; r < 6u; r++) {
                         if (r != k) {
                             let q = m[r][k];
-                            for (var j = k; j < 6u; j++) { m[r][j] -= q * m[k][j]; }
+                            for (var j = k; j < 7u; j++) { m[r][j] -= q * m[k][j]; }
                         }
                     }
                 }
             }
-            coeff[0] = clamp(m[0][5], -0.10, 0.10);
-            coeff[1] = clamp(m[1][5], -0.40, 0.40);
-            coeff[2] = clamp(m[2][5], -0.40, 0.40);
-            coeff[3] = clamp(m[3][5], -0.20, 0.20);
-            coeff[4] = clamp(m[4][5], -0.10, 0.10);
+            coeff[0] = clamp(m[0][6], -0.10, 0.10);
+            coeff[1] = clamp(m[1][6], -0.40, 0.40);
+            coeff[2] = clamp(m[2][6], -0.40, 0.40);
+            coeff[3] = clamp(m[3][6], -0.20, 0.20);
+            coeff[4] = clamp(m[4][6], -0.20, 0.20);
+            coeff[5] = clamp(m[5][6], -0.10, 0.10);
         }
-        for (var k = 0u; k < 5u; k++) { state[wid.x * 5u + k] = coeff[k]; }
+        for (var k = 0u; k < 6u; k++) { state[wid.x * 6u + k] = coeff[k]; }
     }
     workgroupBarrier();
 
@@ -344,13 +370,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         let ref_p = prediction(x, y + 1);
         let dx = 0.5 * (xp - xm);
         let dy = 0.5 * (ref_p - ref_m);
-        let lap = xm + xp + ref_m + ref_p - 4.0 * pred;
+        let curv_x = xm + xp - 2.0 * pred;
+        let curv_y = ref_m + ref_p - 2.0 * pred;
         // Invert the shared photometric state on the original sample: this
         // normalizes the whole column without substituting neighbour pixels.
-        var corrected = src[idx] - p.strength * coeff[4] * p.level;
+        var corrected = src[idx] - p.strength * coeff[5] * p.level;
         if (pred > 0.35 * p.thresh) {
             corrected = corrected / max(1.0 + p.strength * coeff[0], 0.80);
-            corrected -= p.strength * (coeff[1]*dx + coeff[2]*dy + coeff[3]*lap);
+            corrected -= p.strength * (coeff[1]*dx + coeff[2]*dy
+                                      + coeff[3]*curv_x + coeff[4]*curv_y);
         }
         dst[idx] = max(corrected, 0.0);
     }
@@ -361,7 +389,11 @@ pub struct ColumnState {
     pub gain: Vec<f64>,
     pub x_shift: Vec<f64>,
     pub y_shift: Vec<f64>,
-    pub blur: Vec<f64>,
+    /// Differential blur along the frame/scan axis.
+    pub blur_x: Vec<f64>,
+    /// Differential blur along the detector slit axis. The final affine warp
+    /// may render this axis diagonally without changing its physical basis.
+    pub blur_y: Vec<f64>,
     /// Additive bias as a fraction of the robust intensity level.
     pub offset: Vec<f64>,
 }
@@ -404,7 +436,7 @@ pub fn demix_columns(disk: &Image, strength: f32) -> Option<(Image, ColumnState)
         usage: wgpu::BufferUsages::STORAGE,
     });
     let image_bytes = (disk.data.len() * 4) as u64;
-    let state_bytes = (disk.w * 5 * 4) as u64;
+    let state_bytes = (disk.w * 6 * 4) as u64;
     let dst_buf = d.create_buffer(&wgpu::BufferDescriptor {
         label: Some("column-demix-dst"), size: image_bytes,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
@@ -461,11 +493,11 @@ pub fn demix_columns(disk: &Image, strength: f32) -> Option<(Image, ColumnState)
     let image_data: Vec<f32> = bytemuck::cast_slice(&map(&read_image)?).to_vec();
     let state_data: Vec<f32> = bytemuck::cast_slice(&map(&read_state)?).to_vec();
     let unpack = |k: usize| -> Vec<f64> {
-        (0..disk.w).map(|x| state_data[x * 5 + k] as f64).collect()
+        (0..disk.w).map(|x| state_data[x * 6 + k] as f64).collect()
     };
     let mut state = ColumnState {
-        gain: unpack(0), x_shift: unpack(1), y_shift: unpack(2), blur: unpack(3),
-        offset: unpack(4),
+        gain: unpack(0), x_shift: unpack(1), y_shift: unpack(2),
+        blur_x: unpack(3), blur_y: unpack(4), offset: unpack(5),
     };
     // Scan-level evidence gate. A clean scan produces tiny isolated fit
     // coefficients; a real column pattern appears coherently in many frames.
@@ -482,7 +514,8 @@ pub fn demix_columns(disk: &Image, strength: f32) -> Option<(Image, ColumnState)
             || count_over(&state.offset, 0.002 / sensitivity) >= need
             || count_over(&state.x_shift, 0.020 / sensitivity) >= need
             || count_over(&state.y_shift, 0.020 / sensitivity) >= need
-            || count_over(&state.blur, 0.015 / sensitivity) >= need);
+            || count_over(&state.blur_x, 0.025 / sensitivity) >= need
+            || count_over(&state.blur_y, 0.025 / sensitivity) >= need);
     let mut out = Image::new(disk.w, disk.h);
     if enabled {
         out.data = image_data;
@@ -491,7 +524,8 @@ pub fn demix_columns(disk: &Image, strength: f32) -> Option<(Image, ColumnState)
         state.gain.fill(0.0);
         state.x_shift.fill(0.0);
         state.y_shift.fill(0.0);
-        state.blur.fill(0.0);
+        state.blur_x.fill(0.0);
+        state.blur_y.fill(0.0);
         state.offset.fill(0.0);
     }
     Some((out, state))

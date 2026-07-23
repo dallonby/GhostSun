@@ -3,7 +3,7 @@
 use crate::deconv;
 use crate::denoise;
 use crate::ellipse;
-use crate::extract::{reconstruct_disk, ExtractOptions, SpectralKernel};
+use crate::extract::{self, reconstruct_disk, ExtractOptions, SpectralKernel};
 use crate::flatfield;
 use crate::image2d::Image;
 use crate::jitter;
@@ -30,6 +30,7 @@ pub struct TuneParams {
     pub burst_thresh: f64,    // burst detection threshold (x local floor)
     pub nlm_radius: f64,      // temporal NLM neighbor radius (frames)
     pub nlm_h: f64,           // temporal NLM strength (x noise sigma)
+    pub motion_strength: f64, // pre-extraction slit-motion correction (0..1.5)
     pub column_demix_strength: f64, // residual column-state correction (0..1)
     pub rl_iters: f64,        // Richardson-Lucy iterations
     pub rl_tv: f64,           // RL total-variation lambda
@@ -50,6 +51,7 @@ impl Default for TuneParams {
             burst_thresh: 1.3,
             nlm_radius: 3.0,
             nlm_h: 1.8,
+            motion_strength: 1.0,
             column_demix_strength: 1.0,
             rl_iters: 15.0,
             rl_tv: 0.01,
@@ -72,6 +74,7 @@ impl TuneParams {
             "burst_thresh" => self.burst_thresh = v,
             "nlm_radius" => self.nlm_radius = v,
             "nlm_h" => self.nlm_h = v,
+            "motion_strength" => self.motion_strength = v,
             "column_demix_strength" => self.column_demix_strength = v,
             "rl_iters" => self.rl_iters = v,
             "rl_tv" => self.rl_tv = v,
@@ -322,13 +325,73 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         if room_right >= room_left { mag.min(room_right) } else { -mag.min(room_left) }
     };
 
+    // Solve slit-direction motion before fitting the spectral profile. The
+    // preview touches only three continuum samples per detector row, then the
+    // recovered sub-pixel trajectory is consumed directly by the extraction
+    // kernel. This retains the raw spectrum instead of resampling an already
+    // reconstructed line-core column.
+    let motion_strength = opts.tune.motion_strength.clamp(0.0, 1.5);
+    let pre_extraction_motion: Option<Vec<f64>> =
+        if use_profile && opts.jitter_correction && motion_strength >= 1e-3 {
+            let mut reference = extract::reconstruct_continuum_preview(
+                &reader,
+                &geom,
+                transpose,
+                continuum_shift,
+            );
+            let mut trajectory = vec![0.0f64; n];
+            if opts.jitter_fast {
+                let jr = jitter::correct_jitter(
+                    &reference,
+                    opts.tune.jitter_hp.round() as usize,
+                );
+                for (dst, src) in trajectory.iter_mut().zip(&jr.trajectory) {
+                    *dst += *src;
+                }
+                reference = jr.corrected;
+            }
+            if opts.jitter_drift {
+                let dr = jitter::correct_drift(&reference);
+                for (dst, src) in trajectory.iter_mut().zip(&dr.trajectory) {
+                    *dst += *src;
+                }
+            }
+            for value in &mut trajectory {
+                *value *= motion_strength;
+            }
+            let max_motion = trajectory
+                .iter()
+                .cloned()
+                .fold(0.0f64, |m, v| m.max(v.abs()));
+            let active = trajectory.iter().filter(|v| v.abs() >= 0.04).count();
+            vlog!(
+                opts,
+                "motion registration [continuum -> extraction x{:.2}]: {} active, max {:.2} px",
+                motion_strength,
+                active,
+                max_motion
+            );
+            stage!("motion preview");
+            Some(trajectory)
+        } else {
+            None
+        };
+
     // The profile extractor already produces a de-smiled per-frame spectrum.
     // Retain its continuum bin so transparency correction does not need a
     // second full extraction of every SER frame.
     let mut profile_continuum_flux: Option<Vec<f64>> = None;
     let (mut disk, flex, mut velocity_raw): (Image, Vec<f64>, Option<Image>) = if use_profile {
-        let (maps, on_gpu) =
-            profile::extract_profile_auto(&reader, &geom, &mean_img, transpose, opts.shift, &ptune, opts.use_gpu);
+        let (maps, on_gpu) = profile::extract_profile_auto(
+            &reader,
+            &geom,
+            &mean_img,
+            transpose,
+            opts.shift,
+            &ptune,
+            opts.use_gpu,
+            pre_extraction_motion.as_deref(),
+        );
         vlog!(opts, "extraction [{}]", if on_gpu { "gpu" } else { "cpu" });
         // The optimized GPU spectrum is disk-gated.  The CPU reference keeps
         // its historic all-lit-row spectrum, so retain the legacy continuum
@@ -407,7 +470,9 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     stage!("extraction");
 
     // ---- photometric & registration corrections ----
-    let mut jitter_applied = vec![0.0f64; disk.w];
+    let mut jitter_applied = pre_extraction_motion
+        .clone()
+        .unwrap_or_else(|| vec![0.0f64; disk.w]);
     let mut xreg_applied = vec![0.0f64; disk.w];
     let mut burst_flags = vec![false; disk.w];
     let mut column_gain = vec![1.0f64; disk.w];
@@ -438,9 +503,10 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         // re-estimated on the already-corrected disk; corrections compose.
         let passes = 1 + opts.map_iterations;
         for pass in 0..passes {
-            if opts.jitter_correction {
+            if opts.jitter_correction && pre_extraction_motion.is_none() {
                 if opts.jitter_fast {
-                    let jr = jitter::correct_jitter(&disk, opts.tune.jitter_hp.round() as usize);
+                    let jr =
+                        jitter::correct_jitter(&disk, opts.tune.jitter_hp.round() as usize);
                     let max_c = jr.trajectory.iter().cloned().fold(0.0f64, |m, v| m.max(v.abs()));
                     vlog!(opts, "jitter[{pass}]: max fast correction {:.2} px", max_c);
                     disk = jr.corrected;
@@ -522,8 +588,12 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         }
         // Joint residual self-calibration: after the explicit physical
         // corrections, fit the remaining column-coherent signal to gain,
-        // additive bias, scan/slit displacement and blur modes. The GPU kernel uses the
-        // paired solar limbs as a high-weight round-disk constraint.
+        // additive bias, scan/slit displacement and independent scan/slit
+        // blur modes. The GPU kernel uses the paired solar limbs as a
+        // high-weight round-disk constraint. It deliberately works in native
+        // acquisition coordinates: the one-shot warp below may make the slit
+        // axis diagonal in the output, but no pre-rotation/resampling is
+        // needed to correct it.
         if opts.use_gpu
             && opts.tune.column_demix_strength > 0.0
             && std::env::var("GS_NO_COLUMN_DEMIX").is_err()
@@ -537,14 +607,15 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 let active = state.gain.iter().filter(|g| g.abs() > 0.002).count();
                 vlog!(
                     opts,
-                    "column-state [gpu x{:.2}]: gain +-{:.2}% ({} active), offset +-{:.2}%, dx +-{:.3}, dy +-{:.3}, blur +-{:.3}",
+                    "column-state [gpu x{:.2}]: gain +-{:.2}% ({} active), offset +-{:.2}%, dx +-{:.3}, dy +-{:.3}, blur-x +-{:.3}, blur-y +-{:.3}",
                     opts.tune.column_demix_strength,
                     100.0 * max_abs(&state.gain),
                     active,
                     100.0 * max_abs(&state.offset),
                     max_abs(&state.x_shift),
                     max_abs(&state.y_shift),
-                    max_abs(&state.blur),
+                    max_abs(&state.blur_x),
+                    max_abs(&state.blur_y),
                 );
                 disk = out;
                 stage!("column-state demix");
@@ -607,6 +678,11 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         filtered_downscale: opts.filtered_warp && !opts.baseline,
         allow_negative: false,
     };
+    vlog!(
+        opts,
+        "column/slit axis in output: {:+.2} deg from vertical (geometry-aware native-axis correction)",
+        crate::warp::slit_axis_angle_deg(&fit.geom, &wp)
+    );
     let mut output = if opts.baseline {
         warp_baseline(&disk, &fit.geom, &wp)
     } else if opts.use_gpu {

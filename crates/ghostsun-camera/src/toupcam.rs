@@ -2,8 +2,8 @@
 //!
 //! `libtoupcam` is loaded at runtime with `libloading`; if it is absent the app
 //! still launches and this backend simply reports no devices. ABI (structs,
-//! constants, signatures) mirrors the ToupTek SDK — the macOS/Linux variant
-//! where string parameters are `char` (UTF-8), not `wchar_t`.
+//! constants, signatures) mirrors the ToupTek SDK, including its UTF-16
+//! device/model strings on Windows and UTF-8 strings on macOS/Linux.
 //!
 //! Capture uses the SDK's pull model: an event callback (fired on the SDK's own
 //! thread) signals "frame ready" over a channel, and [`Camera::next_frame`]
@@ -12,7 +12,9 @@
 
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_char, c_int, c_uint, c_ushort, c_void};
+#[cfg(not(target_os = "windows"))]
+use std::os::raw::c_char;
+use std::os::raw::{c_int, c_uint, c_ushort, c_void};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
@@ -24,6 +26,11 @@ use crate::{Backend, Camera, CameraError, CameraInfo, Frame, Roi};
 // --- ABI ------------------------------------------------------------------
 
 type HToupcam = *mut c_void;
+
+#[cfg(target_os = "windows")]
+type ToupChar = u16;
+#[cfg(not(target_os = "windows"))]
+type ToupChar = c_char;
 
 const TOUPCAM_MAX: usize = 128;
 const OPTION_RAW: c_uint = 0x04;
@@ -39,7 +46,7 @@ struct Resolution {
 
 #[repr(C)]
 struct ModelV2 {
-    name: *const c_char,
+    name: *const ToupChar,
     flag: u64,
     maxspeed: c_uint,
     preview: c_uint,
@@ -54,8 +61,8 @@ struct ModelV2 {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DeviceV2 {
-    displayname: [c_char; 64],
-    id: [c_char; 64],
+    displayname: [ToupChar; 64],
+    id: [ToupChar; 64],
     model: *const ModelV2,
 }
 
@@ -135,7 +142,46 @@ fn candidate_paths() -> Vec<PathBuf> {
             v.push(dir.join("..").join("Frameworks").join(LIBNAME)); // macOS .app bundle
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        // Camera drivers commonly install the SDK DLL privately rather than
+        // on PATH. Consider known 64-bit copies only: loading the similarly
+        // named x86 DLL into GhostSun's x64 process would fail.
+        let program_files = std::env::var_os("ProgramW6432")
+            .or_else(|| std::env::var_os("ProgramFiles"))
+            .map(PathBuf::from);
+        let program_files_x86 = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+
+        if let Some(root) = &program_files {
+            v.push(
+                root.join("N.I.N.A. - Nighttime Imaging 'N' Astronomy")
+                    .join("External")
+                    .join("x64")
+                    .join("ToupTek")
+                    .join(LIBNAME),
+            );
+            // SharpCap versions its directory, so discover its 64-bit
+            // installs instead of baking in a release number.
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("SharpCap ") && name.contains("64 bit") {
+                        v.push(entry.path().join(LIBNAME));
+                    }
+                }
+            }
+        }
+        if let Some(root) = &program_files_x86 {
+            v.push(
+                root.join("Common Files")
+                    .join("ASCOM")
+                    .join("x64")
+                    .join(LIBNAME),
+            );
+        }
+    }
     // Development fallback: borrow the dylib KStars/INDI ships.
+    #[cfg(target_os = "macos")]
     v.push(PathBuf::from("/Applications/kstars.app/Contents/Frameworks").join(LIBNAME));
     v.push(PathBuf::from(LIBNAME)); // system search paths
     v
@@ -176,9 +222,24 @@ impl Api {
     }
 }
 
-fn cstr_to_string(buf: &[c_char]) -> String {
+#[cfg(not(target_os = "windows"))]
+fn toup_string(buf: &[ToupChar]) -> String {
     let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(target_os = "windows")]
+fn toup_string(buf: &[ToupChar]) -> String {
+    let units: Vec<u16> = buf.iter().copied().take_while(|&c| c != 0).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Probe the ToupTek SDK while preserving loader errors for UI diagnostics.
+/// Regular enumeration intentionally remains failure-tolerant.
+pub fn probe() -> crate::Result<usize> {
+    let api = Api::load()?;
+    let mut arr: [DeviceV2; TOUPCAM_MAX] = unsafe { std::mem::zeroed() };
+    Ok(unsafe { (api.enum_v2)(arr.as_mut_ptr()) } as usize)
 }
 
 pub fn enumerate() -> Vec<CameraInfo> {
@@ -190,7 +251,7 @@ pub fn enumerate() -> Vec<CameraInfo> {
     let n = unsafe { (api.enum_v2)(arr.as_mut_ptr()) } as usize;
     let mut out = Vec::new();
     for (i, dev) in arr.iter().enumerate().take(n.min(TOUPCAM_MAX)) {
-        let name = cstr_to_string(&dev.displayname);
+        let name = toup_string(&dev.displayname);
         // res[0] is the largest sensor resolution; used to bound ROI sliders.
         let (mw, mh) = if dev.model.is_null() {
             (0, 0)

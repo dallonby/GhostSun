@@ -46,34 +46,32 @@ fn ncc_lag(a: &[f64], b: &[f64], k: isize) -> f64 {
     let n = a.len() as isize;
     let mut sa = 0.0;
     let mut sb = 0.0;
+    let mut saa = 0.0;
+    let mut sbb = 0.0;
+    let mut sab = 0.0;
     let mut cnt = 0.0;
     for y in 0..n {
         let yb = y + k;
         if yb < 0 || yb >= n {
             continue;
         }
-        sa += a[y as usize];
-        sb += b[yb as usize];
+        let va = a[y as usize];
+        let vb = b[yb as usize];
+        sa += va;
+        sb += vb;
+        saa += va * va;
+        sbb += vb * vb;
+        sab += va * vb;
         cnt += 1.0;
     }
     if cnt < 32.0 {
         return f64::NEG_INFINITY;
     }
-    let (ma, mb) = (sa / cnt, sb / cnt);
-    let mut num = 0.0;
-    let mut da = 0.0;
-    let mut db = 0.0;
-    for y in 0..n {
-        let yb = y + k;
-        if yb < 0 || yb >= n {
-            continue;
-        }
-        let va = a[y as usize] - ma;
-        let vb = b[yb as usize] - mb;
-        num += va * vb;
-        da += va * va;
-        db += vb * vb;
-    }
+    // Pearson NCC from running moments. This is algebraically equivalent to
+    // the former mean pass + covariance pass but streams each profile once.
+    let num = sab - sa * sb / cnt;
+    let da = saa - sa * sa / cnt;
+    let db = sbb - sb * sb / cnt;
     if da <= 1e-12 || db <= 1e-12 {
         return f64::NEG_INFINITY;
     }
@@ -438,8 +436,12 @@ pub fn correct_drift(disk: &Image) -> JitterResult {
     let ys2: Vec<f64> = pts.iter().map(|p| p.1).collect();
     let ws2 = vec![1.0; xs.len()];
     let line = crate::mathutil::polyfit_robust(&xs, &ys2, &ws2, 1, 4).unwrap_or(line);
-    // residuals -> Tukey-clip against a robust local trend (prominences and
-    // active regions bias individual edge centroids), then smooth
+    // Residuals -> Tukey-clip against a robust local trend (prominences and
+    // active regions bias individual edge centroids). The paired midpoint is
+    // an absolute translation anchor: gain errors and true radius structure
+    // move the two limbs oppositely and cancel. Retain its full column cadence
+    // so alternating teeth are corrected instead of being discarded as they
+    // were by the former 31-column median / sigma-12 low pass.
     let res_raw: Vec<f64> = pts.iter().map(|p| p.1 - crate::mathutil::polyval(&line, p.0)).collect();
     let trend0 = crate::mathutil::robust_loess_quadratic(&res_raw, 41, 3);
     let mut dev: Vec<f64> = res_raw.iter().zip(&trend0).map(|(r, t)| (r - t).abs()).collect();
@@ -449,7 +451,7 @@ pub fn correct_drift(disk: &Image) -> JitterResult {
         .zip(&trend0)
         .map(|(r, t)| if (r - t).abs() > 3.0 * 1.4826 * mad { *t } else { *r })
         .collect();
-    let res_sm = robust_trend(&res, 31, 12.0);
+    let res_sm = crate::mathutil::gaussian_smooth(&res, 1.2);
     // interpolate over all columns (nearest for gaps, 0 outside disk)
     let mut drift = vec![0.0f64; w];
     for x in 0..w {
@@ -714,6 +716,39 @@ pub fn correct_x(disk: &Image, hp_window: usize) -> XRegResult {
 
     let corrected = apply_x_offsets(disk, &delta);
     XRegResult { corrected, delta }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ncc_lag;
+
+    #[test]
+    fn streaming_ncc_matches_centered_reference() {
+        let a: Vec<f64> = (0..127)
+            .map(|i| (i as f64 * 0.17).sin() + 0.03 * i as f64)
+            .collect();
+        let b: Vec<f64> = (0..127)
+            .map(|i| (i as f64 * 0.17 + 0.21).sin() + 0.031 * i as f64)
+            .collect();
+
+        for lag in -4isize..=4 {
+            let pairs: Vec<(f64, f64)> = (0..a.len() as isize)
+                .filter_map(|y| {
+                    let yb = y + lag;
+                    (0..b.len() as isize)
+                        .contains(&yb)
+                        .then(|| (a[y as usize], b[yb as usize]))
+                })
+                .collect();
+            let ma = pairs.iter().map(|p| p.0).sum::<f64>() / pairs.len() as f64;
+            let mb = pairs.iter().map(|p| p.1).sum::<f64>() / pairs.len() as f64;
+            let num = pairs.iter().map(|p| (p.0 - ma) * (p.1 - mb)).sum::<f64>();
+            let da = pairs.iter().map(|p| (p.0 - ma).powi(2)).sum::<f64>();
+            let db = pairs.iter().map(|p| (p.1 - mb).powi(2)).sum::<f64>();
+            let reference = num / (da * db).sqrt();
+            assert!((ncc_lag(&a, &b, lag) - reference).abs() < 1e-12);
+        }
+    }
 }
 
 /// Resample every row at x - delta(x) (B-spline).

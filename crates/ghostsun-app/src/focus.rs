@@ -228,7 +228,20 @@ impl FocusState {
         if self.selected >= self.cameras.len() {
             self.selected = 0;
         }
-        self.status = format!("{} camera(s) found", self.cameras.len());
+        let hardware = self.cameras.iter()
+            .filter(|c| c.backend != ghostsun_camera::Backend::Synth)
+            .count();
+        self.status = if hardware > 0 {
+            format!("{hardware} hardware camera(s) found")
+        } else {
+            match ghostsun_camera::toupcam::probe() {
+                Ok(0) => "No hardware camera detected (ToupTek SDK loaded)".to_owned(),
+                Ok(n) => format!(
+                    "ToupTek reports {n} camera(s), but enumeration returned none; reconnect and refresh"
+                ),
+                Err(e) => format!("No hardware camera; {e}"),
+            }
+        };
     }
 
     pub fn start(&mut self, ctx: &egui::Context) {

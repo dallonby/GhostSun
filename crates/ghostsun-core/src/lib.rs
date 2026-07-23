@@ -16,6 +16,7 @@ pub mod lines;
 pub mod mathutil;
 pub mod metrics;
 pub mod output;
+pub mod orientation;
 pub mod pipeline;
 pub mod profile;
 pub mod quality;

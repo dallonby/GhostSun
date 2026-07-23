@@ -22,6 +22,27 @@ pub struct WarpParams {
     pub allow_negative: bool,
 }
 
+/// Orientation of the native detector slit/column axis in the final view,
+/// expressed as an unoriented angle in [-90, 90) degrees from vertical.
+///
+/// The inverse affine mapping is used here, so the value includes fitted
+/// ellipse shear, requested output rotation, and flips. A directional
+/// correction made along raw `y` before the warp therefore follows this
+/// exact direction in the displayed image without an additional resampling.
+pub fn slit_axis_angle_deg(geom: &EllipseGeom, p: &WarpParams) -> f64 {
+    let th = p.rotation_deg.to_radians();
+    let (ct, st) = (th.cos(), th.sin());
+    let fx = if p.flip_x { -1.0 } else { 1.0 };
+    let fy = if p.flip_y { -1.0 } else { 1.0 };
+
+    // A^-1 * [0, 1] for A(u,v) = [sx*(u + shear*v), v] is
+    // [-shear, 1]. Undo output rotation and flips to obtain the line vector.
+    let qx = fx * (-geom.shear * ct + st);
+    let qy = fy * (geom.shear * st + ct);
+    let angle = qx.atan2(qy).to_degrees();
+    (angle + 90.0).rem_euclid(180.0) - 90.0
+}
+
 /// Output canvas geometry.
 #[allow(dead_code)]
 pub struct WarpOutput {
@@ -196,4 +217,44 @@ pub fn warp_baseline(disk: &Image, geom: &EllipseGeom, p: &WarpParams) -> WarpOu
         }
     }
     WarpOutput { image: out, xc: oc, yc: oc, radius: r }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn geometry(shear: f64) -> EllipseGeom {
+        EllipseGeom {
+            xc: 100.0,
+            yc: 100.0,
+            an: 1.0,
+            bn: 0.0,
+            cn: 1.0,
+            sx: 2.0,
+            shear,
+            radius: 80.0,
+        }
+    }
+
+    fn params(rotation_deg: f64) -> WarpParams {
+        WarpParams {
+            rotation_deg,
+            flip_x: false,
+            flip_y: false,
+            margin_frac: 0.0,
+            filtered_downscale: true,
+            allow_negative: false,
+        }
+    }
+
+    #[test]
+    fn slit_axis_tracks_fitted_shear() {
+        let shear = 5.0_f64.to_radians().tan();
+        assert!((slit_axis_angle_deg(&geometry(shear), &params(0.0)) + 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn slit_axis_includes_output_rotation() {
+        assert!((slit_axis_angle_deg(&geometry(0.0), &params(7.5)) - 7.5).abs() < 1e-10);
+    }
 }

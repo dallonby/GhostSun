@@ -3,11 +3,12 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod focus;
+mod gong;
 
 use eframe::egui;
 use ghostsun_core::image2d::Image;
 use ghostsun_core::mathutil::percentile_f32;
-use ghostsun_core::{output, pipeline, render};
+use ghostsun_core::{orientation, output, pipeline, render};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -77,9 +78,25 @@ enum ViewMode {
 
 enum Job {
     Log(String),
-    Done(Box<pipeline::ReconReport>),
+    Done {
+        report: Box<pipeline::ReconReport>,
+        source_ser: PathBuf,
+    },
     Failed(String),
     Colorized { rgb: Vec<u8>, w: usize, h: usize, seq: u64 },
+    OrientationDone(Box<OrientationApplied>),
+    OrientationFailed(String),
+}
+
+struct OrientationApplied {
+    image: Image,
+    before_demix: Option<Image>,
+    velocity: Option<Image>,
+    prep: Option<render::ColorizePrep>,
+    matched: orientation::OrientationMatch,
+    reference_filename: String,
+    reference_url: String,
+    delta_seconds: i64,
 }
 
 struct Loaded {
@@ -88,11 +105,15 @@ struct Loaded {
     velocity: Option<Image>,
     prep: Option<render::ColorizePrep>,
     name: String,
+    source_ser: Option<PathBuf>,
+    orientation_note: Option<String>,
+    orientation_reference_url: Option<String>,
 }
 
 struct App {
     loaded: Option<Loaded>,
     running: bool,
+    orientation_running: bool,
     log: Vec<String>,
     rx: Receiver<Job>,
     tx: Sender<Job>,
@@ -110,8 +131,9 @@ struct App {
     color_cache: Option<(Vec<u8>, usize, usize)>,
     opt_deconv: bool,
     opt_denoise: bool,
+    opt_motion_strength: f64,
     opt_column_demix_strength: f64,
-    last_ser: Option<std::path::PathBuf>,
+    selected_ser: Option<std::path::PathBuf>,
     pending_open: Option<PathBuf>,
     show_before_demix: bool,
     focus: focus::FocusState,
@@ -124,6 +146,7 @@ impl App {
         App {
             loaded: None,
             running: false,
+            orientation_running: false,
             log: Vec::new(),
             rx,
             tx,
@@ -141,30 +164,43 @@ impl App {
             color_cache: None,
             opt_deconv: false,
             opt_denoise: false,
+            opt_motion_strength: 1.0,
             opt_column_demix_strength: 1.0,
-            last_ser: None,
+            selected_ser: None,
             pending_open: std::env::args().nth(1).map(PathBuf::from),
             show_before_demix: false,
             focus: focus::FocusState::default(),
         }
     }
 
-    fn open_file(&mut self, path: PathBuf, ctx: &egui::Context) {
+    fn open_file(&mut self, path: PathBuf) {
+        if self.running || self.orientation_running {
+            self.log
+                .push("processing is already in progress; wait before opening another file".into());
+            return;
+        }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         match ext.as_str() {
-            "ser" => self.run_pipeline(path, ctx),
+            "ser" => {
+                self.selected_ser = Some(path.clone());
+                self.log.clear();
+                self.log.push(format!("selected {}", path.display()));
+                self.log.push("review the Pipeline settings, then click Process".into());
+            }
             "fits" | "fit" => match output::read_fits_f32(&path) {
                 Ok(img) => {
+                    self.selected_ser = None;
                     let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-                    self.set_loaded(img, None, None, name);
+                    self.set_loaded(img, None, None, name, None);
                     self.log.push(format!("loaded {}", path.display()));
                 }
                 Err(e) => self.log.push(format!("FITS load failed: {e}")),
             },
             "png" => match output::read_png16(&path) {
                 Ok(img) => {
+                    self.selected_ser = None;
                     let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-                    self.set_loaded(img, None, None, name);
+                    self.set_loaded(img, None, None, name, None);
                 }
                 Err(e) => self.log.push(format!("PNG load failed: {e}")),
             },
@@ -178,6 +214,7 @@ impl App {
         velocity: Option<Image>,
         before_demix: Option<Image>,
         name: String,
+        source_ser: Option<PathBuf>,
     ) {
         let prep = render::prepare(&image);
         self.loaded = Some(Loaded {
@@ -186,6 +223,9 @@ impl App {
             velocity,
             prep,
             name,
+            source_ser,
+            orientation_note: None,
+            orientation_reference_url: None,
         });
         self.show_before_demix = false;
         self.texture = None;
@@ -198,13 +238,13 @@ impl App {
     fn run_pipeline(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.running = true;
         self.log.clear();
-        self.last_ser = Some(path.clone());
         self.log.push(format!("processing {} ...", path.display()));
         let tx = self.tx.clone();
         let tx_log = self.tx.clone();
         let egui_ctx = ctx.clone();
         let egui_ctx2 = ctx.clone();
         let mut tune = pipeline::TuneParams::default();
+        tune.motion_strength = self.opt_motion_strength;
         tune.column_demix_strength = self.opt_column_demix_strength;
         let opts = pipeline::ReconOptions {
             verbose: false,
@@ -220,13 +260,117 @@ impl App {
         std::thread::spawn(move || {
             match pipeline::reconstruct(&path, &opts) {
                 Ok(rep) => {
-                    let _ = tx.send(Job::Done(Box::new(rep)));
+                    let _ = tx.send(Job::Done {
+                        report: Box::new(rep),
+                        source_ser: path,
+                    });
                 }
                 Err(e) => {
                     let _ = tx.send(Job::Failed(e));
                 }
             }
             egui_ctx2.request_repaint();
+        });
+    }
+
+    fn kick_gong_orientation(&mut self, ctx: &egui::Context) {
+        let Some(loaded) = &self.loaded else { return };
+        let Some(source_ser) = loaded.source_ser.clone() else {
+            self.log.push(
+                "GONG orientation requires the original SER so its UTC timestamp is available"
+                    .into(),
+            );
+            return;
+        };
+        let Some(prep) = &loaded.prep else {
+            self.log.push("cannot orient: solar disk geometry was not detected".into());
+            return;
+        };
+        if self.orientation_running || loaded.orientation_note.is_some() {
+            return;
+        }
+
+        self.orientation_running = true;
+        self.log
+            .push("GONG orientation: finding the nearest calibrated H-alpha reference ...".into());
+        let disk = prep.disk.clone();
+        let image = Arc::clone(&loaded.image);
+        let before_demix = loaded.before_demix.clone();
+        let velocity = loaded.velocity.clone();
+        let tx = self.tx.clone();
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<OrientationApplied, String> {
+                let reference = gong::download_nearest(&source_ser)?;
+                let _ = tx.send(Job::Log(format!(
+                    "GONG reference: {} ({} s from SER UTC)",
+                    reference.filename, reference.delta_seconds
+                )));
+                let matched = orientation::match_to_reference(
+                    &image,
+                    &disk,
+                    &reference.image,
+                    &reference.disk,
+                )?;
+                let _ = tx.send(Job::Log(format!(
+                    "feature match: {}rotation {:+.1} deg, NCC {:.3}, pose margin {:.3}",
+                    if matched.mirrored { "horizontal mirror + " } else { "" },
+                    matched.rotation_deg,
+                    matched.score,
+                    matched.confidence_margin(),
+                )));
+                if !matched.is_confident() {
+                    return Err(format!(
+                        "GONG feature match was not confident enough (NCC {:.3}, pose margin {:.3}); image left unchanged",
+                        matched.score,
+                        matched.confidence_margin()
+                    ));
+                }
+
+                let transformed = orientation::apply_orientation(
+                    &image,
+                    &disk,
+                    matched.mirrored,
+                    matched.rotation_deg,
+                );
+                let transformed_before = before_demix.as_deref().map(|before| {
+                    orientation::apply_orientation(
+                        before,
+                        &disk,
+                        matched.mirrored,
+                        matched.rotation_deg,
+                    )
+                });
+                let transformed_velocity = velocity.as_ref().map(|map| {
+                    orientation::apply_orientation(
+                        map,
+                        &disk,
+                        matched.mirrored,
+                        matched.rotation_deg,
+                    )
+                });
+                let transformed_prep = render::prepare(&transformed);
+                Ok(OrientationApplied {
+                    image: transformed,
+                    before_demix: transformed_before,
+                    velocity: transformed_velocity,
+                    prep: transformed_prep,
+                    matched,
+                    reference_filename: reference.filename,
+                    reference_url: reference.url,
+                    delta_seconds: reference.delta_seconds,
+                })
+            })();
+
+            match result {
+                Ok(applied) => {
+                    let _ = tx.send(Job::OrientationDone(Box::new(applied)));
+                }
+                Err(error) => {
+                    let _ = tx.send(Job::OrientationFailed(error));
+                }
+            }
+            egui_ctx.request_repaint();
         });
     }
 
@@ -268,15 +412,16 @@ impl App {
                         self.log.drain(..100);
                     }
                 }
-                Job::Done(rep) => {
+                Job::Done { report, source_ser } => {
                     self.running = false;
                     self.log.push("done.".into());
-                    let rep = *rep;
+                    let rep = *report;
                     self.set_loaded(
                         rep.output.image,
                         rep.velocity,
                         rep.demix_before,
                         "reconstruction".into(),
+                        Some(source_ser),
                     );
                 }
                 Job::Failed(e) => {
@@ -293,6 +438,36 @@ impl App {
                     } else {
                         self.color_dirty = true;
                     }
+                }
+                Job::OrientationDone(applied) => {
+                    self.orientation_running = false;
+                    let applied = *applied;
+                    if let Some(loaded) = &mut self.loaded {
+                        loaded.image = Arc::new(applied.image);
+                        loaded.before_demix = applied.before_demix.map(Arc::new);
+                        loaded.velocity = applied.velocity;
+                        loaded.prep = applied.prep;
+                        loaded.orientation_note = Some(format!(
+                            "GONG: north up, east left · {}{:+.1}° · NCC {:.3}",
+                            if applied.matched.mirrored { "mirror + " } else { "" },
+                            applied.matched.rotation_deg,
+                            applied.matched.score,
+                        ));
+                        loaded.orientation_reference_url = Some(applied.reference_url);
+                    }
+                    self.texture = None;
+                    self.tex_mode = None;
+                    self.color_cache = None;
+                    self.color_dirty = true;
+                    self.fit_requested = true;
+                    self.log.push(format!(
+                        "orientation applied from {} ({} s from acquisition): solar north is up, east is left",
+                        applied.reference_filename, applied.delta_seconds
+                    ));
+                }
+                Job::OrientationFailed(error) => {
+                    self.orientation_running = false;
+                    self.log.push(format!("GONG orientation failed: {error}"));
                 }
             }
         }
@@ -400,17 +575,21 @@ impl eframe::App for App {
 
         // open a file passed on the command line (once)
         if let Some(path) = self.pending_open.take() {
-            self.open_file(path, ctx);
+            self.open_file(path);
         }
         // drag & drop
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
         if let Some(p) = dropped.into_iter().next() {
-            self.open_file(p, ctx);
+            self.open_file(p);
         }
 
-        if self.mode == ViewMode::Color && self.color_dirty && !self.running {
+        if self.mode == ViewMode::Color
+            && self.color_dirty
+            && !self.running
+            && !self.orientation_running
+        {
             self.kick_colorize(ctx);
         }
 
@@ -424,12 +603,15 @@ impl eframe::App for App {
                         .add_filter("Solar data", &["ser", "fits", "fit", "png"])
                         .pick_file()
                     {
-                        self.open_file(path, ctx);
+                        self.open_file(path);
                     }
                 }
                 if self.running {
                     ui.add(egui::Spinner::new().color(ACCENT));
                     ui.label(egui::RichText::new("processing…").italics());
+                } else if self.orientation_running {
+                    ui.add(egui::Spinner::new().color(ACCENT));
+                    ui.label(egui::RichText::new("matching GONG features…").italics());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(6.0);
@@ -477,9 +659,71 @@ impl eframe::App for App {
                     if let Some(prep) = &loaded.prep {
                         ui.label(format!("disk radius {:.0} px", prep.disk.r));
                     }
+                    if let Some(note) = &loaded.orientation_note {
+                        ui.label(egui::RichText::new(note).color(ACCENT));
+                    }
                 });
                 ui.add_space(6.0);
             }
+
+            ui.heading("Solar orientation");
+            ui.label(
+                egui::RichText::new(
+                    "Feature-match the SER time against calibrated GONG H-alpha.\nTarget: north up, east left.",
+                )
+                .small()
+                .weak(),
+            );
+            let orientation_applied = self
+                .loaded
+                .as_ref()
+                .and_then(|loaded| loaded.orientation_note.as_ref())
+                .is_some();
+            let has_source_ser = self
+                .loaded
+                .as_ref()
+                .and_then(|loaded| loaded.source_ser.as_ref())
+                .is_some();
+            if orientation_applied {
+                if let Some(url) = self
+                    .loaded
+                    .as_ref()
+                    .and_then(|loaded| loaded.orientation_reference_url.as_ref())
+                {
+                    ui.hyperlink_to("Open matched GONG reference", url);
+                }
+                ui.label(
+                    egui::RichText::new("Reprocess the SER to restore the native scan pose.")
+                        .small()
+                        .weak(),
+                );
+            } else {
+                let orient = egui::Button::new(
+                    egui::RichText::new("Orient from GONG")
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ACCENT_DIM);
+                if ui
+                    .add_enabled(
+                        has_source_ser && !self.running && !self.orientation_running,
+                        orient,
+                    )
+                    .clicked()
+                {
+                    self.kick_gong_orientation(ctx);
+                }
+                if self.loaded.is_some() && !has_source_ser {
+                    ui.label(
+                        egui::RichText::new(
+                            "Available after processing a timestamped .ser scan.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            }
+            ui.add_space(10.0);
 
             ui.heading("Hα rendering");
             if self.loaded.as_ref().and_then(|l| l.before_demix.as_ref()).is_some() {
@@ -491,7 +735,7 @@ impl eframe::App for App {
                     egui::RichText::new(if self.show_before_demix {
                         "BEFORE: residual column pattern"
                     } else {
-                        "AFTER: gain / offset / dx / dy / blur demixed"
+                        "AFTER: gain / offset / shifts / blur corrected"
                     })
                     .small()
                     .weak(),
@@ -520,29 +764,55 @@ impl eframe::App for App {
 
             ui.heading("Pipeline");
             ui.label(
-                egui::RichText::new("Options below apply when a .ser scan\nis reconstructed — not to loaded images.")
+                egui::RichText::new("Select a .ser scan, check these settings,\nthen click Process.")
                     .small()
                     .weak(),
             );
+            if let Some(ser) = &self.selected_ser {
+                let name = ser.file_name().unwrap_or_default().to_string_lossy();
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("Selected: {name}")).strong().color(ACCENT)
+                    )
+                    .wrap(),
+                );
+            }
             ui.checkbox(&mut self.opt_deconv, "PSF deconvolution");
             ui.checkbox(&mut self.opt_denoise, "wavelet denoise");
+            ui.label("motion registration strength");
+            ui.add(
+                egui::Slider::new(&mut self.opt_motion_strength, 0.0..=1.5)
+                    .fixed_decimals(2),
+            );
+            ui.label(
+                egui::RichText::new("0 = off, 1 = measured, above 1 = more aggressive")
+                    .small()
+                    .weak(),
+            );
             ui.label("column correction strength");
             ui.add(
                 egui::Slider::new(&mut self.opt_column_demix_strength, 0.0..=1.0)
                     .fixed_decimals(2),
             );
             ui.label(
-                egui::RichText::new("0 = off, 1 = full; detection is automatic per scan; reprocess to apply")
+                egui::RichText::new("0 = off, 1 = full; detection is automatic per scan")
                     .small()
                     .weak(),
             );
-            if let Some(ser) = self.last_ser.clone() {
-                if !self.running && ui.button("Reprocess scan with these options").clicked() {
-                    self.open_file(ser, ctx);
+            if let Some(ser) = self.selected_ser.clone() {
+                let process = egui::Button::new(
+                    egui::RichText::new("Process").strong().color(egui::Color32::WHITE)
+                )
+                .fill(ACCENT_DIM);
+                if ui
+                    .add_enabled(!self.running && !self.orientation_running, process)
+                    .clicked()
+                {
+                    self.run_pipeline(ser, ctx);
                 }
             } else {
                 ui.label(
-                    egui::RichText::new("Open a .ser scan to reconstruct;\n.fits / .png files are view-only.")
+                    egui::RichText::new("Open a .ser scan to enable processing;\n.fits / .png files are view-only.")
                         .small()
                         .weak(),
                 );
@@ -666,8 +936,12 @@ impl eframe::App for App {
                         egui::Align2::CENTER_CENTER,
                         if self.running {
                             "reconstructing…"
+                        } else if self.orientation_running {
+                            "matching solar features to GONG…"
                         } else if self.mode == ViewMode::Color && self.loaded.is_some() {
                             "rendering color…"
+                        } else if self.selected_ser.is_some() {
+                            "Scan selected — review settings and click Process"
                         } else {
                             "Open a .ser scan or .fits reconstruction"
                         },

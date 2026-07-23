@@ -122,20 +122,40 @@ Default processing includes:
 - telluric-referenced flexure and slit-velocity estimation when suitable Hα
   telluric anchors are present, with a solar-line flexure fallback;
 - continuum-referenced scan transparency correction;
-- multi-baseline slit-direction jitter, slow mid-chord drift, limb-anchored
-  scan-direction registration, and temporal burst repair;
+- continuum-anchored slit-direction motion solved before profile fitting and
+  sampled sub-pixel inside the extraction kernel, plus scan-direction
+  registration and temporal burst repair;
 - robust detector-row nonuniformity correction and temporal NLM;
 - RANSAC/IRLS ellipse estimation and one footprint-aware Lanczos-3 warp; and
 - float FITS plus 16-bit linear/display PNG output.
 
-The GPU-only residual column-state stage follows those explicit corrections.
-One workgroup per acquisition column robustly fits multiplicative gain,
-additive bias, scan/slit displacement, and blur against near and wider temporal
-predictions. It applies the inverse state to the original column, preserving
-that column's own fine detail rather than replacing it with neighbour pixels.
-An evidence gate is recomputed for every SER, the desktop app offers an instant
+The GPU residual column-correction stage follows those explicit corrections.
+It assigns one workgroup per acquisition column to fit multiplicative gain,
+additive bias, scan/slit displacement, and separate scan-axis/slit-axis blur
+against near and wider temporal predictions. It corrects the original samples
+rather than replacing them with neighbour columns, preserving each column's
+fine detail. The model stays in native
+acquisition coordinates, so fitted ellipse shear and requested image rotation
+can make the corrected slit direction appear diagonal without requiring
+another resampling. The processing log reports that final-view angle. Evidence
+gates are recomputed for every SER, the desktop app offers an instant
 before/after view, and a 0–1 strength control can be changed before reprocessing
 (`--tune column_demix_strength=0.5` on the CLI; zero disables the stage).
+Pre-extraction motion has a separate 0–1.5 control
+(`--tune motion_strength=1.0`); zero disables it, one applies the measured
+trajectory, and values above one are deliberately more aggressive.
+
+The desktop app can also establish an absolute solar pose from a timestamped
+SER. **Orient from GONG** reads the SER's UTC acquisition time, downloads and
+caches the nearest full-resolution GONG H-alpha frame, then registers
+chromospheric features while searching both image parities and all rotations.
+Only a confident match is applied; weak, rotation-ambiguous, or
+parity-ambiguous results leave the image unchanged. The resulting convention
+is solar north at the top and the east limb at the left, matching the
+calibrated GONG product. Grayscale, before/after column-state, H-alpha colour,
+and Doppler views receive the same transform. Because the reference is matched
+after reconstruction, this optional presentation correction performs one
+additional Lanczos-3 resample.
 
 Optional processing includes:
 
@@ -165,18 +185,22 @@ The same WGSL compute kernels run through `wgpu`: Metal on macOS and Direct3D
 warp have CPU fallbacks. Residual column-state demixing is GPU-only and is
 skipped when no compatible compute adapter is available.
 
-The repository contains Windows and macOS CI workflows. The Windows workflow
-tests the workspace and uploads a packaged x64 desktop artifact; the macOS
-workflow tests the workspace and builds the Metal desktop app.
+The `Desktop builds` GitHub Actions workflow tests the workspace and publishes
+packaged Windows x64, macOS Apple Silicon, and macOS Intel artifacts. Pushing a
+tag beginning with `v` also creates or updates a GitHub Release containing all
+three ZIPs and their SHA-256 checksums.
 
 ## Usage
 
 ### Desktop app
 
 Open or drag a `.ser`, `.fits`, `.fit`, or `.png` file into GhostSun. SER scans
-are reconstructed in the background; FITS and PNG files open in view-only
-mode. The viewer provides grayscale, Hα colour, relative Doppler, and live
-before/after column-correction views when those products exist.
+wait for the user to review the pipeline controls and click **Process**; FITS
+and PNG files open in view-only mode. The viewer provides grayscale, Hα colour,
+relative Doppler, and live before/after column-correction views when those
+products exist. **Orient from GONG** additionally requires network access and a
+valid UTC timestamp in the source SER; downloaded public reference JPEGs are
+cached in the operating system's temporary directory.
 
 On macOS:
 
@@ -184,8 +208,9 @@ On macOS:
 cargo run --release --locked --package ghostsun-app
 ```
 
-On Windows 11, use the `GhostSun-Windows-x64` workflow artifact or follow the
-[Windows build and usage guide](docs/windows.md).
+Packaged builds are available from the `Desktop builds` workflow or a tagged
+GitHub Release. See the [macOS](docs/macos.md) and
+[Windows](docs/windows.md) build and usage guides.
 
 ### Command line
 

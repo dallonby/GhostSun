@@ -16,3 +16,5 @@ eframe = { version = "0.29", default-features = false, features = ["wgpu", "defa
 egui = "0.29"
 egui_plot = "0.29"
 rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+ureq = { version = "3.3", default-features = false, features = ["native-tls"] }

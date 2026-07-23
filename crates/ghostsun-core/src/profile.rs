@@ -235,15 +235,73 @@ pub fn extract_profile_auto(
     shift: f64,
     tune: &ProfileTune,
     use_gpu: bool,
+    spatial_offsets: Option<&[f64]>,
 ) -> (ProfileMaps, bool) {
     if use_gpu {
         if let Some(maps) =
-            crate::gpu_extract::extract_profile_gpu(reader, geom, mean_img, transpose, shift, tune)
+            crate::gpu_extract::extract_profile_gpu(
+                reader,
+                geom,
+                mean_img,
+                transpose,
+                shift,
+                tune,
+                spatial_offsets,
+            )
         {
             return (maps, true);
         }
     }
-    (extract_profile(reader, geom, mean_img, transpose, shift, tune), false)
+    (
+        extract_profile(
+            reader,
+            geom,
+            mean_img,
+            transpose,
+            shift,
+            tune,
+            spatial_offsets,
+        ),
+        false,
+    )
+}
+
+pub(crate) fn shift_spatial_cubic(frame: &Image, offset: f64) -> Image {
+    if offset.abs() < 1e-6 {
+        return frame.clone();
+    }
+    let mut out = Image::new(frame.w, frame.h);
+    for y in 0..frame.h {
+        let src = (y as f64 + offset).clamp(0.0, (frame.h - 1) as f64);
+        let y1 = src.floor() as isize;
+        let f = (src - y1 as f64) as f32;
+        for x in 0..frame.w {
+            let p0 = frame.at_clamped(x as isize, y1 - 1);
+            let p1 = frame.at_clamped(x as isize, y1);
+            let p2 = frame.at_clamped(x as isize, y1 + 1);
+            let p3 = frame.at_clamped(x as isize, y1 + 2);
+            let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+            let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+            let c = -0.5 * p0 + 0.5 * p2;
+            out.set(x, y, ((a * f + b) * f + c) * f + p1);
+        }
+    }
+    out
+}
+
+pub(crate) fn shift_series_linear(values: &[f64], offset: f64) -> Vec<f64> {
+    if offset.abs() < 1e-6 {
+        return values.to_vec();
+    }
+    (0..values.len())
+        .map(|y| {
+            let src = (y as f64 + offset).clamp(0.0, (values.len() - 1) as f64);
+            let y0 = src.floor() as usize;
+            let y1 = (y0 + 1).min(values.len() - 1);
+            let f = src - y0 as f64;
+            values[y0] * (1.0 - f) + values[y1] * f
+        })
+        .collect()
 }
 
 /// CPU reference implementation.
@@ -254,6 +312,7 @@ pub fn extract_profile(
     transpose: bool,
     shift: f64,
     tune: &ProfileTune,
+    spatial_offsets: Option<&[f64]>,
 ) -> ProfileMaps {
     let n = reader.header.frame_count;
     let slit_h = if transpose { reader.header.width } else { reader.header.height };
@@ -288,7 +347,25 @@ pub fn extract_profile(
             if transpose {
                 frame = frame.transpose();
             }
-            fit_frame(&frame, &smile, &sigma_row, shift, tune, &spec_offsets)
+            let offset = spatial_offsets
+                .and_then(|v| v.get(t))
+                .copied()
+                .unwrap_or(0.0);
+            if offset.abs() >= 1e-6 {
+                frame = shift_spatial_cubic(&frame, offset);
+                let shifted_smile = shift_series_linear(&smile, offset);
+                let shifted_sigma = shift_series_linear(&sigma_row, offset);
+                fit_frame(
+                    &frame,
+                    &shifted_smile,
+                    &shifted_sigma,
+                    shift,
+                    tune,
+                    &spec_offsets,
+                )
+            } else {
+                fit_frame(&frame, &smile, &sigma_row, shift, tune, &spec_offsets)
+            }
         })
         .collect();
 
@@ -827,4 +904,64 @@ pub fn slit_velocity_from_telluric(
         *v /= n_used as f64;
     }
     Some(vy_acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shift_series_linear, shift_spatial_cubic};
+    use crate::image2d::Image;
+
+    #[test]
+    fn spatial_cubic_shift_is_identity_at_zero() {
+        let mut image = Image::new(5, 9);
+        for y in 0..image.h {
+            for x in 0..image.w {
+                image.set(x, y, (100 * y + x) as f32);
+            }
+        }
+
+        let shifted = shift_spatial_cubic(&image, 0.0);
+        assert_eq!(shifted.data, image.data);
+    }
+
+    #[test]
+    fn spatial_cubic_shift_matches_integer_source_rows() {
+        let mut image = Image::new(4, 12);
+        for y in 0..image.h {
+            for x in 0..image.w {
+                image.set(x, y, (10 * y + x) as f32);
+            }
+        }
+
+        let shifted = shift_spatial_cubic(&image, 2.0);
+        for y in 0..image.h - 2 {
+            for x in 0..image.w {
+                assert_eq!(shifted.at(x, y), image.at(x, y + 2));
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_interpolators_preserve_linear_motion() {
+        let values: Vec<f64> = (0..16).map(|y| 3.0 * y as f64 + 7.0).collect();
+        let shifted_values = shift_series_linear(&values, 0.35);
+        for (y, &value) in shifted_values.iter().enumerate().take(14).skip(1) {
+            let expected = 3.0 * (y as f64 + 0.35) + 7.0;
+            assert!((value - expected).abs() < 1e-12);
+        }
+
+        let mut image = Image::new(3, 16);
+        for y in 0..image.h {
+            for x in 0..image.w {
+                image.set(x, y, (3.0 * y as f64 + 7.0 + x as f64) as f32);
+            }
+        }
+        let shifted = shift_spatial_cubic(&image, 0.35);
+        for y in 1..14 {
+            for x in 0..image.w {
+                let expected = (3.0 * (y as f64 + 0.35) + 7.0 + x as f64) as f32;
+                assert!((shifted.at(x, y) - expected).abs() < 1e-4);
+            }
+        }
+    }
 }

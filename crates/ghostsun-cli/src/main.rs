@@ -269,6 +269,12 @@ fn save_recon_outputs(dir: &Path, name: &str, rep: &pipeline::ReconReport, veloc
     output::write_png16(&dir.join(format!("{name}_linear.png")), img, Some((0.0, mx))).unwrap();
     output::write_png16(&dir.join(format!("{name}_display.png")), img, None).unwrap();
     output::write_fits_f32(&dir.join(format!("{name}.fits")), img).unwrap();
+    if std::env::var_os("GS_SAVE_DEMIX_BEFORE").is_some() {
+        if let Some(before) = &rep.demix_before {
+            output::write_png16(&dir.join(format!("{name}_before_demix.png")), before, None).unwrap();
+            output::write_fits_f32(&dir.join(format!("{name}_before_demix.fits")), before).unwrap();
+        }
+    }
     if velocity {
         if let Some(v) = &rep.velocity {
             write_velocity_png(&dir.join(format!("{name}_velocity.png")), v).unwrap();
@@ -422,7 +428,7 @@ fn main() {
                     .sqrt()
             };
             match (gpu::demix_columns(&striped, 1.0), gpu::demix_columns(&img, 1.0)) {
-                (Some((fixed, state)), Some((clean, _))) => {
+                (Some((fixed, state)), Some((clean, clean_state))) => {
                     let before = rmse(&striped, &img);
                     let after = rmse(&fixed, &img);
                     let clean_delta = rmse(&clean, &img);
@@ -430,13 +436,23 @@ fn main() {
                         .offset
                         .iter()
                         .fold(0.0f64, |m, v| m.max(v.abs()));
+                    let clean_blur_x = clean_state
+                        .blur_x
+                        .iter()
+                        .fold(0.0f64, |m, v| m.max(v.abs()));
+                    let clean_blur_y = clean_state
+                        .blur_y
+                        .iter()
+                        .fold(0.0f64, |m, v| m.max(v.abs()));
                     println!(
-                        "COL : injected RMSE {:.2} -> {:.2} ({:.1}% removed), clean delta {:.3}, offset +- {:.3}%",
+                        "COL : injected RMSE {:.2} -> {:.2} ({:.1}% removed), clean delta {:.3}, offset +- {:.3}%, clean blur x/y {:.3}/{:.3}",
                         before,
                         after,
                         100.0 * (1.0 - after / before),
                         clean_delta,
                         100.0 * max_offset,
+                        clean_blur_x,
+                        clean_blur_y,
                     );
                     if let (Some((fixed2, _)), Some((clean2, _))) =
                         (gpu::demix_columns(&striped, 0.5), gpu::demix_columns(&img, 0.5))
@@ -452,6 +468,65 @@ fn main() {
                     }
                 }
                 _ => println!("COL : GPU unavailable"),
+            }
+            // Directional column-PSF regression. Alternate acquisition
+            // columns receive different amounts of slit-axis diffusion. The
+            // final ellipse warp would render this native-y blur diagonally
+            // when the scan has shear; the demixer must separate it from
+            // scan-axis curvature before that warp.
+            //
+            // Add coherent, near-resolution slit detail to the truth. Unlike
+            // uncorrelated detector noise, this is information shared by
+            // neighbouring frames and is therefore legitimately recoverable.
+            let mut directional_truth = img.clone();
+            for y in 0..h {
+                for x in 0..w {
+                    let dx = x as f64 - 1200.0;
+                    let dy = y as f64 - 600.0;
+                    if (dx * dx / 4.0 + dy * dy).sqrt() < 450.0 {
+                        let phase = std::f64::consts::TAU
+                            * (y as f64 / 4.6 + x as f64 / 700.0);
+                        let i = y * w + x;
+                        directional_truth.data[i] =
+                            (directional_truth.data[i] + 2500.0 * phase.sin() as f32).max(0.0);
+                    }
+                }
+            }
+            let mut smeared = directional_truth.clone();
+            for x in 0..w {
+                let beta = match x % 6 {
+                    0 => 0.24,
+                    1 => 0.12,
+                    2 => 0.18,
+                    3 => 0.06,
+                    _ => 0.0,
+                };
+                if beta == 0.0 {
+                    continue;
+                }
+                for y in 1..h - 1 {
+                    let i = y * w + x;
+                    let curv_y = directional_truth.data[i - w] + directional_truth.data[i + w]
+                        - 2.0 * directional_truth.data[i];
+                    smeared.data[i] =
+                        (directional_truth.data[i] + beta * curv_y).max(0.0);
+                }
+            }
+            match gpu::demix_columns(&smeared, 1.0) {
+                Some((fixed, state)) => {
+                    let before = rmse(&smeared, &directional_truth);
+                    let after = rmse(&fixed, &directional_truth);
+                    let max_blur_y =
+                        state.blur_y.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    println!(
+                        "COL-Y: directional RMSE {:.2} -> {:.2} ({:.1}% removed), blur-y +- {:.3}",
+                        before,
+                        after,
+                        100.0 * (1.0 - after / before),
+                        max_blur_y,
+                    );
+                }
+                None => println!("COL-Y: GPU unavailable"),
             }
             // profile extraction (needs a synthetic SER scan)
             {
@@ -488,11 +563,30 @@ fn main() {
                 }
                 let geo = linefit::fit_line_geometry(&mean_img, 2).unwrap();
                 let tune = profile::ProfileTune::default();
+                let motion: Vec<f64> = (0..n)
+                    .map(|t| 0.7 * (std::f64::consts::TAU * t as f64 / 37.0).sin())
+                    .collect();
                 let t0 = std::time::Instant::now();
-                let cpu = profile::extract_profile(&reader, &geo, &mean_img, transpose, 0.0, &tune);
+                let cpu = profile::extract_profile(
+                    &reader,
+                    &geo,
+                    &mean_img,
+                    transpose,
+                    0.0,
+                    &tune,
+                    Some(&motion),
+                );
                 let t_cpu = t0.elapsed().as_secs_f64();
                 let t0 = std::time::Instant::now();
-                match ghostsun_core::gpu_extract::extract_profile_gpu(&reader, &geo, &mean_img, transpose, 0.0, &tune) {
+                match ghostsun_core::gpu_extract::extract_profile_gpu(
+                    &reader,
+                    &geo,
+                    &mean_img,
+                    transpose,
+                    0.0,
+                    &tune,
+                    Some(&motion),
+                ) {
                     Some(gout) => {
                         let t_gpu = t0.elapsed().as_secs_f64();
                         let peak = 30000.0f64;
@@ -506,7 +600,7 @@ fn main() {
                             }
                         }
                         println!(
-                            "EXTR: core max rel {:.2e}  mu max {:.2e} px  cpu {:.3}s  gpu {:.3}s  ({:.1}x)",
+                            "EXTR-M: core max rel {:.2e}  mu max {:.2e} px  cpu {:.3}s  gpu {:.3}s  ({:.1}x)",
                             md_core, md_mu, t_cpu, t_gpu, t_cpu / t_gpu
                         );
                     }

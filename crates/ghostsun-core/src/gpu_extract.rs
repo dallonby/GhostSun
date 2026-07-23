@@ -34,11 +34,12 @@ struct P {
 @group(0) @binding(5) var<storage, read_write> out3: array<f32>;
 @group(0) @binding(6) var<storage, read_write> spec_out: array<atomic<u32>>;
 @group(0) @binding(7) var<uniform> p: P;
+@group(0) @binding(8) var<storage, read> spatial_offset: array<f32>;
 
 var<workgroup> wg_spec: array<atomic<u32>, 200>;
 var<workgroup> wg_cnt: atomic<u32>;
 
-fn raw_val(f: u32, spec_i: u32, y: u32) -> f32 {
+fn raw_val_at(f: u32, spec_i: u32, y: u32) -> f32 {
     var sidx: u32;
     if (p.transpose == 1u) {
         sidx = spec_i * p.sw + y;
@@ -56,6 +57,21 @@ fn raw_val(f: u32, spec_i: u32, y: u32) -> f32 {
         let sh = (byte & 3u) * 8u;
         return f32((word >> sh) & 0xffu) * 257.0;
     }
+}
+
+fn raw_val(f: u32, spec_i: u32, y: f32) -> f32 {
+    let yc = clamp(y, 0.0, f32(p.slit_h - 1u));
+    let yi = i32(floor(yc));
+    let t = yc - f32(yi);
+    let h1 = i32(p.slit_h - 1u);
+    let p0 = raw_val_at(f, spec_i, u32(clamp(yi - 1, 0, h1)));
+    let p1 = raw_val_at(f, spec_i, u32(clamp(yi, 0, h1)));
+    let p2 = raw_val_at(f, spec_i, u32(clamp(yi + 1, 0, h1)));
+    let p3 = raw_val_at(f, spec_i, u32(clamp(yi + 2, 0, h1)));
+    let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3;
+    let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+    let c = -0.5 * p0 + 0.5 * p2;
+    return ((a * t + b) * t + c) * t + p1;
 }
 
 var<private> cbuf: array<f32, 256>;
@@ -127,7 +143,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         // 16 guard samples make a local prefilter numerically indistinguishable
         // at the fit window while avoiding ~3/4 of the serial prefilter work.
         let wide_spectrum_row = (y & 7u) == 0u;
-        let center_abs = smile[y] + p.shift;
+        let y_src = clamp(f32(y) + spatial_offset[f], 0.0, f32(p.slit_h - 1u));
+        let y0 = u32(floor(y_src));
+        let y1 = min(y0 + 1u, p.slit_h - 1u);
+        let fy = y_src - f32(y0);
+        let center_abs = mix(smile[y0], smile[y1], fy) + p.shift;
         var base: i32 = 0;
         var n = i32(p.spec_w);
         if (!wide_spectrum_row) {
@@ -136,10 +156,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             let end = min(i32(ceil(center_abs)) + reach + 1, i32(p.spec_w));
             n = end - base;
         }
-        for (var i = 0; i < n; i++) { cbuf[i] = raw_val(f, u32(base + i), y); }
+        for (var i = 0; i < n; i++) { cbuf[i] = raw_val(f, u32(base + i), y_src); }
         prefilter(n);
         let center = center_abs - f32(base);
-        let sig = sigma_row[y];
+        let sig = mix(sigma_row[y0], sigma_row[y1], fy);
         let nwin = 2 * p.wf + 1;
 
         // samples at fixed positions around the smile center
@@ -282,6 +302,7 @@ pub fn extract_profile_gpu(
     transpose: bool,
     shift: f64,
     tune: &ProfileTune,
+    spatial_offsets: Option<&[f64]>,
 ) -> Option<ProfileMaps> {
     let gpu = crate::gpu::Gpu::get()?;
     let hdr = &reader.header;
@@ -329,7 +350,32 @@ pub fn extract_profile_gpu(
             if transpose {
                 frame = frame.transpose();
             }
-            let fit = crate::profile::fit_frame(&frame, &smile, &sigma_row, shift, tune, &[]);
+            let offset = spatial_offsets
+                .and_then(|v| v.get(t))
+                .copied()
+                .unwrap_or(0.0);
+            let fit = if offset.abs() >= 1e-6 {
+                frame = crate::profile::shift_spatial_cubic(&frame, offset);
+                let shifted_smile = crate::profile::shift_series_linear(&smile, offset);
+                let shifted_sigma = crate::profile::shift_series_linear(&sigma_row, offset);
+                crate::profile::fit_frame(
+                    &frame,
+                    &shifted_smile,
+                    &shifted_sigma,
+                    shift,
+                    tune,
+                    &[],
+                )
+            } else {
+                crate::profile::fit_frame(
+                    &frame,
+                    &smile,
+                    &sigma_row,
+                    shift,
+                    tune,
+                    &[],
+                )
+            };
             for y in (0..slit_h).step_by(4) {
                 if fit.depth[y] > 0.05 && fit.cscale[y] > 1.0 {
                     let v: Vec<f64> =
@@ -429,6 +475,15 @@ pub fn extract_profile_gpu(
             contents: &raw_padded,
             usage: wgpu::BufferUsages::STORAGE,
         });
+        let motion: Vec<f32> = (0..fc)
+            .map(|fl| {
+                spatial_offsets
+                    .and_then(|v| v.get(f0 + fl))
+                    .copied()
+                    .unwrap_or(0.0) as f32
+            })
+            .collect();
+        let motion_buf = mk_f32(&motion);
         let out_len = fc * slit_h * 3;
         let out_buf = d.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -491,6 +546,7 @@ pub fn extract_profile_gpu(
                 wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: spec_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: par_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 8, resource: motion_buf.as_entire_binding() },
             ],
         });
         let mut enc = d.create_command_encoder(&Default::default());
