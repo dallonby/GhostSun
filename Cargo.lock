@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "ghostsun"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "ghostsun-core",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "ghostsun-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "egui",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "ghostsun-camera"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ghostsun-core",
  "libloading",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "ghostsun-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "memmap2",
