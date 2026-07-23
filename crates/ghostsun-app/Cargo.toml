@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 ghostsun-core = { path = "../ghostsun-core" }
+ghostsun-camera = { path = "../ghostsun-camera" }
 eframe = { version = "0.29", default-features = false, features = ["wgpu", "default_fonts"] }
 egui = "0.29"
+egui_plot = "0.29"
 rfd = "0.15"

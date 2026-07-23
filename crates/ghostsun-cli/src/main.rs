@@ -102,7 +102,7 @@ enum Cmd {
         ser: PathBuf,
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
-        /// INTI-faithful baseline mode (for comparison)
+        /// Minimal comparison pipeline with adaptive local-polynomial extraction
         #[arg(long)]
         baseline: bool,
         /// wavelength shift in px from line center
@@ -740,7 +740,7 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
     // ---- variant list ----
     let mut variants: Vec<(String, pipeline::ReconOptions)> = vec![
         (
-            "INTI-baseline".into(),
+            "Minimal-baseline".into(),
             pipeline::ReconOptions { baseline: true, verbose: false, ..Default::default() },
         ),
         (

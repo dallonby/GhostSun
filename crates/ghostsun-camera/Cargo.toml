@@ -1,0 +1,12 @@
+[package]
+name = "ghostsun-camera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live camera capture (ToupTek / ZWO / synthetic) for the GhostSun focus assistant"
+
+[dependencies]
+libloading = "0.8"
+
+[dev-dependencies]
+ghostsun-core = { path = "../ghostsun-core" }

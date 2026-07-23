@@ -3,7 +3,7 @@
 use crate::deconv;
 use crate::denoise;
 use crate::ellipse;
-use crate::extract::{reconstruct_disk, ExtractOptions};
+use crate::extract::{reconstruct_disk, ExtractOptions, SpectralKernel};
 use crate::flatfield;
 use crate::image2d::Image;
 use crate::jitter;
@@ -388,9 +388,16 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     } else {
         let exopts = ExtractOptions {
             shift: opts.shift,
-            baseline: opts.baseline,
             transpose_input: transpose,
-            window_sigma: if opts.baseline { 0.0 } else { opts.window_sigma },
+            kernel: if opts.baseline {
+                SpectralKernel::LocalPolynomial
+            } else if opts.window_sigma > 0.0 {
+                SpectralKernel::Gaussian {
+                    sigma: opts.window_sigma,
+                }
+            } else {
+                SpectralKernel::Point
+            },
             frame_offsets: None,
         };
         (reconstruct_disk(&reader, &geom, &exopts), vec![0.0; n], None)
@@ -414,9 +421,8 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             } else {
                 let cont_opts = ExtractOptions {
                     shift: opts.shift + continuum_shift,
-                    baseline: false,
                     transpose_input: transpose,
-                    window_sigma: 1.5, // wide window: continuum flux, noise-averaged
+                    kernel: SpectralKernel::Gaussian { sigma: 1.5 },
                     frame_offsets: if flex.iter().any(|f| f.abs() > 0.0) { Some(flex.clone()) } else { None },
                 };
                 let cont_disk = reconstruct_disk(&reader, &geom, &cont_opts);
@@ -655,9 +661,8 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         let mk = |sh: f64| {
             reconstruct_disk(&reader, &geom, &ExtractOptions {
                 shift: opts.shift + sh,
-                baseline: false,
                 transpose_input: transpose,
-                window_sigma: 1.0,
+                kernel: SpectralKernel::Gaussian { sigma: 1.0 },
                 frame_offsets: offsets.clone(),
             })
         };

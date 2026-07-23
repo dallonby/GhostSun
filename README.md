@@ -19,7 +19,7 @@ Metrics register each reconstruction to the ground truth before scoring.
 
 | implementation | disk PSNR | disk SSIM | limb PSNR | fitted limb σ |
 |---|---:|---:|---:|---:|
-| INTI-style internal emulation | 29.75 dB | 0.8528 | 16.98 dB | 3.17 px |
+| GhostSun minimal baseline | 31.56 dB | 0.9174 | 20.55 dB | 1.93 px |
 | **GhostSun default** | **35.47 dB** | **0.9790** | **28.71 dB** | **1.17 px** |
 
 These numbers were regenerated from the current tree with:
@@ -28,10 +28,18 @@ These numbers were regenerated from the current tree with:
 cargo run --release --locked --package ghostsun -- bench --dir testdata
 ```
 
-The INTI-style row is GhostSun's documented emulation of INTI's relevant
-numeric choices; it is not an invocation of the upstream Python application.
-Use `--ablations`, `--sweep name=v1,v2,...`, or `--json ledger.jsonl` for more
-experiments.
+The minimal baseline is an internal GhostSun comparison path. It retains
+simple integer line geometry and staged bilinear geometry, but its spectral
+kernel is GhostSun's independently derived, noise-adaptive local-polynomial
+estimator. It is neither INTI code nor an exact emulation of the upstream
+application. Use `--ablations`, `--sweep name=v1,v2,...`, or
+`--json ledger.jsonl` for more experiments.
+
+On this same seed-42 scan, the superseded fixed-coefficient extractor scored
+29.75 dB PSNR, 0.8528 SSIM, 16.98 dB at the limb, and a 3.17 px fitted limb
+width. The new kernel therefore improves all four measures. On the clean
+ceiling scan it also improves PSNR from 38.12 to 38.21 dB and flatness error
+from 0.61% to 0.33%, guarding against a noise-only smoothing win.
 
 The GPU check also contains a column-pattern regression. On its deterministic
 test image, the default kernel reduced mixed gain/bias stripe RMSE from 101.47
@@ -74,8 +82,12 @@ the comparison is deliberately scoped to that reconstruction path.
    and combines seven half-pixel samples using
    `[-2, 3, 6, 7, 6, 3, -2] / 21`. GhostSun's basic extractor uses
    prefiltered cubic B-splines; the default profile extractor instead estimates
-   the local absorption-line centre and depth. A Gaussian spectral window is
-   optional in basic mode (`--window-sigma`).
+   the local absorption-line centre and depth. GhostSun's minimal baseline
+   derives quadratic and quartic weighted-least-squares kernels from their
+   polynomial models, then blends their estimates according to measured
+   row noise. It contains neither INTI's fixed coefficients nor its
+   Catmull-Rom/`uint16` extraction path. A Gaussian spectral window is optional
+   in basic mode (`--window-sigma`).
 
 5. **Scan-time disturbances.** No explicit per-frame seeing-jitter solver or
    scan-time transparency model was found in the audited INTI reconstruction
@@ -184,8 +196,8 @@ ghostsun recon scan.ser --out-dir out
 # Also write relative line-centre and wing-difference Doppler products
 ghostsun recon scan.ser --out-dir out --velocity
 
-# INTI-style internal emulation for controlled comparisons
-ghostsun recon scan.ser --out-dir out --baseline --name inti_style
+# Minimal internal pipeline for controlled comparisons
+ghostsun recon scan.ser --out-dir out --baseline --name minimal
 
 # Reconstruct a wavelength offset in pixels from the line core
 ghostsun recon scan.ser --shift 15
@@ -214,7 +226,7 @@ Reconstruction switches include `--no-jitter`, `--no-transparency`,
 
 - `crates/ghostsun-core/src/ser.rs` — memory-mapped SER v3 reader/writer
 - `crates/ghostsun-core/src/linefit.rs` — sub-pixel line geometry
-- `crates/ghostsun-core/src/extract.rs` — B-spline extraction and baseline mode
+- `crates/ghostsun-core/src/extract.rs` — profile sampling and adaptive local-polynomial kernel
 - `crates/ghostsun-core/src/profile.rs` — profile extraction, flexure, velocity
 - `crates/ghostsun-core/src/jitter.rs` — slit/scan registration and slow drift
 - `crates/ghostsun-core/src/flatfield.rs` — transparency and row nonuniformity

@@ -359,7 +359,7 @@ pub fn robust_loess_quadratic(v: &[f64], win: usize, iters: usize) -> Vec<f64> {
 }
 
 /// Savitzky-Golay-like quadratic smoothing via least squares on a moving
-/// window (used only by the INTI-baseline mode).
+/// window (used only by the minimal comparison mode).
 pub fn savgol_quadratic(v: &[f64], window: usize) -> Vec<f64> {
     let n = v.len();
     let hw = (window / 2).max(2);

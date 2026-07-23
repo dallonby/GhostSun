@@ -2,6 +2,8 @@
 //! viewer and processor for macOS and Windows.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod focus;
+
 use eframe::egui;
 use ghostsun_core::image2d::Image;
 use ghostsun_core::mathutil::percentile_f32;
@@ -70,6 +72,7 @@ enum ViewMode {
     Display,
     Color,
     Velocity,
+    Focus,
 }
 
 enum Job {
@@ -111,6 +114,7 @@ struct App {
     last_ser: Option<std::path::PathBuf>,
     pending_open: Option<PathBuf>,
     show_before_demix: bool,
+    focus: focus::FocusState,
 }
 
 impl App {
@@ -141,6 +145,7 @@ impl App {
             last_ser: None,
             pending_open: std::env::args().nth(1).map(PathBuf::from),
             show_before_demix: false,
+            focus: focus::FocusState::default(),
         }
     }
 
@@ -323,6 +328,7 @@ impl App {
                     return;
                 }
             }
+            ViewMode::Focus => return, // Focus mode renders its own live view
         };
         self.texture = Some(ctx.load_texture(
             "main",
@@ -388,6 +394,9 @@ fn style(ctx: &egui::Context) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_jobs();
+        if self.mode == ViewMode::Focus {
+            self.focus.poll(ctx);
+        }
 
         // open a file passed on the command line (once)
         if let Some(path) = self.pending_open.take() {
@@ -427,12 +436,21 @@ impl eframe::App for App {
                     let has_vel =
                         self.loaded.as_ref().map(|l| l.velocity.is_some()).unwrap_or(false);
                     let mut mode = self.mode;
+                    ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
                     ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
                     if has_vel {
                         ui.selectable_value(&mut mode, ViewMode::Velocity, "Doppler");
                     }
                     ui.selectable_value(&mut mode, ViewMode::Display, "Grayscale");
                     if mode != self.mode {
+                        // leaving Focus: stop the camera stream
+                        if self.mode == ViewMode::Focus {
+                            self.focus.stop();
+                        }
+                        // entering Focus: discover cameras once
+                        if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
+                            self.focus.refresh_cameras();
+                        }
                         self.mode = mode;
                         self.texture = None;
                         self.tex_mode = None;
@@ -447,6 +465,10 @@ impl eframe::App for App {
             .width_range(260.0..=520.0)
             .show(ctx, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            if self.mode == ViewMode::Focus {
+                self.focus.controls_ui(ui, ctx);
+                return;
+            }
             ui.add_space(8.0);
             if let Some(loaded) = &self.loaded {
                 egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
@@ -562,6 +584,10 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(8, 7, 6)))
             .show(ctx, |ui| {
+                if self.mode == ViewMode::Focus {
+                    self.focus.view_ui(ui, ctx);
+                    return;
+                }
                 self.build_texture(ctx);
                 let avail = ui.available_size();
                 let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());

@@ -4,6 +4,7 @@ members = [
     "crates/ghostsun-core",
     "crates/ghostsun-cli",
     "crates/ghostsun-app",
+    "crates/ghostsun-camera",
 ]
 
 [workspace.package]

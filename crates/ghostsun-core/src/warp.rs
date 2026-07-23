@@ -129,7 +129,7 @@ pub fn warp_single(disk: &Image, geom: &EllipseGeom, p: &WarpParams) -> WarpOutp
     WarpOutput { image, xc: oc, yc: oc, radius: r }
 }
 
-/// INTI-baseline: three successive bilinear resamplings, each rounded to
+/// Comparison baseline: three successive bilinear resamplings, each rounded to
 /// uint16 (shear about the disk column, x-rescale, rotation about center).
 pub fn warp_baseline(disk: &Image, geom: &EllipseGeom, p: &WarpParams) -> WarpOutput {
     let quantize = |img: &mut Image| {

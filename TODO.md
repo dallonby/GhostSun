@@ -19,8 +19,9 @@ gates defined for it, and every stage keeps the project invariants:
   `synth --clean`), a **deadband/gate** wherever an estimator's noise could
   be injected, and a **robustness sweep** (≥3 seeds + one harsh case) before
   it's declared done.
-- **Never touch the `--baseline` (INTI-faithful) path** — it exists to stay
-  faithfully bad for comparison.
+- **Keep `--baseline` minimal and stable.** It is an internal GhostSun
+  comparison path, not an INTI-faithful reference. Changes require the same
+  noisy, clean, and multi-seed evidence as the main pipeline.
 - Extraction-side features must add their degradation to `synth.rs` FIRST,
   with ground truth recorded in `SynthTruth`, so the harness can score the
   fix. If the synth doesn't model the problem, the feature cannot be tuned.
@@ -158,7 +159,7 @@ not).
 
 **Files:** new `src/profile.rs`; `extract.rs` gains
 `ExtractMode::{BSpline, Profile}`; `ReconOptions.extract_mode` (default
-Profile once accepted); baseline path untouched.
+Profile once accepted); minimal comparison path unchanged.
 
 **Tuning params (into `TuneParams`):** `w_fit`, `pca_k`, `sigma_row_smooth`,
 off-disk gate threshold + taper width.
@@ -511,11 +512,47 @@ notes / chat log):
 - **M3:** app polish — histogram panel, tune-parameter editor, multi-scan
   stacking UI, batch queue, .app bundle + icon (cargo-bundle).
 
+## F12: Live spectral line identification & annotation (focus view + `identify`)
+
+> **STATUS: focus-view part IMPLEMENTED (2026-07-23).** `core::lines` has the
+> Fraunhofer catalog, `geometric_dispersion`, and the seeded-ICP `calibrate` /
+> `identify` (unit-tested: geometry matches Sol'Ex Hα ~0.041 Å/px; solver
+> recovers a synthetic scale and labels Hα). The Focus tab has the optics inputs
+> (grating/order/focal/pixel/central-λ), runs calibration live on the detected
+> spectral lines, overlays element/λ labels, and adopts the calibrated Å/px.
+> STILL TODO: the CLI `identify` subcommand; a fwhm/depth pre-filter so the
+> fringe forest can't feed the matcher; multi-scan wavelength consistency.
+
+Annotate the dispersion axis with element/wavelength labels, live in the app's
+Focus tab and as a CLI `identify` subcommand. Two-layer calibration:
+
+1. **Geometric scale (Å/px) from optics.** Inputs: grating groove density
+   `g` (l/mm), order `m`, camera focal length `f_cam` (mm), pixel size `p`.
+   Near-Littrow (Sol'Ex): `sin β ≈ m·λ₀·g/2`, then
+   `Δλ_per_px = p·cosβ / (m·g·f_cam)`. Good to ~±10–15% (depends on β and the
+   true focal length). Auto-fills the Focus tab's Å/px field; user may override.
+2. **Absolute zero-point from the spectrum itself.** Geometry cannot give the
+   grating rotation angle, so anchor to known lines. Embed a small catalog
+   (Fraunhofer + telluric: Hα 6562.8, telluric H₂O 6561.1/6564.2, Na D
+   5890/5896, Mg b 5167/5173/5184, Ca II H/K 3934/3968, strong Fe I). Detect
+   line dips (reuse `fit_line_1d`), then fit `(λ₀, dispersion)` against the
+   catalog seeded by the geometric guess. Overlay a wavelength axis + element
+   labels on the spectral-profile plot. Confidence gate: if no confident lock,
+   show the geometric scale + a manual "target line" dropdown as the anchor.
+
+Reuses the existing telluric machinery (`profile::estimate_flexure_telluric`
+already detects anchors and identified Hα from the −20/+17.5 px telluric
+doublet — see CLAUDE.md). Labels the **spectral (dispersion) axis only**; the
+slit axis has no wavelength meaning. Auto-ID is reliable near a strong distinct
+anchor (Hα ideal), weaker in a bland Fe-line stretch — hence the manual
+fallback. Recommended build order: geometry→Å/px + single manual anchor first
+(robust, immediately useful), then catalog auto-ID.
+
 ## Process checklist for every feature (copy into each PR)
 
 - [ ] Synth models the degradation; truth recorded; penalty measured with
       feature off (numbers in PR).
-- [ ] Feature flag-gated; default per spec above; baseline path untouched.
+- [ ] Feature flag-gated; default per spec above; minimal comparison path unchanged.
 - [ ] Noisy bench: target met (feature-specific gate above); ablation row
       shows the feature earning its place.
 - [ ] Clean-injection audit passed (≤ stated dB).

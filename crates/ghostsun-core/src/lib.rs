@@ -12,6 +12,7 @@ pub mod image2d;
 pub mod jitter;
 pub mod limb;
 pub mod linefit;
+pub mod lines;
 pub mod mathutil;
 pub mod metrics;
 pub mod output;
