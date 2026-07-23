@@ -110,6 +110,7 @@ jobs:
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_CERTIFICATE_CER_BASE64: ${{ secrets.MACOS_CERTIFICATE_CER_BASE64 }}
         run: bash scripts/import-macos-signing-certificate.sh
 
       - name: Package application

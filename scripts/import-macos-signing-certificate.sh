@@ -3,16 +3,21 @@ set -euo pipefail
 
 : "${MACOS_CERTIFICATE_P12_BASE64:?Set MACOS_CERTIFICATE_P12_BASE64}"
 : "${MACOS_CERTIFICATE_PASSWORD:?Set MACOS_CERTIFICATE_PASSWORD}"
+: "${MACOS_CERTIFICATE_CER_BASE64:?Set MACOS_CERTIFICATE_CER_BASE64}"
 : "${GITHUB_ENV:?This script is intended for GitHub Actions}"
 
 keychain="$RUNNER_TEMP/ghostsun-signing.keychain-db"
 certificate="$RUNNER_TEMP/ghostsun-developer-id.p12"
+public_certificate="$RUNNER_TEMP/ghostsun-developer-id.cer"
 keychain_password="$(openssl rand -hex 24)"
-trap 'rm -f "$certificate"' EXIT
+trap 'rm -f "$certificate" "$public_certificate"' EXIT
 
 printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" \
   | openssl base64 -d -A \
   > "$certificate"
+printf '%s' "$MACOS_CERTIFICATE_CER_BASE64" \
+  | openssl base64 -d -A \
+  > "$public_certificate"
 
 security create-keychain -p "$keychain_password" "$keychain"
 security set-keychain-settings -lut 21600 "$keychain"
@@ -20,6 +25,10 @@ security unlock-keychain -p "$keychain_password" "$keychain"
 security import "$certificate" \
   -k "$keychain" \
   -P "$MACOS_CERTIFICATE_PASSWORD" \
+  -T /usr/bin/codesign \
+  -T /usr/bin/security
+security import "$public_certificate" \
+  -k "$keychain" \
   -T /usr/bin/codesign \
   -T /usr/bin/security
 security set-key-partition-list \

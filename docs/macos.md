@@ -31,6 +31,9 @@ pushed:
   private key exported from Keychain Access as a password-protected `.p12`,
   then base64-encoded.
 - `MACOS_CERTIFICATE_PASSWORD`: the password chosen during the `.p12` export.
+- `MACOS_CERTIFICATE_CER_BASE64`: the corresponding public Developer ID
+  Application certificate exported from Keychain Access, base64-encoded. This
+  also supports `.p12` exports that contain only the private key.
 - `APPLE_NOTARY_KEY_P8_BASE64`: an App Store Connect API private key,
   base64-encoded.
 - `APPLE_NOTARY_KEY_ID`: the API key ID.
