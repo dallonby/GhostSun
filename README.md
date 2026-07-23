@@ -231,7 +231,9 @@ skipped when no compatible compute adapter is available.
 The `Desktop builds` GitHub Actions workflow tests the workspace and publishes
 packaged Windows x64, macOS Apple Silicon, and macOS Intel artifacts. Pushing a
 tag beginning with `v` also creates or updates a GitHub Release containing all
-three ZIPs and their SHA-256 checksums.
+three ZIPs and their SHA-256 checksums. Tagged macOS packages are Developer ID
+signed and notarized, with the ToupTek and ZWO camera SDKs bundled inside the
+app.
 
 ## Usage
 

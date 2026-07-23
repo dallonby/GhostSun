@@ -8,7 +8,7 @@ packages for Apple Silicon and Intel Macs.
 1. Download the package matching the Mac: **Apple Silicon** for M-series Macs,
    or **Intel** for older Intel Macs.
 2. Extract the ZIP and move `GhostSun.app` to `Applications`.
-3. Control-click `GhostSun.app`, choose **Open**, then confirm **Open**.
+3. Open `GhostSun.app`.
 
 Open a SER, review the pipeline controls, and click **Process**. Once processing
 finishes, **Orient from GONG** can use the SER's UTC timestamp and a downloaded
@@ -16,20 +16,38 @@ GONG H-alpha reference to feature-match the image into solar north-up,
 east-left orientation. The optional match requires internet access; references
 are cached in the macOS temporary directory.
 
-CI packages are ad-hoc signed so their bundle is internally consistent, but
-they are not Apple-notarized. The first launch can therefore show a Gatekeeper
-warning. A notarized public distribution would additionally require an Apple
-Developer ID certificate and notarization credentials stored as repository
-secrets.
+Tagged releases are signed with GhostSun's Developer ID Application identity,
+submitted to Apple's notary service, and distributed with the notarization
+ticket stapled to the app. Ordinary branch and pull-request artifacts use an
+ad-hoc signature because release credentials are deliberately unavailable to
+untrusted builds; Gatekeeper may warn when opening those CI-only artifacts.
+
+### Release signing setup
+
+The repository needs these GitHub Actions secrets before a version tag is
+pushed:
+
+- `MACOS_CERTIFICATE_P12_BASE64`: the Developer ID Application certificate and
+  private key exported from Keychain Access as a password-protected `.p12`,
+  then base64-encoded.
+- `MACOS_CERTIFICATE_PASSWORD`: the password chosen during the `.p12` export.
+- `APPLE_NOTARY_KEY_P8_BASE64`: an App Store Connect API private key,
+  base64-encoded.
+- `APPLE_NOTARY_KEY_ID`: the API key ID.
+- `APPLE_NOTARY_ISSUER_ID`: the App Store Connect issuer ID.
+
+The workflow imports the signing identity into a temporary keychain, signs the
+libraries before the app with the hardened runtime enabled, submits each ZIP to
+Apple, staples the returned ticket, and rebuilds the downloadable archive.
 
 ## Camera SDKs
 
-The Focus view loads camera SDKs at runtime. The package does not redistribute
-ToupTek's `libtoupcam.dylib` or ZWO's `libASICamera2.dylib`. GhostSun searches
-the app's `Contents/Frameworks` directory, normal dynamic-library search paths,
-and the KStars frameworks directory. Developers can also set
-`GHOSTSUN_TOUPCAM_LIB` or `GHOSTSUN_ASI_LIB` to a full library path before
-launching from a terminal.
+The packaged app includes the ToupTek and ZWO camera SDKs in
+`Contents/Frameworks`, together with the `libusb` dependency required by ZWO.
+Each library is reduced to the package's target architecture and signed before
+the app itself. GhostSun can still use an explicitly selected development
+library by setting `GHOSTSUN_TOUPCAM_LIB` or `GHOSTSUN_ASI_LIB` to its full path
+before launching from a terminal.
 
 ## Build locally
 

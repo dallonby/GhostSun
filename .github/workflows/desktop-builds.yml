@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         shell: pwsh
@@ -40,7 +40,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -56,7 +56,7 @@ jobs:
         run: ./scripts/package-windows.ps1 -Destination dist
 
       - name: Upload Windows package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GhostSun-Windows-x64
           path: dist/GhostSun-Windows-x64.zip
@@ -82,7 +82,7 @@ jobs:
             package: GhostSun-macOS-Intel
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
         run: |
@@ -91,7 +91,7 @@ jobs:
           rustup default stable
 
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -102,17 +102,45 @@ jobs:
       - name: Test workspace
         run: cargo test --release --workspace --locked
 
+      - name: Install camera SDK dependency
+        run: brew list libusb >/dev/null 2>&1 || brew install libusb
+
+      - name: Import Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: bash scripts/import-macos-signing-certificate.sh
+
       - name: Package application
         run: bash scripts/package-macos.sh "${{ matrix.target }}" dist "${{ matrix.package }}"
 
+      - name: Notarize macOS package
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          bash scripts/notarize-macos.sh \
+            "dist/${{ matrix.package }}/GhostSun.app" \
+            "dist/${{ matrix.package }}.zip"
+
       - name: Upload macOS package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.package }}
           path: dist/${{ matrix.package }}.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Remove temporary signing keychain
+        if: always() && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [[ -n "${MACOS_SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$MACOS_SIGNING_KEYCHAIN" || true
+          fi
 
   release:
     name: Publish tagged release
@@ -125,7 +153,7 @@ jobs:
       contents: write
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: GhostSun-*
           path: dist

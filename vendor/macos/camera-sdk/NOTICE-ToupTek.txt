@@ -1,0 +1,8 @@
+ToupTek ToupCam SDK
+SDK version: 59.30701.20260128
+Library: libtoupcam.dylib
+Copyright: ToupTek
+
+The GhostSun project owner confirmed that ToupTek granted permission to
+redistribute this SDK library on 2026-07-23. The library remains the property
+of ToupTek and is redistributed only for use with compatible cameras.
