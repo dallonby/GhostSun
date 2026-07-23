@@ -1,5 +1,13 @@
 # GhostSun
 
+<p align="center">
+  <img
+    src="docs/images/ghostsun-hero.png"
+    alt="GhostSun reconstructing a real H-alpha solar observation from a spectroheliograph SER scan"
+    width="100%"
+  />
+</p>
+
 GhostSun reconstructs solar disks from spectroheliograph (Sol'Ex / SHG) SER
 scans. It is a native Rust workspace containing a command-line program, a
 shared reconstruction library, and a desktop viewer for Windows 11 and macOS.
@@ -9,6 +17,41 @@ The project reimplements and extends ideas used by
 deterministic, physically motivated synthetic scan generator with known ground
 truth. Synthetic results are useful regression evidence; they are not a
 substitute for validation across independent real observations.
+
+## Real-scan reconstruction
+
+The images below were produced from the same real Hα observation: a
+3840 × 120 pixel SER scan containing 9,075 frames. The source scan is not
+included in the repository.
+
+<p align="center">
+  <img
+    src="docs/images/ghostsun-correction-comparison.png"
+    alt="A real solar observation reconstructed with GhostSun's minimal baseline and default correction pipeline"
+    width="100%"
+  />
+</p>
+
+<p align="center">
+  <img
+    src="docs/images/ghostsun-products.png"
+    alt="GhostSun H-alpha colour, 16-bit intensity, and relative Doppler output products"
+    width="100%"
+  />
+</p>
+
+<details>
+<summary>View the full-resolution Hα presentation</summary>
+
+<p align="center">
+  <img
+    src="docs/images/ghostsun-real-ha.png"
+    alt="Full solar disk reconstructed and colourized by GhostSun from a real H-alpha scan"
+    width="900"
+  />
+</p>
+
+</details>
 
 ## Reproducible results
 
