@@ -172,8 +172,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           files=(dist/*.zip dist/SHA256SUMS.txt)
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${files[@]}" --clobber
-          else
-            gh release create "$TAG" "${files[@]}" --verify-tag --generate-notes
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # A release can be created successfully even if a later API call
+            # makes `gh release create` return non-zero. Accept that partial
+            # success only when a follow-up view confirms the release exists.
+            gh release create "$TAG" --verify-tag --generate-notes ||
+              gh release view "$TAG" >/dev/null
           fi
+          gh release upload "$TAG" "${files[@]}" --clobber
