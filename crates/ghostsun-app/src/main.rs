@@ -4,6 +4,7 @@
 
 mod focus;
 mod gong;
+mod mount;
 
 use eframe::egui;
 use ghostsun_core::image2d::Image;
@@ -74,6 +75,7 @@ enum ViewMode {
     Color,
     Velocity,
     Focus,
+    Mount,
 }
 
 enum Job {
@@ -137,6 +139,7 @@ struct App {
     pending_open: Option<PathBuf>,
     show_before_demix: bool,
     focus: focus::FocusState,
+    mount: mount::MountState,
 }
 
 impl App {
@@ -170,6 +173,7 @@ impl App {
             pending_open: std::env::args().nth(1).map(PathBuf::from),
             show_before_demix: false,
             focus: focus::FocusState::default(),
+            mount: mount::MountState::default(),
         }
     }
 
@@ -503,7 +507,7 @@ impl App {
                     return;
                 }
             }
-            ViewMode::Focus => return, // Focus mode renders its own live view
+            ViewMode::Focus | ViewMode::Mount => return, // These modes render their own views
         };
         self.texture = Some(ctx.load_texture(
             "main",
@@ -571,6 +575,9 @@ impl eframe::App for App {
         self.pump_jobs();
         if self.mode == ViewMode::Focus {
             self.focus.poll(ctx);
+        } else if self.mode == ViewMode::Mount {
+            self.focus.poll(ctx);
+            self.mount.poll(ctx, &mut self.focus);
         }
 
         // open a file passed on the command line (once)
@@ -594,50 +601,72 @@ impl eframe::App for App {
         }
 
         egui::TopBottomPanel::top("top").exact_height(48.0).show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("☀ GhostSun").size(22.0).strong().color(ACCENT));
-                ui.add_space(16.0);
-                if ui.button("Open…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Solar data", &["ser", "fits", "fit", "png"])
-                        .pick_file()
-                    {
-                        self.open_file(path);
-                    }
-                }
-                if self.running {
-                    ui.add(egui::Spinner::new().color(ACCENT));
-                    ui.label(egui::RichText::new("processing…").italics());
-                } else if self.orientation_running {
-                    ui.add(egui::Spinner::new().color(ACCENT));
-                    ui.label(egui::RichText::new("matching GONG features…").italics());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(6.0);
-                    let has_vel =
-                        self.loaded.as_ref().map(|l| l.velocity.is_some()).unwrap_or(false);
-                    let mut mode = self.mode;
-                    ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
-                    ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
-                    if has_vel {
-                        ui.selectable_value(&mut mode, ViewMode::Velocity, "Doppler");
-                    }
-                    ui.selectable_value(&mut mode, ViewMode::Display, "Grayscale");
-                    if mode != self.mode {
-                        // leaving Focus: stop the camera stream
-                        if self.mode == ViewMode::Focus {
-                            self.focus.stop();
+            ui.columns(2, |columns| {
+                columns[0].with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("☀ GhostSun")
+                                .size(22.0)
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.add_space(16.0);
+                        if ui.button("Open…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Solar data", &["ser", "fits", "fit", "png"])
+                                .pick_file()
+                            {
+                                self.open_file(path);
+                            }
                         }
-                        // entering Focus: discover cameras once
-                        if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
-                            self.focus.refresh_cameras();
+                        if self.running {
+                            ui.add(egui::Spinner::new().color(ACCENT));
+                            ui.label(egui::RichText::new("processing…").italics());
+                        } else if self.orientation_running {
+                            ui.add(egui::Spinner::new().color(ACCENT));
+                            ui.label(
+                                egui::RichText::new("matching GONG features…").italics(),
+                            );
                         }
-                        self.mode = mode;
-                        self.texture = None;
-                        self.tex_mode = None;
-                    }
-                });
+                    },
+                );
+                columns[1].with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(6.0);
+                        let has_vel =
+                            self.loaded.as_ref().map(|l| l.velocity.is_some()).unwrap_or(false);
+                        let mut mode = self.mode;
+                        ui.selectable_value(&mut mode, ViewMode::Display, "Grayscale");
+                        if has_vel {
+                            ui.selectable_value(&mut mode, ViewMode::Velocity, "Doppler");
+                        }
+                        ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
+                        ui.selectable_value(&mut mode, ViewMode::Mount, "Mount");
+                        ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
+                        if mode != self.mode {
+                            // leaving Focus: stop the camera stream
+                            if self.mode == ViewMode::Focus {
+                                self.focus.stop();
+                            }
+                            if self.mode == ViewMode::Mount {
+                                self.mount.leave_tab(&mut self.focus);
+                            }
+                            // entering Focus: discover cameras once
+                            if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
+                                self.focus.refresh_cameras();
+                            }
+                            if mode == ViewMode::Mount {
+                                self.mount.enter_tab(&mut self.focus);
+                            }
+                            self.mode = mode;
+                            self.texture = None;
+                            self.tex_mode = None;
+                        }
+                    },
+                );
             });
         });
 
@@ -649,6 +678,10 @@ impl eframe::App for App {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             if self.mode == ViewMode::Focus {
                 self.focus.controls_ui(ui, ctx);
+                return;
+            }
+            if self.mode == ViewMode::Mount {
+                self.mount.controls_ui(ui, &mut self.focus);
                 return;
             }
             ui.add_space(8.0);
@@ -856,6 +889,10 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 if self.mode == ViewMode::Focus {
                     self.focus.view_ui(ui, ctx);
+                    return;
+                }
+                if self.mode == ViewMode::Mount {
+                    self.mount.view_ui(ui, ctx, &mut self.focus);
                     return;
                 }
                 self.build_texture(ctx);

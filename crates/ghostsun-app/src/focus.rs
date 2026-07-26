@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 use eframe::egui;
 use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Text, VLine};
 
-use ghostsun_camera::{enumerate_all, open, CameraInfo, Roi};
+use ghostsun_camera::{enumerate_all, open, Backend, CameraInfo, Roi};
 use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
 
@@ -125,6 +125,12 @@ enum FocusCmd {
     AutoExposure(bool),
 }
 
+pub struct SearchCameraRestore {
+    was_streaming: bool,
+    exposure_us: u32,
+    auto_exposure: bool,
+}
+
 /// Min-hold + rolling history for one measured axis.
 #[derive(Default)]
 struct Track {
@@ -179,6 +185,7 @@ pub struct FocusState {
     track_x: Track, // vertical lines
     track_y: Track, // horizontal lines
     last: Option<FocusUpdate>,
+    frame_seq: u64,
     tex: Option<egui::TextureHandle>,
     rx: Option<Receiver<FocusMsg>>,
     cmd: Option<Sender<FocusCmd>>,
@@ -213,6 +220,7 @@ impl Default for FocusState {
             track_x: Track::new(),
             track_y: Track::new(),
             last: None,
+            frame_seq: 0,
             tex: None,
             rx: None,
             cmd: None,
@@ -379,7 +387,79 @@ impl FocusState {
                 }
             }
             self.last = Some(*u);
+            self.frame_seq = self.frame_seq.wrapping_add(1);
         }
+    }
+
+    pub fn prepare_sun_search(
+        &mut self,
+        ctx: &egui::Context,
+        requested_exposure_us: u32,
+    ) -> Result<SearchCameraRestore, String> {
+        if self.cameras.is_empty() {
+            self.refresh_cameras();
+        }
+        if self
+            .cameras
+            .get(self.selected)
+            .map(|camera| camera.backend == Backend::Synth)
+            .unwrap_or(true)
+        {
+            if let Some(index) = self
+                .cameras
+                .iter()
+                .position(|camera| camera.backend != Backend::Synth)
+            {
+                self.selected = index;
+            }
+        }
+        let (camera_name, exposure_min, exposure_max) = self
+            .cameras
+            .get(self.selected)
+            .filter(|camera| camera.backend != Backend::Synth)
+            .map(|camera| {
+                (
+                    camera.name.clone(),
+                    *camera.exposure_us.start(),
+                    *camera.exposure_us.end(),
+                )
+            })
+            .ok_or_else(|| "no hardware camera is available for Sun centering".to_owned())?;
+        let target_exposure = requested_exposure_us.clamp(exposure_min, exposure_max);
+        let restore = SearchCameraRestore {
+            was_streaming: self.streaming,
+            exposure_us: self.exposure_us,
+            auto_exposure: self.auto_exposure,
+        };
+        if !self.streaming {
+            self.start(ctx);
+        }
+        self.auto_exposure = false;
+        self.exposure_us = target_exposure;
+        self.send_cmd(FocusCmd::AutoExposure(false));
+        self.send_cmd(FocusCmd::Exposure(target_exposure));
+        self.status = format!(
+            "Sun search: {} at {:.0} ms",
+            camera_name,
+            target_exposure as f64 / 1000.0
+        );
+        Ok(restore)
+    }
+
+    pub fn restore_after_sun_search(&mut self, restore: SearchCameraRestore) {
+        self.exposure_us = restore.exposure_us;
+        self.auto_exposure = restore.auto_exposure;
+        self.send_cmd(FocusCmd::Exposure(restore.exposure_us));
+        self.send_cmd(FocusCmd::AutoExposure(restore.auto_exposure));
+        if !restore.was_streaming {
+            self.stop();
+        } else {
+            self.status = "Sun search complete; camera settings restored".into();
+        }
+    }
+
+    pub fn sun_signal_sample(&self) -> Option<(u64, f32)> {
+        self.last.as_ref().map(|frame| (self.frame_seq, frame.mean))
     }
 
     fn reset_holds(&mut self) {

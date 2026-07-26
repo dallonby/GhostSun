@@ -28,6 +28,27 @@ before choosing **More info > Run anyway**.
 The app does not need an installer or the Rust toolchain. Keep it anywhere you
 can write files; loaded scans and exported images can be located elsewhere.
 
+## ZWO mount control
+
+The **Mount** tab controls ZWO AM-series mounts directly over their
+LX200-compatible USB serial connection. Power on the mount and connect its
+USB-B control port to the computer with a USB 2.0 data cable. Select the
+resulting `COM` port, click **Connect**, and use the press-and-hold jog buttons.
+Releasing a direction, changing rate, leaving the tab, disconnecting, or
+closing GhostSun sends a stop command.
+
+GhostSun scans Windows SetupAPI COM ports every three seconds and prioritizes
+ZWO's USB vendor ID. If no ZWO port is found, expand **Mount not detected** for
+a cable/power checklist and **Open ASI Mount**. Confirm that ASI Mount detects
+the hardware, then disconnect or close it so the serial port is free for
+GhostSun.
+
+**Slew to the Sun** requires a separate confirmation and then requests solar
+tracking. Before confirming, securely fit a suitable solar filter, check the
+entire slew path, and use ASI Mount to synchronize the mount's time, location,
+home position, and alignment. GhostSun deliberately does not change those
+mount settings automatically.
+
 ## ToupTek cameras
 
 The Focus view uses ToupTek's 64-bit SDK at runtime. GhostSun searches beside

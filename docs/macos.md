@@ -16,6 +16,27 @@ GONG H-alpha reference to feature-match the image into solar north-up,
 east-left orientation. The optional match requires internet access; references
 are cached in the macOS temporary directory.
 
+## ZWO mount control
+
+The **Mount** tab uses the same direct, LX200-compatible USB serial connection
+on macOS and Windows; it does not depend on Windows ASCOM. Power on the ZWO
+AM-series mount and attach its USB control port with a data cable. Select the
+mount's `/dev/cu.*` device in GhostSun (or enter its path), then click
+**Connect**. Releasing a jog direction, changing rate, leaving the tab,
+disconnecting, or closing GhostSun sends a stop command.
+
+GhostSun scans macOS IOKit serial devices every three seconds, keeps the
+outgoing `/dev/cu.*` endpoint, and supplements it with a direct `/dev/cu.*`
+directory scan. If no ZWO port is found, expand **Mount not detected** for a
+cable/power checklist and **Open ASIStudio**. Confirm that ASIStudio detects the
+hardware, then disconnect or close it so the serial port is free for GhostSun.
+
+**Slew to the Sun** requires a second explicit confirmation and requests solar
+tracking after the GoTo begins. Before confirming, securely fit a suitable
+solar filter, check the entire slew path, and synchronize the mount's time,
+location, home position, and alignment in the ZWO software. GhostSun does not
+change those mount settings automatically.
+
 Tagged releases are signed with GhostSun's Developer ID Application identity,
 submitted to Apple's notary service, and distributed with the notarization
 ticket stapled to the app. Ordinary branch and pull-request artifacts use an
