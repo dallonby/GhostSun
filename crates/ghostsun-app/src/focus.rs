@@ -79,17 +79,22 @@ pub enum LineMode {
 /// Pick one line from the candidates per the mode (Manual uses `picked`).
 fn choose(lines: &[Fit], mode: LineMode, picked: Option<f64>) -> Option<Fit> {
     match mode {
-        LineMode::Narrowest => {
-            lines.iter().min_by(|a, b| a.fwhm.partial_cmp(&b.fwhm).unwrap()).copied()
-        }
-        LineMode::Deepest => {
-            lines.iter().max_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap()).copied()
-        }
+        LineMode::Narrowest => lines
+            .iter()
+            .min_by(|a, b| a.fwhm.partial_cmp(&b.fwhm).unwrap())
+            .copied(),
+        LineMode::Deepest => lines
+            .iter()
+            .max_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap())
+            .copied(),
         LineMode::Manual => picked.and_then(|pc| {
             lines
                 .iter()
                 .min_by(|a, b| {
-                    (a.center - pc).abs().partial_cmp(&(b.center - pc).abs()).unwrap()
+                    (a.center - pc)
+                        .abs()
+                        .partial_cmp(&(b.center - pc).abs())
+                        .unwrap()
                 })
                 .copied()
         }),
@@ -140,7 +145,10 @@ struct Track {
 
 impl Track {
     fn new() -> Track {
-        Track { min_hold: f64::INFINITY, history: VecDeque::with_capacity(HISTORY) }
+        Track {
+            min_hold: f64::INFINITY,
+            history: VecDeque::with_capacity(HISTORY),
+        }
     }
     fn push(&mut self, fit: &Option<Fit>) {
         if let Some(f) = fit {
@@ -236,7 +244,9 @@ impl FocusState {
         if self.selected >= self.cameras.len() {
             self.selected = 0;
         }
-        let hardware = self.cameras.iter()
+        let hardware = self
+            .cameras
+            .iter()
             .filter(|c| c.backend != ghostsun_camera::Backend::Synth)
             .count();
         self.status = if hardware > 0 {
@@ -322,13 +332,23 @@ impl FocusState {
         }
         if let Some(u) = latest {
             if u.strip_w > 0 && u.strip_h > 0 {
-                let pixels = u.strip.iter().map(|&g| egui::Color32::from_gray(g)).collect();
-                let img = egui::ColorImage { size: [u.strip_w, u.strip_h], pixels };
+                let pixels = u
+                    .strip
+                    .iter()
+                    .map(|&g| egui::Color32::from_gray(g))
+                    .collect();
+                let img = egui::ColorImage {
+                    size: [u.strip_w, u.strip_h],
+                    pixels,
+                };
                 match &mut self.tex {
                     Some(t) => t.set(img, egui::TextureOptions::NEAREST),
                     None => {
-                        self.tex =
-                            Some(ctx.load_texture("focus_strip", img, egui::TextureOptions::NEAREST))
+                        self.tex = Some(ctx.load_texture(
+                            "focus_strip",
+                            img,
+                            egui::TextureOptions::NEAREST,
+                        ))
                     }
                 }
             }
@@ -345,8 +365,11 @@ impl FocusState {
             // Choose which line each axis reports, per the user's mode/pick.
             let spec_is_y = self.spectral_is_y();
             let (spec, slit) = {
-                let (spec_lines, slit_lines) =
-                    if spec_is_y { (&u.lines_y, &u.lines_x) } else { (&u.lines_x, &u.lines_y) };
+                let (spec_lines, slit_lines) = if spec_is_y {
+                    (&u.lines_y, &u.lines_x)
+                } else {
+                    (&u.lines_x, &u.lines_y)
+                };
                 (
                     choose(spec_lines, self.line_mode, self.picked_center),
                     choose(slit_lines, LineMode::Narrowest, None),
@@ -479,9 +502,11 @@ impl FocusState {
         ui.add_space(8.0);
         ui.heading("Focus assistant");
         ui.label(
-            egui::RichText::new("Minimise FWHM — spectral (camera focus) and slit (scope-on-slit).")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "Minimise FWHM — spectral (camera focus) and slit (scope-on-slit).",
+            )
+            .small()
+            .weak(),
         );
         ui.add_space(8.0);
 
@@ -498,7 +523,12 @@ impl FocusState {
             .map(|c| format!("{} · {}", c.backend.label(), c.name))
             .collect();
         egui::ComboBox::from_label("camera")
-            .selected_text(names.get(self.selected).cloned().unwrap_or_else(|| "—".into()))
+            .selected_text(
+                names
+                    .get(self.selected)
+                    .cloned()
+                    .unwrap_or_else(|| "—".into()),
+            )
             .show_ui(ui, |ui| {
                 for (i, n) in names.iter().enumerate() {
                     ui.selectable_value(&mut self.selected, i, n);
@@ -509,7 +539,10 @@ impl FocusState {
         ui.horizontal(|ui| {
             let can_start = !self.cameras.is_empty();
             if !self.streaming {
-                if ui.add_enabled(can_start, egui::Button::new("▶ Start")).clicked() {
+                if ui
+                    .add_enabled(can_start, egui::Button::new("▶ Start"))
+                    .clicked()
+                {
                     self.start(ctx);
                 }
             } else if ui.button("■ Stop").clicked() {
@@ -523,7 +556,10 @@ impl FocusState {
         ui.add_space(10.0);
         ui.spacing_mut().slider_width = (ui.available_width() - 130.0).max(120.0);
 
-        if ui.checkbox(&mut self.auto_exposure, "auto-exposure").changed() {
+        if ui
+            .checkbox(&mut self.auto_exposure, "auto-exposure")
+            .changed()
+        {
             self.send_cmd(FocusCmd::AutoExposure(self.auto_exposure));
         }
         let manual = !self.auto_exposure;
@@ -537,7 +573,8 @@ impl FocusState {
         if ui
             .add_enabled(
                 manual,
-                egui::Slider::new(&mut self.exposure_us, emin..=emax.min(2_000_000)).logarithmic(true),
+                egui::Slider::new(&mut self.exposure_us, emin..=emax.min(2_000_000))
+                    .logarithmic(true),
             )
             .changed()
         {
@@ -550,7 +587,11 @@ impl FocusState {
             .map(|c| (*c.gain.start(), *c.gain.end()))
             .unwrap_or((0, 600));
         self.gain = self.gain.clamp(gmin, gmax);
-        ui.label(if gmin >= 100 { "gain (%, 100 = 1×)" } else { "gain" });
+        ui.label(if gmin >= 100 {
+            "gain (%, 100 = 1×)"
+        } else {
+            "gain"
+        });
         if ui
             .add_enabled(manual, egui::Slider::new(&mut self.gain, gmin..=gmax))
             .changed()
@@ -590,23 +631,32 @@ impl FocusState {
             self.labels.clear();
         }
         if self.identify_lines {
-            egui::Grid::new("optics").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("grating l/mm");
-                ui.add(egui::DragValue::new(&mut self.grating_l_mm).range(100.0..=5000.0));
-                ui.end_row();
-                ui.label("order");
-                ui.add(egui::DragValue::new(&mut self.order).range(1..=5));
-                ui.end_row();
-                ui.label("focal length mm");
-                ui.add(egui::DragValue::new(&mut self.focal_len_mm).range(10.0..=1000.0));
-                ui.end_row();
-                ui.label("pixel µm");
-                ui.add(egui::DragValue::new(&mut self.pixel_um).speed(0.05).range(0.5..=20.0));
-                ui.end_row();
-                ui.label("central λ (Å)");
-                ui.add(egui::DragValue::new(&mut self.central_wavelength).range(3000.0..=9000.0));
-                ui.end_row();
-            });
+            egui::Grid::new("optics")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("grating l/mm");
+                    ui.add(egui::DragValue::new(&mut self.grating_l_mm).range(100.0..=5000.0));
+                    ui.end_row();
+                    ui.label("order");
+                    ui.add(egui::DragValue::new(&mut self.order).range(1..=5));
+                    ui.end_row();
+                    ui.label("focal length mm");
+                    ui.add(egui::DragValue::new(&mut self.focal_len_mm).range(10.0..=1000.0));
+                    ui.end_row();
+                    ui.label("pixel µm");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pixel_um)
+                            .speed(0.05)
+                            .range(0.5..=20.0),
+                    );
+                    ui.end_row();
+                    ui.label("central λ (Å)");
+                    ui.add(
+                        egui::DragValue::new(&mut self.central_wavelength).range(3000.0..=9000.0),
+                    );
+                    ui.end_row();
+                });
             let geo = geometric_dispersion(
                 self.grating_l_mm,
                 self.order,
@@ -663,9 +713,12 @@ impl FocusState {
         if self.line_mode == LineMode::Manual {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("locked @ {:.0} px", self.picked_center.unwrap_or(0.0)))
-                        .small()
-                        .weak(),
+                    egui::RichText::new(format!(
+                        "locked @ {:.0} px",
+                        self.picked_center.unwrap_or(0.0)
+                    ))
+                    .small()
+                    .weak(),
                 );
                 if ui.small_button("clear").clicked() {
                     self.line_mode = LineMode::Narrowest;
@@ -674,7 +727,11 @@ impl FocusState {
                 }
             });
         } else {
-            ui.label(egui::RichText::new("click the spectral plot to lock a line").small().weak());
+            ui.label(
+                egui::RichText::new("click the spectral plot to lock a line")
+                    .small()
+                    .weak(),
+            );
         }
 
         ui.add_space(12.0);
@@ -688,16 +745,33 @@ impl FocusState {
         };
         let a_per_px = self.dispersion_a_per_px;
 
-        readout(ui, "Spectral line (dispersion)", SPECTRAL_COLOR, spectral_fit, spectral_min, Some(a_per_px));
+        readout(
+            ui,
+            "Spectral line (dispersion)",
+            SPECTRAL_COLOR,
+            spectral_fit,
+            spectral_min,
+            Some(a_per_px),
+        );
         ui.add_space(6.0);
-        readout(ui, "Slit jaws / dust (spatial)", SLIT_COLOR, slit_fit, slit_min, None);
+        readout(
+            ui,
+            "Slit jaws / dust (spatial)",
+            SLIT_COLOR,
+            slit_fit,
+            slit_min,
+            None,
+        );
 
         if let Some(l) = &self.last {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(format!("frame {}×{}  mean {:.0}", l.full_w, l.full_h, l.mean))
-                    .small()
-                    .weak(),
+                egui::RichText::new(format!(
+                    "frame {}×{}  mean {:.0}",
+                    l.full_w, l.full_h, l.mean
+                ))
+                .small()
+                .weak(),
             );
         }
     }
@@ -771,8 +845,22 @@ impl FocusState {
         }
 
         ui.add_space(4.0);
-        ui.label(egui::RichText::new("Slit profile (across the slit)").small().color(SLIT_COLOR));
-        profile_plot(ui, "focus_slit", &slit_prof, slit_fit, &[], None, &[], SLIT_COLOR, 150.0);
+        ui.label(
+            egui::RichText::new("Slit profile (across the slit)")
+                .small()
+                .color(SLIT_COLOR),
+        );
+        profile_plot(
+            ui,
+            "focus_slit",
+            &slit_prof,
+            slit_fit,
+            &[],
+            None,
+            &[],
+            SLIT_COLOR,
+            150.0,
+        );
 
         // Combined FWHM trend + min-holds.
         let (spec_track, slit_track) = if self.spectral_is_y() {
@@ -786,18 +874,23 @@ impl FocusState {
             let sh: Vec<f64> = spec_track.history.iter().copied().collect();
             let kh: Vec<f64> = slit_track.history.iter().copied().collect();
             let (smin, kmin) = (spec_track.min_hold, slit_track.min_hold);
-            Plot::new("focus_trend").height(110.0).allow_scroll(false).show(ui, |p| {
-                let sp: PlotPoints = sh.iter().enumerate().map(|(x, &y)| [x as f64, y]).collect();
-                p.line(Line::new(sp).color(SPECTRAL_COLOR).name("spectral"));
-                let kp: PlotPoints = kh.iter().enumerate().map(|(x, &y)| [x as f64, y]).collect();
-                p.line(Line::new(kp).color(SLIT_COLOR).name("slit"));
-                if smin.is_finite() {
-                    p.hline(HLine::new(smin).color(SPECTRAL_COLOR));
-                }
-                if kmin.is_finite() {
-                    p.hline(HLine::new(kmin).color(SLIT_COLOR));
-                }
-            });
+            Plot::new("focus_trend")
+                .height(110.0)
+                .allow_scroll(false)
+                .show(ui, |p| {
+                    let sp: PlotPoints =
+                        sh.iter().enumerate().map(|(x, &y)| [x as f64, y]).collect();
+                    p.line(Line::new(sp).color(SPECTRAL_COLOR).name("spectral"));
+                    let kp: PlotPoints =
+                        kh.iter().enumerate().map(|(x, &y)| [x as f64, y]).collect();
+                    p.line(Line::new(kp).color(SLIT_COLOR).name("slit"));
+                    if smin.is_finite() {
+                        p.hline(HLine::new(smin).color(SPECTRAL_COLOR));
+                    }
+                    if kmin.is_finite() {
+                        p.hline(HLine::new(kmin).color(SLIT_COLOR));
+                    }
+                });
         }
     }
 }
@@ -810,28 +903,41 @@ fn readout(
     min_hold: f64,
     a_per_px: Option<f64>,
 ) {
-    egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
-        ui.label(egui::RichText::new(title).small().weak());
-        match fit {
-            Some(f) if f.depth > DEPTH_GATE => {
-                ui.label(egui::RichText::new(format!("{:.2} px", f.fwhm)).size(26.0).strong().color(color));
-                let extra = match a_per_px {
-                    Some(a) => format!("{:.3} Å   ·   depth {:.0}%", f.fwhm * a, f.depth * 100.0),
-                    None => format!("depth {:.0}%", f.depth * 100.0),
-                };
-                ui.label(egui::RichText::new(extra).small());
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().faint_bg_color)
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).small().weak());
+            match fit {
+                Some(f) if f.depth > DEPTH_GATE => {
+                    ui.label(
+                        egui::RichText::new(format!("{:.2} px", f.fwhm))
+                            .size(26.0)
+                            .strong()
+                            .color(color),
+                    );
+                    let extra = match a_per_px {
+                        Some(a) => {
+                            format!("{:.3} Å   ·   depth {:.0}%", f.fwhm * a, f.depth * 100.0)
+                        }
+                        None => format!("depth {:.0}%", f.depth * 100.0),
+                    };
+                    ui.label(egui::RichText::new(extra).small());
+                }
+                _ => {
+                    ui.label(egui::RichText::new("— no line —").size(20.0).weak());
+                }
             }
-            _ => {
-                ui.label(egui::RichText::new("— no line —").size(20.0).weak());
-            }
-        }
-        let mh = if min_hold.is_finite() {
-            format!("min-hold {min_hold:.2} px")
-        } else {
-            "min-hold —".into()
-        };
-        ui.label(egui::RichText::new(mh).small().color(egui::Color32::LIGHT_GREEN));
-    });
+            let mh = if min_hold.is_finite() {
+                format!("min-hold {min_hold:.2} px")
+            } else {
+                "min-hold —".into()
+            };
+            ui.label(
+                egui::RichText::new(mh)
+                    .small()
+                    .color(egui::Color32::LIGHT_GREEN),
+            );
+        });
 }
 
 /// Draws a profile with candidate-line markers and the selected fit. Returns
@@ -855,13 +961,20 @@ fn profile_plot(
     let ymax = profile.iter().cloned().fold(f32::MIN, f32::max) as f64;
     let span = (ymax - ymin).max(1.0);
     let mut clicked = None;
-    let mut plot = Plot::new(id).height(height).allow_scroll(false).show_axes([false, true]);
+    let mut plot = Plot::new(id)
+        .height(height)
+        .allow_scroll(false)
+        .show_axes([false, true]);
     if !labels.is_empty() {
         // Reserve headroom above the profile so the labels aren't clipped.
         plot = plot.include_y(ymin).include_y(ymax + 0.34 * span);
     }
     plot.show(ui, |p| {
-        let pts: PlotPoints = profile.iter().enumerate().map(|(x, &y)| [x as f64, y as f64]).collect();
+        let pts: PlotPoints = profile
+            .iter()
+            .enumerate()
+            .map(|(x, &y)| [x as f64, y as f64])
+            .collect();
         p.line(Line::new(pts).color(color).name("profile"));
         // Faint marker at each detected candidate line.
         for &c in &cands {
@@ -874,8 +987,11 @@ fn profile_plot(
             p.vline(VLine::new(*x).color(label_col));
             let ly = ymax + span * (0.06 + 0.13 * (k % 2) as f64);
             p.text(
-                Text::new(PlotPoint::new(*x, ly), egui::RichText::new(txt).size(11.0).color(label_col))
-                    .anchor(egui::Align2::CENTER_BOTTOM),
+                Text::new(
+                    PlotPoint::new(*x, ly),
+                    egui::RichText::new(txt).size(11.0).color(label_col),
+                )
+                .anchor(egui::Align2::CENTER_BOTTOM),
             );
         }
         if let Some(f) = fit {
@@ -887,7 +1003,10 @@ fn profile_plot(
                     .map(|i| {
                         let x = lo + (hi - lo) * i as f64 / 80.0;
                         let dx = x - f.center;
-                        [x, f.continuum - amp * (-dx * dx / (2.0 * f.sigma * f.sigma)).exp()]
+                        [
+                            x,
+                            f.continuum - amp * (-dx * dx / (2.0 * f.sigma * f.sigma)).exp(),
+                        ]
                     })
                     .collect();
                 p.line(Line::new(curve).name("fit"));
@@ -956,8 +1075,14 @@ fn worker(
                 // because averaging one axis cancels lines parallel to it.
                 let prof_x = frame.mean_profile(true); // dips = vertical lines
                 let prof_y = frame.mean_profile(false); // dips = horizontal lines
-                let lines_x: Vec<Fit> = fit_lines_1d(&prof_x, 0.02).into_iter().map(Fit::from).collect();
-                let lines_y: Vec<Fit> = fit_lines_1d(&prof_y, 0.02).into_iter().map(Fit::from).collect();
+                let lines_x: Vec<Fit> = fit_lines_1d(&prof_x, 0.02)
+                    .into_iter()
+                    .map(Fit::from)
+                    .collect();
+                let lines_y: Vec<Fit> = fit_lines_1d(&prof_y, 0.02)
+                    .into_iter()
+                    .map(Fit::from)
+                    .collect();
                 let mean = if prof_x.is_empty() {
                     0.0
                 } else {
@@ -1028,5 +1153,10 @@ impl Drop for FocusState {
 
 #[allow(dead_code)]
 pub fn full_roi(info: &CameraInfo) -> Roi {
-    Roi { x: 0, y: 0, w: info.max_width, h: info.max_height }
+    Roi {
+        x: 0,
+        y: 0,
+        w: info.max_width,
+        h: info.max_height,
+    }
 }

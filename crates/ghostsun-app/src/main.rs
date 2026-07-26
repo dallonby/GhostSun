@@ -1,6 +1,9 @@
 //! GhostSun desktop app: GPU-accelerated (via wgpu) solar reconstruction
 //! viewer and processor for macOS and Windows.
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 mod focus;
 mod gong;
@@ -28,7 +31,11 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-    eframe::run_native("GhostSun", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native(
+        "GhostSun",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
 }
 
 /// Generate a small native window/taskbar icon without a platform-specific
@@ -64,7 +71,11 @@ fn app_icon() -> egui::IconData {
         }
     }
 
-    egui::IconData { rgba, width: SIZE, height: SIZE }
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +96,12 @@ enum Job {
         source_ser: PathBuf,
     },
     Failed(String),
-    Colorized { rgb: Vec<u8>, w: usize, h: usize, seq: u64 },
+    Colorized {
+        rgb: Vec<u8>,
+        w: usize,
+        h: usize,
+        seq: u64,
+    },
     OrientationDone(Box<OrientationApplied>),
     OrientationFailed(String),
 }
@@ -183,18 +199,27 @@ impl App {
                 .push("processing is already in progress; wait before opening another file".into());
             return;
         }
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         match ext.as_str() {
             "ser" => {
                 self.selected_ser = Some(path.clone());
                 self.log.clear();
                 self.log.push(format!("selected {}", path.display()));
-                self.log.push("review the Pipeline settings, then click Process".into());
+                self.log
+                    .push("review the Pipeline settings, then click Process".into());
             }
             "fits" | "fit" => match output::read_fits_f32(&path) {
                 Ok(img) => {
                     self.selected_ser = None;
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
                     self.set_loaded(img, None, None, name, None);
                     self.log.push(format!("loaded {}", path.display()));
                 }
@@ -203,7 +228,11 @@ impl App {
             "png" => match output::read_png16(&path) {
                 Ok(img) => {
                     self.selected_ser = None;
-                    let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
                     self.set_loaded(img, None, None, name, None);
                 }
                 Err(e) => self.log.push(format!("PNG load failed: {e}")),
@@ -287,7 +316,8 @@ impl App {
             return;
         };
         let Some(prep) = &loaded.prep else {
-            self.log.push("cannot orient: solar disk geometry was not detected".into());
+            self.log
+                .push("cannot orient: solar disk geometry was not detected".into());
             return;
         };
         if self.orientation_running || loaded.orientation_note.is_some() {
@@ -318,7 +348,11 @@ impl App {
                 )?;
                 let _ = tx.send(Job::Log(format!(
                     "feature match: {}rotation {:+.1} deg, NCC {:.3}, pose margin {:.3}",
-                    if matched.mirrored { "horizontal mirror + " } else { "" },
+                    if matched.mirrored {
+                        "horizontal mirror + "
+                    } else {
+                        ""
+                    },
                     matched.rotation_deg,
                     matched.score,
                     matched.confidence_margin(),
@@ -453,7 +487,11 @@ impl App {
                         loaded.prep = applied.prep;
                         loaded.orientation_note = Some(format!(
                             "GONG: north up, east left · {}{:+.1}° · NCC {:.3}",
-                            if applied.matched.mirrored { "mirror + " } else { "" },
+                            if applied.matched.mirrored {
+                                "mirror + "
+                            } else {
+                                ""
+                            },
                             applied.matched.rotation_deg,
                             applied.matched.score,
                         ));
@@ -485,7 +523,10 @@ impl App {
         let color_image = match self.mode {
             ViewMode::Display => {
                 let img = if self.show_before_demix {
-                    loaded.before_demix.as_deref().unwrap_or(loaded.image.as_ref())
+                    loaded
+                        .before_demix
+                        .as_deref()
+                        .unwrap_or(loaded.image.as_ref())
                 } else {
                     loaded.image.as_ref()
                 };
@@ -529,26 +570,49 @@ fn gray_to_color(img: &Image, lo: f32, hi: f32) -> egui::ColorImage {
         let g = ((v - lo) * scale).clamp(0.0, 255.0) as u8;
         px.push(egui::Color32::from_gray(g));
     }
-    egui::ColorImage { size: [img.w, img.h], pixels: px }
+    egui::ColorImage {
+        size: [img.w, img.h],
+        pixels: px,
+    }
 }
 
 fn velocity_to_color(v: &Image) -> egui::ColorImage {
     // normalize over measured (nonzero) pixels only — the background is
     // masked to exactly zero and must not set the scale
-    let abs: Vec<f32> = v.data.iter().filter(|x| **x != 0.0).map(|x| x.abs()).collect();
-    let mag = if abs.is_empty() { 1.0 } else { percentile_f32(&abs, 98.0).max(1e-3) };
+    let abs: Vec<f32> = v
+        .data
+        .iter()
+        .filter(|x| **x != 0.0)
+        .map(|x| x.abs())
+        .collect();
+    let mag = if abs.is_empty() {
+        1.0
+    } else {
+        percentile_f32(&abs, 98.0).max(1e-3)
+    };
     let mut px = Vec::with_capacity(v.w * v.h);
     for &val in &v.data {
         let t = (val / mag).clamp(-1.0, 1.0);
         let (r, g, b) = if t < 0.0 {
             let a = -t;
-            ((255.0 * (1.0 - a)) as u8, (255.0 * (1.0 - a * 0.6)) as u8, 255u8)
+            (
+                (255.0 * (1.0 - a)) as u8,
+                (255.0 * (1.0 - a * 0.6)) as u8,
+                255u8,
+            )
         } else {
-            (255u8, (255.0 * (1.0 - t * 0.6)) as u8, (255.0 * (1.0 - t)) as u8)
+            (
+                255u8,
+                (255.0 * (1.0 - t * 0.6)) as u8,
+                (255.0 * (1.0 - t)) as u8,
+            )
         };
         px.push(egui::Color32::from_rgb(r, g, b));
     }
-    egui::ColorImage { size: [v.w, v.h], pixels: px }
+    egui::ColorImage {
+        size: [v.w, v.h],
+        pixels: px,
+    }
 }
 
 fn style(ctx: &egui::Context) {
@@ -586,7 +650,11 @@ impl eframe::App for App {
         }
         // drag & drop
         let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
         });
         if let Some(p) = dropped.into_iter().next() {
             self.open_file(p);
@@ -600,75 +668,78 @@ impl eframe::App for App {
             self.kick_colorize(ctx);
         }
 
-        egui::TopBottomPanel::top("top").exact_height(48.0).show(ctx, |ui| {
-            ui.columns(2, |columns| {
-                columns[0].with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(6.0);
-                        ui.label(
-                            egui::RichText::new("☀ GhostSun")
-                                .size(22.0)
-                                .strong()
-                                .color(ACCENT),
-                        );
-                        ui.add_space(16.0);
-                        if ui.button("Open…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Solar data", &["ser", "fits", "fit", "png"])
-                                .pick_file()
-                            {
-                                self.open_file(path);
-                            }
-                        }
-                        if self.running {
-                            ui.add(egui::Spinner::new().color(ACCENT));
-                            ui.label(egui::RichText::new("processing…").italics());
-                        } else if self.orientation_running {
-                            ui.add(egui::Spinner::new().color(ACCENT));
+        egui::TopBottomPanel::top("top")
+            .exact_height(48.0)
+            .show(ctx, |ui| {
+                ui.columns(2, |columns| {
+                    columns[0].with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(6.0);
                             ui.label(
-                                egui::RichText::new("matching GONG features…").italics(),
+                                egui::RichText::new("☀ GhostSun")
+                                    .size(22.0)
+                                    .strong()
+                                    .color(ACCENT),
                             );
-                        }
-                    },
-                );
-                columns[1].with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(6.0);
-                        let has_vel =
-                            self.loaded.as_ref().map(|l| l.velocity.is_some()).unwrap_or(false);
-                        let mut mode = self.mode;
-                        ui.selectable_value(&mut mode, ViewMode::Display, "Grayscale");
-                        if has_vel {
-                            ui.selectable_value(&mut mode, ViewMode::Velocity, "Doppler");
-                        }
-                        ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
-                        ui.selectable_value(&mut mode, ViewMode::Mount, "Mount");
-                        ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
-                        if mode != self.mode {
-                            // leaving Focus: stop the camera stream
-                            if self.mode == ViewMode::Focus {
-                                self.focus.stop();
+                            ui.add_space(16.0);
+                            if ui.button("Open…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Solar data", &["ser", "fits", "fit", "png"])
+                                    .pick_file()
+                                {
+                                    self.open_file(path);
+                                }
                             }
-                            if self.mode == ViewMode::Mount {
-                                self.mount.leave_tab(&mut self.focus);
+                            if self.running {
+                                ui.add(egui::Spinner::new().color(ACCENT));
+                                ui.label(egui::RichText::new("processing…").italics());
+                            } else if self.orientation_running {
+                                ui.add(egui::Spinner::new().color(ACCENT));
+                                ui.label(egui::RichText::new("matching GONG features…").italics());
                             }
-                            // entering Focus: discover cameras once
-                            if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
-                                self.focus.refresh_cameras();
+                        },
+                    );
+                    columns[1].with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(6.0);
+                            let has_vel = self
+                                .loaded
+                                .as_ref()
+                                .map(|l| l.velocity.is_some())
+                                .unwrap_or(false);
+                            let mut mode = self.mode;
+                            ui.selectable_value(&mut mode, ViewMode::Display, "Grayscale");
+                            if has_vel {
+                                ui.selectable_value(&mut mode, ViewMode::Velocity, "Doppler");
                             }
-                            if mode == ViewMode::Mount {
-                                self.mount.enter_tab(&mut self.focus);
+                            ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
+                            ui.selectable_value(&mut mode, ViewMode::Mount, "Mount");
+                            ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
+                            if mode != self.mode {
+                                // leaving Focus: stop the camera stream
+                                if self.mode == ViewMode::Focus {
+                                    self.focus.stop();
+                                }
+                                if self.mode == ViewMode::Mount {
+                                    self.mount.leave_tab(&mut self.focus);
+                                }
+                                // entering Focus: discover cameras once
+                                if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
+                                    self.focus.refresh_cameras();
+                                }
+                                if mode == ViewMode::Mount {
+                                    self.mount.enter_tab(&mut self.focus);
+                                }
+                                self.mode = mode;
+                                self.texture = None;
+                                self.tex_mode = None;
                             }
-                            self.mode = mode;
-                            self.texture = None;
-                            self.tex_mode = None;
-                        }
-                    },
-                );
+                        },
+                    );
+                });
             });
-        });
 
         egui::SidePanel::left("side")
             .resizable(true)
@@ -681,7 +752,13 @@ impl eframe::App for App {
                 return;
             }
             if self.mode == ViewMode::Mount {
-                self.mount.controls_ui(ui, &mut self.focus);
+                // Side panel is short; site/setup controls must scroll.
+                egui::ScrollArea::vertical()
+                    .id_salt("mount_side_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.mount.controls_ui(ui, &mut self.focus);
+                    });
                 return;
             }
             ui.add_space(8.0);

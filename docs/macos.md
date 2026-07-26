@@ -33,9 +33,12 @@ hardware, then disconnect or close it so the serial port is free for GhostSun.
 
 **Slew to the Sun** requires a second explicit confirmation and requests solar
 tracking after the GoTo begins. Before confirming, securely fit a suitable
-solar filter, check the entire slew path, and synchronize the mount's time,
-location, home position, and alignment in the ZWO software. GhostSun does not
-change those mount settings automatically.
+solar filter and check the entire slew path. The mount rejects GoTo with error
+**e7** until time and site coordinates are set: use the **Observing site**
+panel (latitude/longitude, UTC offset, optional OpenStreetMap place search) and
+**Sync now**, or enable **Sync time & site on connect**. Site settings are
+saved under `~/.ghostsun/mount_site.json`. Mechanical home position and
+polar/alignment setup still require ASI Mount / the hand controller.
 
 Tagged releases are signed with GhostSun's Developer ID Application identity,
 submitted to Apple's notary service, and distributed with the notarization
@@ -70,8 +73,16 @@ The packaged app includes the ToupTek and ZWO camera SDKs in
 `Contents/Frameworks`, together with the `libusb` dependency required by ZWO.
 Each library is reduced to the package's target architecture and signed before
 the app itself. GhostSun can still use an explicitly selected development
-library by setting `GHOSTSUN_TOUPCAM_LIB` or `GHOSTSUN_ASI_LIB` to its full path
-before launching from a terminal.
+library by setting `GHOSTSUN_TOUPCAM_LIB`, `GHOSTSUN_ASI_LIB`, or
+`GHOSTSUN_QHY_LIB` to its full path before launching from a terminal.
+
+**QHYCCD** (including **QHY5III678M**) is supported via the official
+`libqhyccd` runtime. The packaging script bundles `libqhyccd.dylib` when it is
+present under `vendor/macos/camera-sdk/`; otherwise install the [QHYCCD SDK](
+https://www.qhyccd.com/download/) system-wide (`/usr/local/lib` or Homebrew) or
+point `GHOSTSUN_QHY_LIB` at the dylib. Focus / Mount auto-center list QHY
+cameras alongside ZWO and ToupTek when the library loads. On Windows the same
+backend loads `qhyccd.dll` with the correct `__stdcall` ABI (`extern "system"`).
 
 ## Build locally
 

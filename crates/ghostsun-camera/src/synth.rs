@@ -17,7 +17,11 @@ const SWEEP_FRAMES: u64 = 240; // one focus in-and-out cycle
 /// Exposed so tests can assert the estimator recovers exactly this.
 pub fn swept_sigma(frame: u64) -> f64 {
     let phase = (frame % SWEEP_FRAMES) as f64 / SWEEP_FRAMES as f64;
-    let tri = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
+    let tri = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        2.0 - phase * 2.0
+    };
     1.4 + tri * 4.0
 }
 
@@ -37,7 +41,12 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
     Ok(Box::new(SynthCam {
         info: info.clone(),
         frame: 0,
-        roi: Roi { x: 0, y: 0, w: W, h: H },
+        roi: Roi {
+            x: 0,
+            y: 0,
+            w: W,
+            h: H,
+        },
     }))
 }
 
@@ -111,7 +120,11 @@ impl Camera for SynthCam {
         }
 
         self.frame = self.frame.wrapping_add(1);
-        Ok(Frame { width: w, height: h, data })
+        Ok(Frame {
+            width: w,
+            height: h,
+            data,
+        })
     }
     fn stop(&mut self) {}
 }

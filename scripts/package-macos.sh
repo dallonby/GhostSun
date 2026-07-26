@@ -75,6 +75,7 @@ cp "$repo_root/docs/macos.md" "$stage/README-macOS.md"
 
 zwo_source="$vendor_camera_dir/libASICamera2.dylib"
 touptek_source="$vendor_camera_dir/libtoupcam.dylib"
+qhy_source="$vendor_camera_dir/libqhyccd.dylib"
 for sdk in "$zwo_source" "$touptek_source"; do
   if [[ ! -f "$sdk" ]]; then
     echo "Bundled camera SDK is missing: $sdk" >&2
@@ -86,6 +87,18 @@ done
 # dylibs are universal. ZWO also needs a matching libusb alongside it.
 lipo "$zwo_source" -thin "$expected_arch" -output "$frameworks/libASICamera2.dylib"
 lipo "$touptek_source" -thin "$expected_arch" -output "$frameworks/libtoupcam.dylib"
+
+# QHY is optional: ship when present in vendor/ (SDK licence may restrict redistrib).
+if [[ -f "$qhy_source" ]]; then
+  if lipo -archs "$qhy_source" | grep -q "$expected_arch"; then
+    lipo "$qhy_source" -thin "$expected_arch" -output "$frameworks/libqhyccd.dylib"
+  else
+    cp "$qhy_source" "$frameworks/libqhyccd.dylib"
+  fi
+  echo "Bundled optional QHYCCD SDK ($expected_arch)"
+else
+  echo "Note: libqhyccd.dylib not in vendor/macos/camera-sdk — QHY cameras need system SDK or GHOSTSUN_QHY_LIB"
+fi
 
 libusb_source="${MACOS_LIBUSB_DYLIB:-}"
 if [[ -z "$libusb_source" ]] && command -v brew >/dev/null 2>&1; then
@@ -108,6 +121,9 @@ chmod 755 "$frameworks"/*.dylib
 install_name_tool -id @rpath/libASICamera2.dylib "$frameworks/libASICamera2.dylib"
 install_name_tool -id @rpath/libtoupcam.dylib "$frameworks/libtoupcam.dylib"
 install_name_tool -id @rpath/libusb-1.0.0.dylib "$frameworks/libusb-1.0.0.dylib"
+if [[ -f "$frameworks/libqhyccd.dylib" ]]; then
+  install_name_tool -id @rpath/libqhyccd.dylib "$frameworks/libqhyccd.dylib" || true
+fi
 
 cp "$vendor_camera_dir/LICENSE-ZWO.txt" "$third_party_licenses/ZWO-ASI-SDK.txt"
 cp "$vendor_camera_dir/NOTICE-ToupTek.txt" "$third_party_licenses/ToupTek-ToupCam-SDK.txt"

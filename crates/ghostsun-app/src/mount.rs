@@ -21,6 +21,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(750);
 const SCAN_INTERVAL: Duration = Duration::from_secs(3);
 const IO_DEADLINE: Duration = Duration::from_millis(1200);
 
+/// Grid step for the expanding square spiral (matches the UI copy).
+const SPIRAL_STEP_DEG: f32 = 0.2;
+/// Worker nudges always use ZWO rate 7 (60× sidereal) — see `WorkerCommand::Nudge`.
+const NUDGE_SIDEREAL_MULT: f64 = 60.0;
+const SIDEREAL_DEG_PER_S: f64 = 15.0 / 3600.0;
+const SETTLE_AFTER_SLEW: Duration = Duration::from_secs(2);
+const SAMPLE_FRAMES: usize = 3;
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(8);
+const SLEW_TIMEOUT: Duration = Duration::from_secs(180);
+const AUTO_CENTER_TIMEOUT: Duration = Duration::from_secs(600);
+
 const RATES: [(&str, u8); 10] = [
     ("0.25x", 0),
     ("0.5x", 1),
@@ -89,11 +100,22 @@ enum WorkerCommand {
     GoHome,
     Park,
     Unpark,
+    /// `true` enables tracking (`:Te#`), `false` disables (`:Td#`).
+    SetTracking(bool),
+    /// Push host clock + observing site so GoTo is not rejected with e7.
+    SyncSiteTime {
+        latitude_deg: f64,
+        longitude_deg: f64,
+        utc_offset_hours: f64,
+    },
     Nudge {
         direction: Direction,
         duration_ms: u64,
     },
-    SlewSun { ra_hours: f64, dec_deg: f64 },
+    SlewSun {
+        ra_hours: f64,
+        dec_deg: f64,
+    },
     Shutdown,
 }
 
@@ -135,7 +157,62 @@ struct AutoCenterState {
     best: (i32, i32),
     best_signal: f32,
     duration_ms: u64,
+    overall_deadline: Instant,
     phase: AutoCenterPhase,
+}
+
+/// One grid step duration at the worker's fixed 60× nudge rate.
+fn spiral_nudge_duration_ms() -> u64 {
+    let deg_per_s = NUDGE_SIDEREAL_MULT * SIDEREAL_DEG_PER_S;
+    ((f64::from(SPIRAL_STEP_DEG) / deg_per_s) * 1000.0).round() as u64
+}
+
+/// Expanding square spiral in grid units (Chebyshev radius `max_r`).
+fn square_spiral(max_r: i32) -> Vec<(i32, i32)> {
+    let mut out = vec![(0, 0)];
+    for r in 1..=max_r {
+        // East edge south→north: (r, 1-r) .. (r, r)
+        for y in (1 - r)..=r {
+            out.push((r, y));
+        }
+        // North edge east→west: (r-1, r) .. (-r, r)
+        for k in 0..(2 * r) {
+            out.push((r - 1 - k, r));
+        }
+        // West edge north→south: (-r, r-1) .. (-r, -r)
+        for k in 0..(2 * r) {
+            out.push((-r, r - 1 - k));
+        }
+        // South edge west→east: (1-r, -r) .. (r, -r)
+        for x in (1 - r)..=r {
+            out.push((x, -r));
+        }
+    }
+    out
+}
+
+fn grid_step_direction(from: (i32, i32), to: (i32, i32)) -> Option<(Direction, (i32, i32))> {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    if dx != 0 {
+        let step = dx.signum();
+        let dir = if step > 0 {
+            Direction::East
+        } else {
+            Direction::West
+        };
+        Some((dir, (from.0 + step, from.1)))
+    } else if dy != 0 {
+        let step = dy.signum();
+        let dir = if step > 0 {
+            Direction::North
+        } else {
+            Direction::South
+        };
+        Some((dir, (from.0, from.1 + step)))
+    } else {
+        None
+    }
 }
 
 pub struct MountState {
@@ -154,6 +231,22 @@ pub struct MountState {
     auto_center: Option<AutoCenterState>,
     search_exposure_ms: u32,
     search_radius_deg: f32,
+    /// East-positive degrees [-180, 180].
+    site_latitude_deg: f64,
+    /// East-positive degrees [-180, 180].
+    site_longitude_deg: f64,
+    /// Local − UTC in hours (e.g. BST = +1, PST = −8).
+    site_utc_offset_hours: f64,
+    site_place: String,
+    site_search: String,
+    site_search_hits: Vec<(String, f64, f64)>,
+    site_search_inflight: bool,
+    /// Background Nominatim results (never block / panic the UI thread).
+    place_search_rx: Receiver<Result<Vec<(String, f64, f64)>, String>>,
+    place_search_tx: Sender<Result<Vec<(String, f64, f64)>, String>>,
+    auto_sync_site_on_connect: bool,
+    /// Modal when connected without a saved observing site (GoTo needs it).
+    site_prompt_open: bool,
     status: String,
     last_scan: Instant,
     last_poll: Instant,
@@ -167,6 +260,7 @@ impl Default for MountState {
     fn default() -> Self {
         let (command_tx, command_rx) = channel();
         let (message_tx, message_rx) = channel();
+        let (place_tx, place_rx) = channel();
         let worker = thread::Builder::new()
             .name("ghostsun-mount".into())
             .spawn(move || worker_loop(command_rx, message_tx))
@@ -188,6 +282,17 @@ impl Default for MountState {
             auto_center: None,
             search_exposure_ms: 250,
             search_radius_deg: 0.6,
+            site_latitude_deg: 0.0,
+            site_longitude_deg: 0.0,
+            site_utc_offset_hours: system_utc_offset_hours(),
+            site_place: String::new(),
+            site_search: String::new(),
+            site_search_hits: Vec::new(),
+            site_search_inflight: false,
+            place_search_rx: place_rx,
+            place_search_tx: place_tx,
+            auto_sync_site_on_connect: true,
+            site_prompt_open: false,
             status: "Not connected".into(),
             last_scan: Instant::now() - SCAN_INTERVAL,
             last_poll: Instant::now(),
@@ -196,6 +301,7 @@ impl Default for MountState {
             rx: message_rx,
             worker: Some(worker),
         };
+        state.load_site_settings();
         state.refresh_ports();
         state
     }
@@ -234,6 +340,138 @@ impl MountState {
         }
     }
 
+    fn site_config_path() -> PathBuf {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".ghostsun")
+                .join("mount_site.json");
+        }
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata)
+                .join("GhostSun")
+                .join("mount_site.json");
+        }
+        PathBuf::from("ghostsun_mount_site.json")
+    }
+
+    fn load_site_settings(&mut self) {
+        let path = Self::site_config_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        for part in raw.split(&['{', '}', ',', '\n'][..]) {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("\"lat\":") {
+                if let Ok(x) = v.trim().parse() {
+                    self.site_latitude_deg = x;
+                }
+            } else if let Some(v) = part.strip_prefix("\"lon\":") {
+                if let Ok(x) = v.trim().parse() {
+                    self.site_longitude_deg = x;
+                }
+            } else if let Some(v) = part.strip_prefix("\"utc_offset_hours\":") {
+                if let Ok(x) = v.trim().parse() {
+                    self.site_utc_offset_hours = x;
+                }
+            } else if let Some(v) = part.strip_prefix("\"auto_sync\":") {
+                self.auto_sync_site_on_connect = v.trim() == "true";
+            } else if let Some(v) = part.strip_prefix("\"place\":") {
+                let v = v.trim().trim_matches('"');
+                self.site_place = v.to_owned();
+            }
+        }
+    }
+
+    fn save_site_settings(&self) {
+        let path = Self::site_config_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let place = self.site_place.replace('\\', "\\\\").replace('"', "\\\"");
+        let body = format!(
+            "{{\n  \"lat\": {:.6},\n  \"lon\": {:.6},\n  \"utc_offset_hours\": {:.4},\n  \"auto_sync\": {},\n  \"place\": \"{place}\"\n}}\n",
+            self.site_latitude_deg,
+            self.site_longitude_deg,
+            self.site_utc_offset_hours,
+            self.auto_sync_site_on_connect,
+        );
+        let _ = std::fs::write(path, body);
+    }
+
+    fn site_is_configured(&self) -> bool {
+        // Treat "never set" as both exactly 0 with empty place — valid Gulf of
+        // Guinea sites must set a place name or non-zero coords intentionally.
+        !(self.site_latitude_deg == 0.0
+            && self.site_longitude_deg == 0.0
+            && self.site_place.trim().is_empty())
+    }
+
+    fn request_site_time_sync(&mut self) {
+        self.save_site_settings();
+        match self.tx.send(WorkerCommand::SyncSiteTime {
+            latitude_deg: self.site_latitude_deg.clamp(-90.0, 90.0),
+            longitude_deg: self.site_longitude_deg.clamp(-180.0, 180.0),
+            utc_offset_hours: self.site_utc_offset_hours.clamp(-14.0, 14.0),
+        }) {
+            Ok(()) => {
+                self.status = "Syncing mount time and site coordinates...".into();
+            }
+            Err(_) => self.status = "Mount worker is not running".into(),
+        }
+    }
+
+    fn run_place_search(&mut self) {
+        let query = self.site_search.trim().to_owned();
+        if query.is_empty() {
+            self.status = "Enter a place name to search".into();
+            return;
+        }
+        if self.site_search_inflight {
+            self.status = "Place search already running…".into();
+            return;
+        }
+        self.site_search_inflight = true;
+        self.site_search_hits.clear();
+        self.status = format!("Searching for “{query}”…");
+        let tx = self.place_search_tx.clone();
+        let _ = thread::Builder::new()
+            .name("ghostsun-place-search".into())
+            .spawn(move || {
+                // Isolate panics (e.g. misconfigured TLS) from the UI process.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nominatim_search(&query)
+                }));
+                let payload = match result {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        Err("place search panicked (TLS/network). Enter lat/lon manually.".into())
+                    }
+                };
+                let _ = tx.send(payload);
+            });
+    }
+
+    fn drain_place_search(&mut self) {
+        while let Ok(result) = self.place_search_rx.try_recv() {
+            self.site_search_inflight = false;
+            match result {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        self.status = "No places found".into();
+                        self.site_search_hits.clear();
+                    } else {
+                        self.status = format!("Found {} place(s) — pick one", hits.len());
+                        self.site_search_hits = hits;
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("Place search failed: {error}");
+                    self.site_search_hits.clear();
+                }
+            }
+        }
+    }
+
     pub fn enter_tab(&mut self, focus: &mut focus::FocusState) {
         self.refresh_ports();
         if focus.cameras.is_empty() {
@@ -251,6 +489,7 @@ impl MountState {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context, focus: &mut focus::FocusState) {
+        self.drain_place_search();
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 WorkerMessage::Connected { port, model } => {
@@ -260,6 +499,17 @@ impl MountState {
                     self.model = Some(model.clone());
                     self.status = format!("Connected to {model} on {port}");
                     self.last_poll = Instant::now() - POLL_INTERVAL;
+                    if self.site_is_configured() {
+                        if self.auto_sync_site_on_connect {
+                            self.request_site_time_sync();
+                        }
+                        self.site_prompt_open = false;
+                    } else {
+                        self.site_prompt_open = true;
+                        self.status = format!(
+                            "Connected to {model} on {port} — set observing site (required for GoTo)"
+                        );
+                    }
                 }
                 WorkerMessage::Disconnected(reason) => {
                     self.cancel_auto_center(focus, "Sun auto-center stopped: mount disconnected");
@@ -295,14 +545,238 @@ impl MountState {
                 self.last_poll = Instant::now();
             }
         }
+        if self.connected && !self.site_is_configured() {
+            self.site_prompt_open = true;
+        }
+        self.show_site_prompt_modal(ctx);
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 
-    pub fn controls_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        focus: &mut focus::FocusState,
-    ) {
+    fn show_site_prompt_modal(&mut self, ctx: &egui::Context) {
+        if !self.site_prompt_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Observing site required")
+            .id(egui::Id::new("mount_site_prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The mount rejects GoTo (error e7) until time and location are set. Enter coordinates or search a place, then Save.",
+                    )
+                    .strong()
+                    .color(egui::Color32::from_rgb(255, 190, 100)),
+                );
+                ui.add_space(8.0);
+                self.site_editor_ui(ui, /*compact*/ true);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.site_is_configured(),
+                            egui::Button::new(
+                                egui::RichText::new("Save & continue")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM),
+                        )
+                        .clicked()
+                    {
+                        if self.site_place.trim().is_empty() {
+                            self.site_place = format!(
+                                "{:.4},{:.4}",
+                                self.site_latitude_deg, self.site_longitude_deg
+                            );
+                        }
+                        self.save_site_settings();
+                        self.site_prompt_open = false;
+                        if self.connected {
+                            self.request_site_time_sync();
+                        } else {
+                            self.status = "Observing site saved".into();
+                        }
+                    }
+                    if ui.button("Later").clicked() {
+                        self.site_prompt_open = false;
+                        self.status =
+                            "Site not set — GoTo will fail with e7 until you save a location"
+                                .into();
+                    }
+                });
+            });
+        if !open {
+            self.site_prompt_open = false;
+        }
+    }
+
+    /// Shared lat/lon / search / sync controls for side panel and modal.
+    fn site_editor_ui(&mut self, ui: &mut egui::Ui, compact: bool) {
+        if !compact {
+            ui.label(
+                egui::RichText::new(
+                    "GoTo fails with e7 until the mount has time + coordinates. GhostSun can push your system clock and this site on connect.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        if ui
+            .checkbox(
+                &mut self.auto_sync_site_on_connect,
+                "Sync time & site on connect",
+            )
+            .changed()
+        {
+            self.save_site_settings();
+        }
+        ui.horizontal(|ui| {
+            ui.label("lat °");
+            ui.add(
+                egui::DragValue::new(&mut self.site_latitude_deg)
+                    .speed(0.01)
+                    .range(-90.0..=90.0)
+                    .fixed_decimals(5),
+            );
+            ui.label("lon °E");
+            ui.add(
+                egui::DragValue::new(&mut self.site_longitude_deg)
+                    .speed(0.01)
+                    .range(-180.0..=180.0)
+                    .fixed_decimals(5),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("UTC offset h");
+            ui.add(
+                egui::DragValue::new(&mut self.site_utc_offset_hours)
+                    .speed(0.25)
+                    .range(-14.0..=14.0)
+                    .fixed_decimals(2),
+            );
+            if ui.button("From system").clicked() {
+                self.site_utc_offset_hours = system_utc_offset_hours();
+                self.status = format!(
+                    "UTC offset set from system: {:+.2} h",
+                    self.site_utc_offset_hours
+                );
+            }
+        });
+        if !self.site_place.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("Place: {}", self.site_place))
+                    .small()
+                    .weak(),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.site_search)
+                    .hint_text("City or place name…")
+                    .desired_width(if compact { 200.0 } else { 140.0 }),
+            );
+            let search_label = if self.site_search_inflight {
+                "Searching…"
+            } else {
+                "Search"
+            };
+            if ui
+                .add_enabled(!self.site_search_inflight, egui::Button::new(search_label))
+                .clicked()
+            {
+                self.run_place_search();
+            }
+        });
+        if !self.site_search_hits.is_empty() {
+            egui::ScrollArea::vertical()
+                .id_salt(if compact {
+                    "site_hits_modal"
+                } else {
+                    "site_hits_side"
+                })
+                .max_height(if compact { 140.0 } else { 100.0 })
+                .show(ui, |ui| {
+                    let hits = self.site_search_hits.clone();
+                    for (name, lat, lon) in hits {
+                        if ui
+                            .selectable_label(false, &name)
+                            .on_hover_text(format!("{lat:.5}, {lon:.5}"))
+                            .clicked()
+                        {
+                            self.site_latitude_deg = lat;
+                            self.site_longitude_deg = lon;
+                            self.site_place = name;
+                            self.site_search_hits.clear();
+                            self.save_site_settings();
+                            self.status = format!(
+                                "Site set to {} ({:.4}°, {:.4}°E)",
+                                self.site_place, self.site_latitude_deg, self.site_longitude_deg
+                            );
+                        }
+                    }
+                });
+        }
+        if !compact {
+            ui.horizontal(|ui| {
+                if ui.button("Save site").clicked() {
+                    if self.site_place.trim().is_empty() {
+                        self.site_place = format!(
+                            "{:.4},{:.4}",
+                            self.site_latitude_deg, self.site_longitude_deg
+                        );
+                    }
+                    self.save_site_settings();
+                    self.site_prompt_open = false;
+                    self.status = "Observing site saved".into();
+                }
+                if ui
+                    .add_enabled(self.connected, egui::Button::new("Sync now"))
+                    .on_hover_text(
+                        "Push system time + this site to the mount (:SC/:SL/:SG/:St/:Sg)",
+                    )
+                    .clicked()
+                {
+                    if !self.site_is_configured() {
+                        self.site_prompt_open = true;
+                        self.status =
+                            "Set latitude/longitude (or search a place) before syncing".into();
+                    } else {
+                        self.request_site_time_sync();
+                    }
+                }
+                if ui
+                    .button("Map…")
+                    .on_hover_text("Open this site in OpenStreetMap (browser)")
+                    .clicked()
+                {
+                    let url = format!(
+                        "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=10/{lat}/{lon}",
+                        lat = self.site_latitude_deg,
+                        lon = self.site_longitude_deg
+                    );
+                    self.status = match webbrowser::open(&url) {
+                        Ok(()) => "Opened OpenStreetMap in browser".into(),
+                        Err(error) => format!("Could not open map: {error}"),
+                    };
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Home position / mechanical alignment still need ASI Mount or a hand controller.",
+                )
+                .small()
+                .color(egui::Color32::from_rgb(255, 190, 100)),
+            );
+        }
+    }
+
+    pub fn controls_ui(&mut self, ui: &mut egui::Ui, focus: &mut focus::FocusState) {
         ui.add_space(8.0);
         ui.heading("Mount connection");
         ui.label(
@@ -407,6 +881,44 @@ impl MountState {
         });
 
         ui.add_space(12.0);
+        ui.heading("Mount status");
+        if let Some(model) = &self.model {
+            ui.label(format!("Model: {model}"));
+        }
+        if let Some(port) = &self.connected_port {
+            ui.label(format!("Port: {port}"));
+        }
+        if let Some(flags) = &self.snapshot.flags {
+            ui.label(format!("Flags: {flags}"));
+        }
+        ui.separator();
+        ui.add(egui::Label::new(egui::RichText::new(&self.status).small()).wrap());
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.heading("Observing site");
+            if !self.site_is_configured() {
+                ui.label(
+                    egui::RichText::new("required")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 160, 80)),
+                );
+            }
+        });
+        if !self.site_is_configured() {
+            ui.label(
+                egui::RichText::new("No site saved — search a place or enter lat/lon.")
+                    .small()
+                    .color(egui::Color32::from_rgb(255, 190, 100)),
+            );
+            if ui.button("Set site now…").clicked() {
+                self.site_prompt_open = true;
+            }
+        }
+        self.site_editor_ui(ui, /*compact*/ false);
+
+        ui.add_space(12.0);
         ui.heading("Auto-center camera");
         ui.horizontal(|ui| {
             if ui.button("Scan cameras").clicked() {
@@ -461,53 +973,25 @@ impl MountState {
             .weak(),
         );
 
-        ui.add_space(12.0);
-        ui.heading("Jog rate");
-        let old_rate = self.rate_index;
-        egui::ComboBox::from_id_salt("mount_rate")
-            .selected_text(RATES[self.rate_index].0)
-            .show_ui(ui, |ui| {
-                for (index, (label, _)) in RATES.iter().enumerate() {
-                    ui.selectable_value(&mut self.rate_index, index, *label);
-                }
-            });
-        if self.rate_index != old_rate && self.connected {
-            self.stop_motion();
-            let _ = self
-                .tx
-                .send(WorkerCommand::SetRate(RATES[self.rate_index].1));
-        }
-        ui.label(
-            egui::RichText::new("Rate changes stop any active jog first.")
-                .small()
-                .weak(),
-        );
-
-        ui.add_space(12.0);
-        ui.heading("Mount status");
-        if let Some(model) = &self.model {
-            ui.label(format!("Model: {model}"));
-        }
-        if let Some(port) = &self.connected_port {
-            ui.label(format!("Port: {port}"));
-        }
-        if let Some(flags) = &self.snapshot.flags {
-            ui.label(format!("Flags: {flags}"));
-        }
-        ui.separator();
-        ui.add(egui::Label::new(egui::RichText::new(&self.status).small()).wrap());
-
-        ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new(
-                "Before Sun GoTo, set the mount's time, location, home position, and alignment in ASI Mount.",
-            )
-            .small()
-            .color(egui::Color32::from_rgb(255, 190, 100)),
-        );
+        ui.add_space(16.0);
     }
 
     pub fn view_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        focus: &mut focus::FocusState,
+    ) {
+        // Central panel has no outer scroll — pack controls tightly and scroll
+        // so Home / Park / Track / Sun GoTo never fall off the bottom.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.view_ui_inner(ui, ctx, focus);
+            });
+    }
+
+    fn view_ui_inner(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
@@ -518,14 +1002,41 @@ impl MountState {
             ui.heading(egui::RichText::new("Mount control").size(26.0));
             ui.label(
                 egui::RichText::new(if self.connected {
-                    "Connected - hold a direction to jog; release to stop"
+                    if self.site_is_configured() {
+                        "Connected - hold a direction to jog; release to stop"
+                    } else {
+                        "Connected — set observing site before GoTo (prompt open or left panel)"
+                    }
                 } else {
-                    "Connect to the ZWO mount in the left panel"
+                    "Connect to the ZWO mount in the left panel to enable controls"
                 })
                 .weak(),
             );
         });
 
+        // Entire mount control surface is inert until Connect succeeds.
+        let enabled = self.connected;
+        ui.add_enabled_ui(enabled, |ui| {
+            self.view_ui_connected(ui, ctx, focus);
+        });
+        if !enabled {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("Mount controls locked until connected")
+                        .size(16.0)
+                        .weak(),
+                );
+            });
+        }
+    }
+
+    fn view_ui_connected(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        focus: &mut focus::FocusState,
+    ) {
         ui.add_space(16.0);
         ui.horizontal_wrapped(|ui| {
             status_card(
@@ -559,134 +1070,320 @@ impl MountState {
 
         ui.add_space(20.0);
         let enabled = self.connected;
+        let jog_enabled = enabled && self.auto_center.is_none();
         let mut held = None;
-        ui.vertical_centered(|ui| {
-            let north = ui.add_enabled(
-                enabled,
-                egui::Button::new(egui::RichText::new("N").size(20.0).strong())
-                    .min_size(egui::vec2(86.0, 52.0)),
-            );
-            if north.is_pointer_button_down_on() {
-                held = Some(Direction::North);
-            }
-            ui.horizontal_centered(|ui| {
-                let west = ui.add_enabled(
-                    enabled,
-                    egui::Button::new(egui::RichText::new("W").size(20.0).strong())
-                        .min_size(egui::vec2(86.0, 52.0)),
-                );
-                if west.is_pointer_button_down_on() {
-                    held = Some(Direction::West);
-                }
 
-                let stop = egui::Button::new(
-                    egui::RichText::new("STOP")
-                        .size(18.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(egui::Color32::from_rgb(160, 35, 25))
-                .min_size(egui::vec2(112.0, 58.0));
-                if ui.add(stop).clicked() {
-                    self.stop_motion();
-                    held = None;
-                }
+        // D-pad geometry: N/S share the same horizontal centre as STOP.
+        // Zero egui item_spacing so only our `gap` separates W–STOP–E.
+        {
+            let btn = egui::vec2(86.0, 52.0);
+            let stop_sz = egui::vec2(112.0, 58.0);
+            let gap = 8.0_f32;
+            let mid_w = btn.x + gap + stop_sz.x + gap + btn.x;
+            let mid_h = btn.y.max(stop_sz.y);
+            // STOP starts after W + gap; its centre is the N/S alignment axis.
+            let stop_left = btn.x + gap;
+            let ns_left = stop_left + stop_sz.x * 0.5 - btn.x * 0.5;
+            let pad_h = btn.y + gap + mid_h + gap + btn.y;
 
-                let east = ui.add_enabled(
-                    enabled,
-                    egui::Button::new(egui::RichText::new("E").size(20.0).strong())
-                        .min_size(egui::vec2(86.0, 52.0)),
+            ui.horizontal(|ui| {
+                let indent = ((ui.available_width() - mid_w) * 0.5).max(0.0);
+                ui.add_space(indent);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(mid_w, pad_h),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.spacing_mut().item_spacing.y = 0.0;
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.add_space(ns_left);
+                            let north = ui.add_enabled(
+                                jog_enabled,
+                                egui::Button::new(egui::RichText::new("N").size(20.0).strong())
+                                    .min_size(btn),
+                            );
+                            if north.is_pointer_button_down_on() {
+                                held = Some(Direction::North);
+                            }
+                        });
+                        ui.add_space(gap);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let west = ui.add_enabled(
+                                jog_enabled,
+                                egui::Button::new(egui::RichText::new("W").size(20.0).strong())
+                                    .min_size(btn),
+                            );
+                            if west.is_pointer_button_down_on() {
+                                held = Some(Direction::West);
+                            }
+                            ui.add_space(gap);
+                            let stop = egui::Button::new(
+                                egui::RichText::new("STOP")
+                                    .size(18.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(160, 35, 25))
+                            .min_size(stop_sz);
+                            if ui.add(stop).clicked() {
+                                self.cancel_auto_center(focus, "Sun auto-center stopped");
+                                self.stop_motion();
+                                held = None;
+                            }
+                            ui.add_space(gap);
+                            let east = ui.add_enabled(
+                                jog_enabled,
+                                egui::Button::new(egui::RichText::new("E").size(20.0).strong())
+                                    .min_size(btn),
+                            );
+                            if east.is_pointer_button_down_on() {
+                                held = Some(Direction::East);
+                            }
+                        });
+                        ui.add_space(gap);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.add_space(ns_left);
+                            let south = ui.add_enabled(
+                                jog_enabled,
+                                egui::Button::new(egui::RichText::new("S").size(20.0).strong())
+                                    .min_size(btn),
+                            );
+                            if south.is_pointer_button_down_on() {
+                                held = Some(Direction::South);
+                            }
+                        });
+                    },
                 );
-                if east.is_pointer_button_down_on() {
-                    held = Some(Direction::East);
-                }
             });
-            let south = ui.add_enabled(
-                enabled,
-                egui::Button::new(egui::RichText::new("S").size(20.0).strong())
-                    .min_size(egui::vec2(86.0, 52.0)),
-            );
-            if south.is_pointer_button_down_on() {
-                held = Some(Direction::South);
-            }
-            ui.label(
-                egui::RichText::new(format!("Selected jog rate: {}", RATES[self.rate_index].0))
-                    .small()
-                    .weak(),
-            );
-        });
+
+            // Jog rate lives in the main window (not the left rail).
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Jog rate").strong());
+                    let old_rate = self.rate_index;
+                    egui::ComboBox::from_id_salt("mount_rate_main")
+                        .selected_text(RATES[self.rate_index].0)
+                        .width(100.0)
+                        .show_ui(ui, |ui| {
+                            for (index, (label, _)) in RATES.iter().enumerate() {
+                                ui.selectable_value(&mut self.rate_index, index, *label);
+                            }
+                        });
+                    if self.rate_index != old_rate && self.connected {
+                        self.stop_motion();
+                        let _ = self
+                            .tx
+                            .send(WorkerCommand::SetRate(RATES[self.rate_index].1));
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Rate changes stop any active jog first.")
+                        .small()
+                        .weak(),
+                );
+            });
+        }
         self.update_held_direction(held);
 
-        ui.add_space(10.0);
+        ui.add_space(14.0);
+        let tracking_on = self.snapshot.tracking.as_deref() == Some("On");
+        let equatorial = self
+            .snapshot
+            .flags
+            .as_ref()
+            .map(|flags| !flags.contains('Z'))
+            .unwrap_or(true);
+        let actions_ok = enabled && self.auto_center.is_none();
+
+        // Always-clickable buttons with explicit status feedback. A fixed-height
+        // allocate_ui previously clipped hit targets; disabled buttons gave no
+        // feedback when the mount was only *detected* (not Connected).
         ui.vertical_centered(|ui| {
-            ui.horizontal_centered(|ui| {
+            ui.horizontal(|ui| {
+                let btn = |label: &str| {
+                    egui::Button::new(egui::RichText::new(label).size(15.0).strong())
+                        .min_size(egui::vec2(100.0, 40.0))
+                };
+
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Go Home"))
+                    .add(btn("Home"))
+                    .on_hover_text("Go to mechanical home (asks for confirmation)")
                     .clicked()
                 {
-                    self.confirm_sun = false;
-                    self.confirm_motion = Some(ConfirmedMotion::GoHome);
+                    if !enabled {
+                        self.status = "Connect the mount before using Home".into();
+                    } else if self.auto_center.is_some() {
+                        self.status = "Cancel auto-center before using Home".into();
+                    } else {
+                        self.confirm_sun = false;
+                        self.confirm_auto_center = false;
+                        self.confirm_motion = Some(ConfirmedMotion::GoHome);
+                        self.status = "Home: confirm the movement in the panel below".into();
+                    }
                 }
-                let equatorial = self
-                    .snapshot
-                    .flags
-                    .as_ref()
-                    .map(|flags| !flags.contains('Z'))
-                    .unwrap_or(true);
+
+                ui.add_space(8.0);
                 if ui
-                    .add_enabled(enabled && equatorial, egui::Button::new("Park"))
+                    .add(btn("Park"))
+                    .on_hover_text("Park (equatorial mode; asks for confirmation)")
                     .clicked()
                 {
-                    self.confirm_sun = false;
-                    self.confirm_motion = Some(ConfirmedMotion::Park);
+                    if !enabled {
+                        self.status = "Connect the mount before using Park".into();
+                    } else if self.auto_center.is_some() {
+                        self.status = "Cancel auto-center before using Park".into();
+                    } else if !equatorial {
+                        self.status =
+                            "Park is only available in equatorial mode (not alt-az)".into();
+                    } else {
+                        self.confirm_sun = false;
+                        self.confirm_auto_center = false;
+                        self.confirm_motion = Some(ConfirmedMotion::Park);
+                        self.status = "Park: confirm the movement in the panel below".into();
+                    }
+                }
+
+                ui.add_space(8.0);
+                if ui
+                    .add(btn("Unpark"))
+                    .on_hover_text("Unpark the mount")
+                    .clicked()
+                {
+                    if !enabled {
+                        self.status = "Connect the mount before using Unpark".into();
+                    } else if self.auto_center.is_some() {
+                        self.status = "Cancel auto-center before using Unpark".into();
+                    } else {
+                        self.stop_motion();
+                        match self.tx.send(WorkerCommand::Unpark) {
+                            Ok(()) => self.status = "Requesting unpark...".into(),
+                            Err(_) => self.status = "Mount worker is not running".into(),
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                let track_label = if tracking_on {
+                    "Track: On"
+                } else {
+                    "Track: Off"
+                };
+                let mut track = btn(track_label);
+                if tracking_on {
+                    track = track.fill(ACCENT_DIM);
                 }
                 if ui
-                    .add_enabled(enabled, egui::Button::new("Unpark"))
+                    .add(track)
+                    .on_hover_text(if tracking_on {
+                        "Stop tracking (:Td#)"
+                    } else {
+                        "Start tracking (:Te#)"
+                    })
                     .clicked()
                 {
-                    self.stop_motion();
-                    let _ = self.tx.send(WorkerCommand::Unpark);
-                    self.status = "Requesting unpark...".into();
+                    if !actions_ok {
+                        self.status = if !enabled {
+                            "Connect the mount before using Track".into()
+                        } else {
+                            "Cancel auto-center before using Track".into()
+                        };
+                    } else {
+                        let enable = !tracking_on;
+                        match self.tx.send(WorkerCommand::SetTracking(enable)) {
+                            Ok(()) => {
+                                self.status = if enable {
+                                    "Enabling tracking...".into()
+                                } else {
+                                    "Disabling tracking...".into()
+                                };
+                                self.last_poll = Instant::now() - POLL_INTERVAL;
+                            }
+                            Err(_) => self.status = "Mount worker is not running".into(),
+                        }
+                    }
                 }
             });
 
-            if let Some(action) = self.confirm_motion {
-                let (title, detail, command) = match action {
-                    ConfirmedMotion::GoHome => (
-                        "Confirm Go Home",
-                        "The mount will move both axes to its mechanical home position.",
-                        WorkerCommand::GoHome,
-                    ),
-                    ConfirmedMotion::Park => (
-                        "Confirm Park",
-                        "The mount will move to its configured park position (equatorial mode only).",
-                        WorkerCommand::Park,
-                    ),
-                };
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(egui::Color32::from_rgb(220, 200, 160)),
+            );
+        });
+
+        if let Some(action) = self.confirm_motion {
+            let (title, detail, command) = match action {
+                ConfirmedMotion::GoHome => (
+                    "Confirm Home",
+                    "The mount will move both axes to its mechanical home position.",
+                    WorkerCommand::GoHome,
+                ),
+                ConfirmedMotion::Park => (
+                    "Confirm Park",
+                    "The mount will move to its configured park position (equatorial mode only).",
+                    WorkerCommand::Park,
+                ),
+            };
+            ui.add_space(12.0);
+            ui.vertical_centered(|ui| {
                 egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(42, 28, 20))
+                    .fill(egui::Color32::from_rgb(70, 32, 18))
+                    .stroke(egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgb(255, 160, 80),
+                    ))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(detail).strong());
+                        ui.set_min_width(380.0);
+                        ui.set_max_width(480.0);
+                        ui.label(
+                            egui::RichText::new(detail)
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 210, 160)),
+                        );
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
+                            let confirm = egui::Button::new(
+                                egui::RichText::new(title)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM)
+                            .min_size(egui::vec2(140.0, 36.0));
+                            if ui.add(confirm).clicked() {
+                                if !self.connected {
+                                    self.status = "Connect the mount before confirming".into();
+                                    self.confirm_motion = None;
+                                } else {
+                                    self.stop_motion();
+                                    match self.tx.send(command) {
+                                        Ok(()) => {
+                                            self.status = format!("{title} sent to mount...");
+                                            self.confirm_motion = None;
+                                            self.last_poll = Instant::now() - POLL_INTERVAL;
+                                        }
+                                        Err(_) => {
+                                            self.status = "Mount worker is not running".into();
+                                        }
+                                    }
+                                }
+                            }
                             if ui
-                                .add_enabled(
-                                    enabled,
-                                    egui::Button::new(title).fill(ACCENT_DIM),
-                                )
+                                .add(egui::Button::new("Cancel").min_size(egui::vec2(90.0, 36.0)))
                                 .clicked()
                             {
-                                self.stop_motion();
-                                let _ = self.tx.send(command);
-                                self.status = format!("{title} sent...");
                                 self.confirm_motion = None;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.confirm_motion = None;
+                                self.status = "Home/Park cancelled".into();
                             }
                         });
                     });
-            }
-        });
+            });
+        }
 
         ui.add_space(18.0);
         ui.separator();
@@ -740,7 +1437,7 @@ impl MountState {
                     });
             } else if ui
                 .add_enabled(
-                    enabled,
+                    enabled && self.auto_center.is_none(),
                     egui::Button::new(
                         egui::RichText::new("Prepare Sun GoTo")
                             .strong()
@@ -750,7 +1447,69 @@ impl MountState {
                 )
                 .clicked()
             {
+                self.confirm_auto_center = false;
                 self.confirm_sun = true;
+            }
+
+            ui.add_space(16.0);
+            ui.heading("Camera-assisted Sun center");
+            ui.label(
+                egui::RichText::new(
+                    "Slews to the Sun, then walks a 0.2° square spiral at 60×, sampling camera brightness at each point and returning to the strongest signal.",
+                )
+                .small()
+                .weak(),
+            );
+            if let Some(progress) = self.auto_center_progress_label() {
+                ui.label(
+                    egui::RichText::new(progress)
+                        .strong()
+                        .color(ACCENT),
+                );
+                if ui.button("Cancel auto-center").clicked() {
+                    self.cancel_auto_center(focus, "Sun auto-center cancelled");
+                }
+            } else if self.confirm_auto_center {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(50, 25, 16))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "DANGER: Confirm only with a solar filter fitted, a clear slew path, and mount time/location/alignment set. The mount will move.",
+                            )
+                            .strong()
+                            .color(egui::Color32::from_rgb(255, 170, 80)),
+                        );
+                        ui.horizontal(|ui| {
+                            let confirm = egui::Button::new(
+                                egui::RichText::new("Confirm Sun auto-center")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM);
+                            if ui.add_enabled(enabled, confirm).clicked() {
+                                self.confirm_auto_center = false;
+                                self.begin_auto_center(ctx, focus);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.confirm_auto_center = false;
+                            }
+                        });
+                    });
+            } else if ui
+                .add_enabled(
+                    enabled && self.auto_center.is_none(),
+                    egui::Button::new(
+                        egui::RichText::new("Prepare Sun auto-center")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT_DIM),
+                )
+                .clicked()
+            {
+                self.confirm_sun = false;
+                self.confirm_auto_center = true;
             }
         });
     }
@@ -774,6 +1533,345 @@ impl MountState {
     fn stop_motion(&mut self) {
         let _ = self.tx.send(WorkerCommand::Stop);
         self.active_direction = None;
+    }
+
+    fn auto_center_progress_label(&self) -> Option<String> {
+        let state = self.auto_center.as_ref()?;
+        let n = state.points.len().max(1);
+        let i = state.point_index.min(n - 1) + 1;
+        let phase = match &state.phase {
+            AutoCenterPhase::AwaitingSlew { .. } => "waiting for slew".into(),
+            AutoCenterPhase::Settling { .. } => "settling after slew".into(),
+            AutoCenterPhase::Sampling { samples, .. } => {
+                format!(
+                    "sampling point {i}/{n} ({}/{})",
+                    samples.len(),
+                    SAMPLE_FRAMES
+                )
+            }
+            AutoCenterPhase::Moving { target, .. } => {
+                format!("nudging to ({}, {}) — point {i}/{n}", target.0, target.1)
+            }
+            AutoCenterPhase::ReturnReady => "returning to best signal".into(),
+            AutoCenterPhase::Finished => "finishing".into(),
+        };
+        Some(format!(
+            "Auto-center: {phase} · best {:.4} at ({}, {})",
+            state.best_signal, state.best.0, state.best.1
+        ))
+    }
+
+    fn begin_auto_center(&mut self, ctx: &egui::Context, focus: &mut focus::FocusState) {
+        if self.auto_center.is_some() {
+            return;
+        }
+        if !self.connected {
+            self.status = "Connect the mount before Sun auto-center".into();
+            return;
+        }
+        let exposure_us = self.search_exposure_ms.saturating_mul(1000);
+        let restore = match focus.prepare_sun_search(ctx, exposure_us) {
+            Ok(restore) => restore,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+
+        let max_r = (self.search_radius_deg / SPIRAL_STEP_DEG)
+            .round()
+            .clamp(1.0, 6.0) as i32;
+        let points = square_spiral(max_r);
+        let duration_ms = spiral_nudge_duration_ms().max(100);
+        let sun = sun_equatorial_now();
+
+        self.stop_motion();
+        self.confirm_sun = false;
+        self.confirm_motion = None;
+        let _ = self.tx.send(WorkerCommand::SlewSun {
+            ra_hours: sun.ra_hours,
+            dec_deg: sun.dec_deg,
+        });
+
+        self.auto_center = Some(AutoCenterState {
+            restore,
+            points,
+            point_index: 0,
+            current: (0, 0),
+            best: (0, 0),
+            best_signal: f32::NEG_INFINITY,
+            duration_ms,
+            overall_deadline: Instant::now() + AUTO_CENTER_TIMEOUT,
+            phase: AutoCenterPhase::AwaitingSlew {
+                started: Instant::now(),
+                saw_motion: false,
+            },
+        });
+        self.status = format!(
+            "Sun auto-center started (radius {max_r}×{SPIRAL_STEP_DEG}°, nudge {} ms @ 60×)",
+            duration_ms
+        );
+    }
+
+    fn cancel_auto_center(&mut self, focus: &mut focus::FocusState, reason: &str) {
+        let Some(state) = self.auto_center.take() else {
+            return;
+        };
+        self.stop_motion();
+        focus.restore_after_sun_search(state.restore);
+        self.confirm_auto_center = false;
+        self.status = reason.into();
+    }
+
+    fn auto_center_nudge_done(&mut self) {
+        let Some(state) = self.auto_center.as_mut() else {
+            return;
+        };
+        let AutoCenterPhase::Moving { target, .. } = state.phase else {
+            return;
+        };
+        let target = target;
+        if state.current == target {
+            // Arrival handled in advance_auto_center (needs focus for sampling).
+            state.phase = AutoCenterPhase::Moving {
+                target,
+                sample_index: Some(state.point_index),
+            };
+        } else if let Some((direction, next)) = grid_step_direction(state.current, target) {
+            let duration_ms = state.duration_ms;
+            state.current = next;
+            let _ = self.tx.send(WorkerCommand::Nudge {
+                direction,
+                duration_ms,
+            });
+        } else {
+            state.phase = AutoCenterPhase::Moving {
+                target,
+                sample_index: Some(state.point_index),
+            };
+        }
+    }
+
+    fn advance_auto_center(&mut self, focus: &mut focus::FocusState) {
+        if self.auto_center.is_none() {
+            return;
+        }
+        if self
+            .auto_center
+            .as_ref()
+            .is_some_and(|s| Instant::now() >= s.overall_deadline)
+        {
+            self.cancel_auto_center(focus, "Sun auto-center timed out (10 min limit)");
+            return;
+        }
+
+        enum Next {
+            Idle,
+            BeginSample,
+            FinishSuccess,
+            Cancel(&'static str),
+            StartMove { target: (i32, i32) },
+        }
+
+        let next = {
+            let state = self.auto_center.as_mut().expect("checked");
+            match &mut state.phase {
+                AutoCenterPhase::AwaitingSlew {
+                    started,
+                    saw_motion,
+                } => {
+                    if self.snapshot.slewing == Some(true) {
+                        *saw_motion = true;
+                    }
+                    if *saw_motion && self.snapshot.slewing == Some(false) {
+                        state.phase = AutoCenterPhase::Settling {
+                            until: Instant::now() + SETTLE_AFTER_SLEW,
+                        };
+                        self.status = "Sun auto-center: slew complete, settling…".into();
+                        Next::Idle
+                    } else if started.elapsed() >= SLEW_TIMEOUT {
+                        Next::Cancel("Sun auto-center: slew timed out")
+                    } else if !*saw_motion
+                        && started.elapsed() >= Duration::from_secs(12)
+                        && self.snapshot.slewing != Some(true)
+                    {
+                        // Some firmwares never report the slewing flag; don't hang forever.
+                        state.phase = AutoCenterPhase::Settling {
+                            until: Instant::now() + SETTLE_AFTER_SLEW,
+                        };
+                        self.status =
+                            "Sun auto-center: no slew flag seen; settling and sampling…".into();
+                        Next::Idle
+                    } else {
+                        Next::Idle
+                    }
+                }
+                AutoCenterPhase::Settling { until } => {
+                    if Instant::now() >= *until {
+                        Next::BeginSample
+                    } else {
+                        Next::Idle
+                    }
+                }
+                AutoCenterPhase::Sampling {
+                    last_seq,
+                    samples,
+                    deadline,
+                } => {
+                    if let Some((seq, mean)) = focus.sun_signal_sample() {
+                        if seq > *last_seq {
+                            *last_seq = seq;
+                            samples.push(mean);
+                        }
+                    }
+                    if samples.len() >= SAMPLE_FRAMES {
+                        let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+                        let at = state
+                            .points
+                            .get(state.point_index)
+                            .copied()
+                            .unwrap_or(state.current);
+                        if mean > state.best_signal {
+                            state.best_signal = mean;
+                            state.best = at;
+                        }
+                        self.status = format!(
+                            "Sun auto-center: point {}/{} signal {:.4} (best {:.4} @ {:?})",
+                            state.point_index + 1,
+                            state.points.len(),
+                            mean,
+                            state.best_signal,
+                            state.best
+                        );
+                        state.point_index += 1;
+                        if state.point_index >= state.points.len() {
+                            state.phase = AutoCenterPhase::ReturnReady;
+                            Next::Idle
+                        } else {
+                            let target = state.points[state.point_index];
+                            Next::StartMove { target }
+                        }
+                    } else if Instant::now() >= *deadline {
+                        if samples.is_empty() {
+                            Next::Cancel("Sun auto-center: no camera frames while sampling")
+                        } else {
+                            // Partial average is better than abort mid-spiral.
+                            let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+                            let at = state
+                                .points
+                                .get(state.point_index)
+                                .copied()
+                                .unwrap_or(state.current);
+                            if mean > state.best_signal {
+                                state.best_signal = mean;
+                                state.best = at;
+                            }
+                            state.point_index += 1;
+                            if state.point_index >= state.points.len() {
+                                state.phase = AutoCenterPhase::ReturnReady;
+                                Next::Idle
+                            } else {
+                                let target = state.points[state.point_index];
+                                Next::StartMove { target }
+                            }
+                        }
+                    } else {
+                        Next::Idle
+                    }
+                }
+                AutoCenterPhase::Moving {
+                    target,
+                    sample_index,
+                } => {
+                    if sample_index.is_some() || state.current == *target {
+                        Next::BeginSample
+                    } else {
+                        Next::Idle
+                    }
+                }
+                AutoCenterPhase::ReturnReady => {
+                    if state.current == state.best {
+                        state.phase = AutoCenterPhase::Finished;
+                        Next::FinishSuccess
+                    } else {
+                        let target = state.best;
+                        Next::StartMove { target }
+                    }
+                }
+                AutoCenterPhase::Finished => Next::FinishSuccess,
+            }
+        };
+
+        match next {
+            Next::Idle => {}
+            Next::Cancel(reason) => self.cancel_auto_center(focus, reason),
+            Next::FinishSuccess => {
+                let best = self
+                    .auto_center
+                    .as_ref()
+                    .map(|s| (s.best, s.best_signal))
+                    .unwrap_or(((0, 0), 0.0));
+                self.cancel_auto_center(
+                    focus,
+                    &format!(
+                        "Sun auto-center complete: best signal {:.4} at grid {:?}",
+                        best.1, best.0
+                    ),
+                );
+            }
+            Next::BeginSample => {
+                let seq = focus.sun_signal_sample().map(|(s, _)| s).unwrap_or(0);
+                if let Some(state) = self.auto_center.as_mut() {
+                    state.phase = AutoCenterPhase::Sampling {
+                        last_seq: seq,
+                        samples: Vec::new(),
+                        deadline: Instant::now() + SAMPLE_TIMEOUT,
+                    };
+                }
+            }
+            Next::StartMove { target } => {
+                if let Some(state) = self.auto_center.as_mut() {
+                    if state.current == target {
+                        let seq = focus.sun_signal_sample().map(|(s, _)| s).unwrap_or(0);
+                        state.phase = AutoCenterPhase::Sampling {
+                            last_seq: seq,
+                            samples: Vec::new(),
+                            deadline: Instant::now() + SAMPLE_TIMEOUT,
+                        };
+                    } else if let Some((direction, next_pos)) =
+                        grid_step_direction(state.current, target)
+                    {
+                        let duration_ms = state.duration_ms;
+                        state.current = next_pos;
+                        state.phase = AutoCenterPhase::Moving {
+                            target,
+                            sample_index: None,
+                        };
+                        let _ = self.tx.send(WorkerCommand::Nudge {
+                            direction,
+                            duration_ms,
+                        });
+                    } else {
+                        let seq = focus.sun_signal_sample().map(|(s, _)| s).unwrap_or(0);
+                        state.phase = AutoCenterPhase::Sampling {
+                            last_seq: seq,
+                            samples: Vec::new(),
+                            deadline: Instant::now() + SAMPLE_TIMEOUT,
+                        };
+                    }
+                }
+            }
+        }
+
+        // ReturnReady → StartMove sets Moving; if we just set ReturnReady and
+        // best != current, re-enter once so the first return nudge is issued
+        // without waiting another poll tick.
+        if matches!(
+            self.auto_center.as_ref().map(|s| &s.phase),
+            Some(AutoCenterPhase::ReturnReady)
+        ) {
+            self.advance_auto_center(focus);
+        }
     }
 }
 
@@ -1014,12 +2112,14 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                         }
                     });
                     let slewing = flags.as_ref().map(|value| !value.contains('N'));
-                    let park = query(opened, ":Gps#").ok().map(|value| match value.as_str() {
-                        "1" => "Parking".into(),
-                        "2" => "Parked".into(),
-                        "3" => "Park error".into(),
-                        _ => "Not parked".into(),
-                    });
+                    let park = query(opened, ":Gps#")
+                        .ok()
+                        .map(|value| match value.as_str() {
+                            "1" => "Parking".into(),
+                            "2" => "Parked".into(),
+                            "3" => "Park error".into(),
+                            _ => "Not parked".into(),
+                        });
                     let snapshot = MountSnapshot {
                         ra: query(opened, ":GR#").ok(),
                         dec: query(opened, ":GD#").ok(),
@@ -1100,8 +2200,43 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 if let Some(opened) = port.as_deref_mut() {
                     match expect_ack(opened, ":Spu#", "unpark") {
                         Ok(()) => {
-                            let _ =
-                                tx.send(WorkerMessage::Notice("Mount is unparked".into()));
+                            let _ = tx.send(WorkerMessage::Notice("Mount is unparked".into()));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(WorkerMessage::Error(error));
+                        }
+                    }
+                }
+            }
+            Ok(WorkerCommand::SetTracking(enable)) => {
+                if let Some(opened) = port.as_deref_mut() {
+                    // ZWO AM-series LX200 dialect: :Te# enable tracking, :Td# disable.
+                    // Rate is left as-is (jog rate / solar rate from Sun GoTo).
+                    let cmd = if enable { ":Te#" } else { ":Td#" };
+                    match blind(opened, cmd) {
+                        Ok(()) => {
+                            let _ = tx.send(WorkerMessage::Notice(if enable {
+                                "Tracking enabled".into()
+                            } else {
+                                "Tracking disabled".into()
+                            }));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(WorkerMessage::Error(error));
+                        }
+                    }
+                }
+            }
+            Ok(WorkerCommand::SyncSiteTime {
+                latitude_deg,
+                longitude_deg,
+                utc_offset_hours,
+            }) => {
+                if let Some(opened) = port.as_deref_mut() {
+                    match sync_site_and_time(opened, latitude_deg, longitude_deg, utc_offset_hours)
+                    {
+                        Ok(summary) => {
+                            let _ = tx.send(WorkerMessage::Notice(summary));
                         }
                         Err(error) => {
                             let _ = tx.send(WorkerMessage::Error(error));
@@ -1147,7 +2282,6 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::Shutdown) => {
-                timed_move_deadline = None;
                 if let Some(mut opened) = port.take() {
                     let _ = blind(&mut *opened, ":Q#");
                 }
@@ -1156,6 +2290,280 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+/// Local − UTC in hours from the OS clock (best-effort).
+fn system_utc_offset_hours() -> f64 {
+    #[cfg(windows)]
+    {
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[TimeZoneInfo]::Local.GetUtcOffset([DateTime]::UtcNow).TotalHours",
+            ])
+            .output();
+        if let Ok(out) = output {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    return v;
+                }
+            }
+        }
+        0.0
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("date").arg("+%z").output();
+        if let Ok(out) = output {
+            if let Ok(s) = String::from_utf8(out.stdout) {
+                let s = s.trim();
+                // ±HHMM
+                if s.len() >= 3 {
+                    if let (Ok(h), Ok(m)) = (s[..3].parse::<i32>(), s[3..].parse::<i32>()) {
+                        let sign = if h < 0 { -1.0 } else { 1.0 };
+                        return h as f64 + sign * (m.abs() as f64) / 60.0;
+                    }
+                }
+            }
+        }
+        0.0
+    }
+}
+
+fn format_lat_lx200(lat_deg: f64) -> String {
+    let sign = if lat_deg >= 0.0 { '+' } else { '-' };
+    let a = lat_deg.abs().min(90.0);
+    let mut d = a.floor() as i32;
+    let mut m = ((a - f64::from(d)) * 60.0).round() as i32;
+    if m >= 60 {
+        d += 1;
+        m = 0;
+    }
+    format!("{sign}{d:02}*{m:02}")
+}
+
+/// Meade/ZWO serial longitude is degrees **West** of Greenwich, 0–360.
+fn format_lon_lx200_west(east_positive_lon: f64) -> String {
+    let mut west = (-east_positive_lon).rem_euclid(360.0);
+    if west >= 360.0 {
+        west = 0.0;
+    }
+    let mut d = west.floor() as i32;
+    let mut m = ((west - f64::from(d)) * 60.0).round() as i32;
+    if m >= 60 {
+        d += 1;
+        m = 0;
+    }
+    if d >= 360 {
+        d = 0;
+    }
+    format!("{d:03}*{m:02}")
+}
+
+fn format_meade_utc_offset(local_minus_utc_hours: f64) -> String {
+    // Meade :SG is hours to *add* to local time to get UTC (= −(local−UTC)).
+    let hours_to_utc = -local_minus_utc_hours;
+    let sign = if hours_to_utc >= 0.0 { '+' } else { '-' };
+    let a = hours_to_utc.abs();
+    let h = a.floor() as i32;
+    let frac = a - f64::from(h);
+    if frac < 0.05 {
+        format!("{sign}{h:02}")
+    } else {
+        format!(
+            "{sign}{h:02}.{}",
+            ((frac * 10.0).round() as i32).clamp(0, 9)
+        )
+    }
+}
+
+fn host_local_date_time() -> Result<(String, String), String> {
+    // MM/DD/YY and HH:MM:SS in the machine's local timezone.
+    #[cfg(windows)]
+    {
+        let date = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Date -Format 'MM/dd/yy'"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let time = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Date -Format 'HH:mm:ss'"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let d = String::from_utf8_lossy(&date.stdout).trim().to_owned();
+        let t = String::from_utf8_lossy(&time.stdout).trim().to_owned();
+        if d.is_empty() || t.is_empty() {
+            return Err("could not read local date/time".into());
+        }
+        Ok((d, t))
+    }
+    #[cfg(not(windows))]
+    {
+        let date = Command::new("date")
+            .arg("+%m/%d/%y")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let time = Command::new("date")
+            .arg("+%H:%M:%S")
+            .output()
+            .map_err(|e| e.to_string())?;
+        let d = String::from_utf8_lossy(&date.stdout).trim().to_owned();
+        let t = String::from_utf8_lossy(&time.stdout).trim().to_owned();
+        if d.is_empty() || t.is_empty() {
+            return Err("could not read local date/time".into());
+        }
+        Ok((d, t))
+    }
+}
+
+fn sync_site_and_time(
+    port: &mut dyn SerialPort,
+    latitude_deg: f64,
+    longitude_deg: f64,
+    utc_offset_hours: f64,
+) -> Result<String, String> {
+    let (date, time) = host_local_date_time()?;
+    let lat = format_lat_lx200(latitude_deg);
+    let lon = format_lon_lx200_west(longitude_deg);
+    let sg = format_meade_utc_offset(utc_offset_hours);
+
+    // Order matches common LX200/AM setup: date, local time, UTC offset, lat, lon.
+    expect_ack(port, &format!(":SC{date}#"), "calendar date")?;
+    expect_ack(port, &format!(":SL{time}#"), "local time")?;
+    expect_ack(port, &format!(":SG{sg}#"), "UTC offset")?;
+    expect_ack(port, &format!(":St{lat}#"), "latitude")?;
+    expect_ack(port, &format!(":Sg{lon}#"), "longitude")?;
+
+    let gt = query(port, ":Gt#").unwrap_or_else(|_| "?".into());
+    let gg = query(port, ":Gg#").unwrap_or_else(|_| "?".into());
+    let gl = query(port, ":GL#").unwrap_or_else(|_| "?".into());
+    Ok(format!(
+        "Site/time synced (local {date} {time}, UTC{sg}, lat {lat}, lonW {lon}). Mount reports Gt={gt} Gg={gg} GL={gl}"
+    ))
+}
+
+/// Same TLS stack as GONG: this crate enables `ureq/native-tls` only. Bare
+/// `ureq::get` defaults to Rustls and **panics** with
+/// `uri scheme is https, provider is Rustls but feature is not enabled`.
+fn native_tls_agent() -> ureq::Agent {
+    use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+    let config = ureq::config::Config::builder()
+        .tls_config(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build();
+    config.new_agent()
+}
+
+/// OpenStreetMap Nominatim place search (no Google key required).
+fn nominatim_search(query: &str) -> Result<Vec<(String, f64, f64)>, String> {
+    let url = format!(
+        "https://nominatim.openstreetmap.org/search?format=json&limit=6&q={}",
+        urlencoding_minimal(query)
+    );
+    let agent = native_tls_agent();
+    let mut response = agent
+        .get(&url)
+        .header(
+            "User-Agent",
+            "GhostSun/0.2 (solar spectroheliograph; mount site setup)",
+        )
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|e| format!("place search request failed: {e}"))?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("cannot read place search response: {e}"))?;
+    parse_nominatim_json(&body)
+}
+
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn parse_nominatim_json(body: &str) -> Result<Vec<(String, f64, f64)>, String> {
+    // Minimal JSON scrape — avoids a serde dependency for a tiny payload.
+    let mut hits = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find('{') {
+        rest = &rest[start..];
+        let Some(end) = rest.find('}') else {
+            break;
+        };
+        let obj = &rest[..=end];
+        rest = &rest[end + 1..];
+        let lat = json_string_field(obj, "lat").and_then(|s| s.parse().ok());
+        let lon = json_string_field(obj, "lon").and_then(|s| s.parse().ok());
+        let name = json_string_field(obj, "display_name");
+        if let (Some(lat), Some(lon), Some(name)) = (lat, lon, name) {
+            hits.push((truncate_chars(&name, 72), lat, lon));
+        }
+        if hits.len() >= 6 {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+fn json_string_field(obj: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{key}\":\"");
+    let start = obj.find(&pattern)? + pattern.len();
+    let bytes = obj.as_bytes();
+    let mut out = String::new();
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'"' {
+            return Some(out);
+        }
+        if c == b'\\' && i + 1 < bytes.len() {
+            // Keep escapes simple; Nominatim names rarely need full JSON decode.
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            continue;
+        }
+        // Decode UTF-8 sequences so multi-byte place names stay valid.
+        let width = match c {
+            0x00..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        if i + width <= bytes.len() {
+            if let Ok(s) = std::str::from_utf8(&bytes[i..i + width]) {
+                out.push_str(s);
+                i += width;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut it = s.chars();
+    let head: String = it.by_ref().take(max_chars).collect();
+    if it.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 
@@ -1204,7 +2612,9 @@ fn goto_error(response: &str) -> String {
         Some(4) => "mount is already moving",
         Some(5) => "Sun is below the horizon",
         Some(6) => "Sun is below the configured altitude limit",
-        Some(7) => "mount time and location have not been synchronized",
+        Some(7) => {
+            "mount time and location have not been synchronized — use Observing site → Sync now"
+        }
         Some(8) => "mount has passed its tracking meridian limit",
         Some(9) => "sync target and mount are on opposite sides of the meridian",
         Some(10) => "alt-azimuth altitude would reverse",
@@ -1369,5 +2779,88 @@ mod tests {
         assert_eq!(RATES.last(), Some(&("1440x", 9)));
         assert!(goto_error("e5").contains("below the horizon"));
         assert!(goto_error("e7").contains("time and location"));
+    }
+
+    #[test]
+    fn square_spiral_covers_chebyshev_disk_once() {
+        let pts = square_spiral(2);
+        assert_eq!(pts[0], (0, 0));
+        assert_eq!(pts.len(), 25); // (2*2+1)^2
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &pts {
+            assert!(p.0.abs().max(p.1.abs()) <= 2);
+            assert!(seen.insert(*p), "duplicate {p:?}");
+        }
+        assert_eq!(seen.len(), 25);
+    }
+
+    #[test]
+    fn spiral_nudge_duration_matches_0_2_deg_at_60x() {
+        // 60× × 15″/s = 0.25 °/s → 0.2° takes 800 ms.
+        assert_eq!(spiral_nudge_duration_ms(), 800);
+    }
+
+    #[test]
+    fn grid_step_prefers_east_west_then_north_south() {
+        let (dir, next) = grid_step_direction((0, 0), (2, 1)).unwrap();
+        assert_eq!(dir, Direction::East);
+        assert_eq!(next, (1, 0));
+        let (dir, next) = grid_step_direction((1, 0), (1, -2)).unwrap();
+        assert_eq!(dir, Direction::South);
+        assert_eq!(next, (1, -1));
+        assert!(grid_step_direction((1, 1), (1, 1)).is_none());
+    }
+
+    #[test]
+    fn lx200_site_formats_match_meade_style() {
+        assert_eq!(format_lat_lx200(51.5), "+51*30");
+        assert_eq!(format_lat_lx200(-33.9), "-33*54");
+        // 2.3°E → 357.7°W
+        assert_eq!(format_lon_lx200_west(2.3), "357*42");
+        // 98°W stored as −98 east-positive → 98°W
+        assert_eq!(format_lon_lx200_west(-98.0), "098*00");
+        // Local = UTC−5 → Meade SG = +05 (add to local to get UTC)
+        assert_eq!(format_meade_utc_offset(-5.0), "+05");
+        assert_eq!(format_meade_utc_offset(1.0), "-01");
+    }
+
+    #[test]
+    fn live_nominatim_blackpool_does_not_panic() {
+        let result = std::panic::catch_unwind(|| nominatim_search("Blackpool"));
+        assert!(
+            result.is_ok(),
+            "nominatim_search panicked (TLS agent misconfigured?)"
+        );
+        let result = result.unwrap();
+        assert!(
+            result.is_ok(),
+            "nominatim error: {:?}",
+            result.as_ref().err()
+        );
+        let hits = result.unwrap();
+        assert!(
+            hits.iter()
+                .any(|(n, _, _)| n.to_lowercase().contains("blackpool")),
+            "unexpected hits: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn nominatim_json_scrapes_display_name_and_coords() {
+        let body = r#"[{"lat":"51.5074","lon":"-0.1278","display_name":"London, UK"}]"#;
+        let hits = parse_nominatim_json(body).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].0.contains("London"));
+        assert!((hits[0].1 - 51.5074).abs() < 1e-6);
+        assert!((hits[0].2 + 0.1278).abs() < 1e-6);
+    }
+
+    #[test]
+    fn truncate_chars_is_utf8_safe() {
+        let s = format!("{}€{}", "a".repeat(70), "b".repeat(10));
+        let t = truncate_chars(&s, 72);
+        assert!(t.ends_with('…'));
+        assert!(t.is_char_boundary(t.len()));
+        assert!(std::panic::catch_unwind(|| truncate_chars(&s, 72)).is_ok());
     }
 }

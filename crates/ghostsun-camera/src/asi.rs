@@ -83,9 +83,9 @@ struct Api {
 }
 
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> crate::Result<T> {
-    let s: Symbol<T> = lib.get(name).map_err(|e| {
-        CameraError::Sdk(format!("missing {}: {e}", String::from_utf8_lossy(name)))
-    })?;
+    let s: Symbol<T> = lib
+        .get(name)
+        .map_err(|e| CameraError::Sdk(format!("missing {}: {e}", String::from_utf8_lossy(name))))?;
     Ok(*s)
 }
 
@@ -114,7 +114,9 @@ impl Api {
                 Err(e) => last = format!("{}: {e}", path.display()),
             }
         }
-        Err(CameraError::LibraryUnavailable(format!("{LIBNAME} not found ({last})")))
+        Err(CameraError::LibraryUnavailable(format!(
+            "{LIBNAME} not found ({last})"
+        )))
     }
 
     unsafe fn bind(lib: Library) -> crate::Result<Api> {
@@ -137,7 +139,11 @@ impl Api {
 }
 
 fn cstr_to_string(buf: &[c_char]) -> String {
-    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -240,7 +246,9 @@ impl Camera for AsiCam {
 
     fn current_exposure_us(&mut self) -> Option<u32> {
         let (mut v, mut auto): (c_long, c_int) = (0, 0);
-        if unsafe { (self.api.get_control)(self.id, ASI_EXPOSURE, &mut v, &mut auto) } == ASI_SUCCESS {
+        if unsafe { (self.api.get_control)(self.id, ASI_EXPOSURE, &mut v, &mut auto) }
+            == ASI_SUCCESS
+        {
             Some(v.max(0) as u32)
         } else {
             None
@@ -272,7 +280,8 @@ impl Camera for AsiCam {
         });
         let w = (roi.w & !7).max(8);
         let h = (roi.h & !1).max(2);
-        if unsafe { (self.api.set_roi)(self.id, w as c_int, h as c_int, 1, ASI_IMG_RAW16) } != ASI_SUCCESS
+        if unsafe { (self.api.set_roi)(self.id, w as c_int, h as c_int, 1, ASI_IMG_RAW16) }
+            != ASI_SUCCESS
         {
             return Err(CameraError::Sdk("ASISetROIFormat failed".into()));
         }
@@ -312,7 +321,11 @@ impl Camera for AsiCam {
         for (i, px) in data.iter_mut().enumerate() {
             *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
         }
-        Ok(Frame { width: w, height: h, data })
+        Ok(Frame {
+            width: w,
+            height: h,
+            data,
+        })
     }
 
     fn stop(&mut self) {

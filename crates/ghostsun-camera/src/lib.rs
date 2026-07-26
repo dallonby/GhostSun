@@ -1,7 +1,7 @@
 //! ghostsun-camera: live camera capture for the focus assistant.
 //!
-//! A single [`Camera`] trait abstracts over vendor SDKs (ToupTek, ZWO) and a
-//! synthetic source used to verify the focus pipeline offline against a known
+//! A single [`Camera`] trait abstracts over vendor SDKs (ToupTek, ZWO, QHY) and
+//! a synthetic source used to verify the focus pipeline offline against a known
 //! line width. Vendor SDKs are loaded at runtime with `libloading`, so the app
 //! launches and reconstructs files even when no SDK dylib or camera is present
 //! — a missing backend simply contributes no devices instead of failing.
@@ -12,9 +12,10 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 
+pub mod asi;
+pub mod qhy;
 pub mod synth;
 pub mod toupcam;
-pub mod asi;
 
 /// Which SDK a camera belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,6 +23,7 @@ pub enum Backend {
     Synth,
     Toupcam,
     Asi,
+    Qhy,
 }
 
 impl Backend {
@@ -30,6 +32,7 @@ impl Backend {
             Backend::Synth => "Synthetic",
             Backend::Toupcam => "ToupTek",
             Backend::Asi => "ZWO ASI",
+            Backend::Qhy => "QHYCCD",
         }
     }
 }
@@ -150,6 +153,7 @@ pub fn enumerate_all() -> Vec<CameraInfo> {
     v.extend(synth::enumerate());
     v.extend(toupcam::enumerate());
     v.extend(asi::enumerate());
+    v.extend(qhy::enumerate());
     v
 }
 
@@ -159,5 +163,6 @@ pub fn open(info: &CameraInfo) -> Result<Box<dyn Camera>> {
         Backend::Synth => synth::open(info),
         Backend::Toupcam => toupcam::open(info),
         Backend::Asi => asi::open(info),
+        Backend::Qhy => qhy::open(info),
     }
 }

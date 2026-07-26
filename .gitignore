@@ -6,3 +6,6 @@
 /inti-reference
 /bench_history.jsonl
 .DS_Store
+.casefile/
+/AGENTS.md
+.claude/skills/

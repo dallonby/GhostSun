@@ -44,10 +44,13 @@ the hardware, then disconnect or close it so the serial port is free for
 GhostSun.
 
 **Slew to the Sun** requires a separate confirmation and then requests solar
-tracking. Before confirming, securely fit a suitable solar filter, check the
-entire slew path, and use ASI Mount to synchronize the mount's time, location,
-home position, and alignment. GhostSun deliberately does not change those
-mount settings automatically.
+tracking. Before confirming, securely fit a suitable solar filter and check the
+entire slew path. The mount rejects GoTo with error **e7** until time and site
+coordinates are set: use the **Observing site** panel (latitude/longitude, UTC
+offset, optional OpenStreetMap place search) and **Sync now**, or enable
+**Sync time & site on connect**. Site settings are saved under
+`%APPDATA%\GhostSun\mount_site.json`. Mechanical home position and
+polar/alignment setup still require ASI Mount / the hand controller.
 
 ## ToupTek cameras
 
@@ -60,6 +63,16 @@ but detected no hardware.
 For another SDK location, set `GHOSTSUN_TOUPCAM_LIB` to the full path of the
 64-bit `toupcam.dll` before starting GhostSun. Do not point it at the x86 DLL.
 The standalone package does not redistribute the vendor SDK.
+
+## QHYCCD cameras
+
+QHY cameras (including **QHY5III678M**) use the official `qhyccd.dll` at
+runtime with the Windows `__stdcall` ABI. GhostSun looks beside
+`GhostSun.exe`, `GHOSTSUN_QHY_LIB`, and common
+`%ProgramFiles%\QHYCCD\SDK\` (and `x64`) install paths. Install the [QHYCCD
+SDK / drivers](https://www.qhyccd.com/download/), then **Refresh** cameras in
+Focus or Mount. The Windows package does not redistribute the QHY SDK unless
+you add `qhyccd.dll` next to the exe yourself under the vendor licence.
 
 ## Build on Windows
 

@@ -86,7 +86,8 @@ type FnEnumV2 = unsafe extern "C" fn(*mut DeviceV2) -> c_uint;
 type FnOpenByIndex = unsafe extern "C" fn(c_uint) -> HToupcam;
 type FnClose = unsafe extern "C" fn(HToupcam);
 type FnStartPull = unsafe extern "C" fn(HToupcam, Option<EventCb>, *mut c_void) -> c_int;
-type FnPullV3 = unsafe extern "C" fn(HToupcam, *mut c_void, c_int, c_int, c_int, *mut FrameInfoV3) -> c_int;
+type FnPullV3 =
+    unsafe extern "C" fn(HToupcam, *mut c_void, c_int, c_int, c_int, *mut FrameInfoV3) -> c_int;
 type FnStop = unsafe extern "C" fn(HToupcam) -> c_int;
 type FnPutOption = unsafe extern "C" fn(HToupcam, c_uint, c_int) -> c_int;
 type FnPutExpoTime = unsafe extern "C" fn(HToupcam, c_uint) -> c_int;
@@ -125,9 +126,9 @@ struct Api {
 }
 
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> crate::Result<T> {
-    let s: Symbol<T> = lib.get(name).map_err(|e| {
-        CameraError::Sdk(format!("missing {}: {e}", String::from_utf8_lossy(name)))
-    })?;
+    let s: Symbol<T> = lib
+        .get(name)
+        .map_err(|e| CameraError::Sdk(format!("missing {}: {e}", String::from_utf8_lossy(name))))?;
     Ok(*s)
 }
 
@@ -224,7 +225,11 @@ impl Api {
 
 #[cfg(not(target_os = "windows"))]
 fn toup_string(buf: &[ToupChar]) -> String {
-    let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    let bytes: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -262,7 +267,11 @@ pub fn enumerate() -> Vec<CameraInfo> {
         out.push(CameraInfo {
             backend: Backend::Toupcam,
             id: i.to_string(), // opened by enumeration index
-            name: if name.is_empty() { format!("ToupTek camera {i}") } else { name },
+            name: if name.is_empty() {
+                format!("ToupTek camera {i}")
+            } else {
+                name
+            },
             max_width: mw,
             max_height: mh,
             exposure_us: 100..=15_000_000,
@@ -406,7 +415,8 @@ impl Camera for ToupcamCam {
             let a = |v: usize| (v & !1) as c_uint;
             unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) };
         }
-        let hr = unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
+        let hr =
+            unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
         if hr < 0 {
             return Err(CameraError::Sdk("StartPullModeWithCallback failed".into()));
         }
@@ -418,7 +428,10 @@ impl Camera for ToupcamCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        match self.rx.recv_timeout(Duration::from_millis(timeout_ms as u64)) {
+        match self
+            .rx
+            .recv_timeout(Duration::from_millis(timeout_ms as u64))
+        {
             Ok(()) => {}
             Err(RecvTimeoutError::Timeout) => return Err(CameraError::Timeout),
             Err(RecvTimeoutError::Disconnected) => {
@@ -431,20 +444,33 @@ impl Camera for ToupcamCam {
         let mut fi = FrameInfoV3::default();
         let pitch = (self.width * 2) as c_int;
         let hr = unsafe {
-            (self.api.pull_v3)(self.h, self.buf.as_mut_ptr() as *mut c_void, 0, 16, pitch, &mut fi)
+            (self.api.pull_v3)(
+                self.h,
+                self.buf.as_mut_ptr() as *mut c_void,
+                0,
+                16,
+                pitch,
+                &mut fi,
+            )
         };
         if hr < 0 {
             return Err(CameraError::Sdk("PullImageV3 failed".into()));
         }
         let (w, h) = (fi.width as usize, fi.height as usize);
         if w == 0 || h == 0 || w * h * 2 > self.buf.len() {
-            return Err(CameraError::Sdk("PullImageV3 returned bad dimensions".into()));
+            return Err(CameraError::Sdk(
+                "PullImageV3 returned bad dimensions".into(),
+            ));
         }
         let mut data = vec![0u16; w * h];
         for (i, px) in data.iter_mut().enumerate() {
             *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
         }
-        Ok(Frame { width: w, height: h, data })
+        Ok(Frame {
+            width: w,
+            height: h,
+            data,
+        })
     }
 
     fn stop(&mut self) {

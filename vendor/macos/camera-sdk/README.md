@@ -7,10 +7,20 @@ GhostSun bundles these runtime-loaded camera SDK libraries in
 - `libtoupcam.dylib` — ToupTek ToupCam SDK 59.30701.20260128, universal
   `arm64` + `x86_64`.
 
+**Optional — QHYCCD:** place `libqhyccd.dylib` (from the [QHYCCD SDK](
+https://www.qhyccd.com/download/)) in this directory or install the SDK
+system-wide. Packaging copies it when present; otherwise the QHY backend is
+compiled in but reports no devices until the library is found at runtime via
+`GHOSTSUN_QHY_LIB`, `Contents/Frameworks/libqhyccd.dylib`, or
+`/usr/local/lib` / `/opt/homebrew/lib`. Verified target: **QHY5III678M**
+(mono live stream, 16-bit).
+
 The packaging script extracts only the release target's architecture. ZWO also
 requires a matching `libusb-1.0.0.dylib`, sourced from the build machine's
 Homebrew installation. All nested code is signed before the application.
 
 ZWO's SDK licence is in `LICENSE-ZWO.txt`. ToupTek redistribution permission
 was confirmed to the project owner on 2026-07-23 and is recorded in
-`NOTICE-ToupTek.txt`.
+`NOTICE-ToupTek.txt`. QHY SDK redistribution is governed by QHYCCD's own
+licence — do not commit proprietary QHY dylibs unless redistribution is
+explicitly allowed.
