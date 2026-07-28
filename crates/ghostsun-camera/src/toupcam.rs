@@ -143,6 +143,10 @@ fn candidate_paths() -> Vec<PathBuf> {
             v.push(dir.join("..").join("Frameworks").join(LIBNAME)); // macOS .app bundle
         }
     }
+    // The library the installer bundles, so development builds match releases.
+    if let Some(p) = crate::vendored_lib(LIBNAME) {
+        v.push(p);
+    }
     #[cfg(target_os = "windows")]
     {
         // Camera drivers commonly install the SDK DLL privately rather than
@@ -190,15 +194,18 @@ fn candidate_paths() -> Vec<PathBuf> {
 
 impl Api {
     fn load() -> crate::Result<Api> {
-        let mut last = String::new();
+        let mut tried = Vec::new();
         for path in candidate_paths() {
             match unsafe { Library::new(&path) } {
                 Ok(lib) => return unsafe { Api::bind(lib) },
-                Err(e) => last = format!("{}: {e}", path.display()),
+                Err(e) => tried.push(format!("{}: {e}", path.display())),
             }
         }
+        // Every candidate, not just the last: knowing which locations were
+        // consulted is the whole diagnostic value of this message.
         Err(CameraError::LibraryUnavailable(format!(
-            "{LIBNAME} not found ({last})"
+            "{LIBNAME} not found; tried:\n  {}",
+            tried.join("\n  ")
         )))
     }
 

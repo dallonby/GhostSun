@@ -24,3 +24,33 @@ was confirmed to the project owner on 2026-07-23 and is recorded in
 `NOTICE-ToupTek.txt`. QHY SDK redistribution is governed by QHYCCD's own
 licence — do not commit proprietary QHY dylibs unless redistribution is
 explicitly allowed.
+
+## Code signatures are load-bearing — do not commit a stripped dylib
+
+macOS refuses to load an unsigned arm64 library into a process, failing with
+`Trying to load an unsigned library`. These dylibs must therefore carry a valid
+signature **in the repository**, not merely after packaging.
+
+`lipo` silently drops code signatures. Both bundled dylibs were committed in
+that state for a while, which made them loadable only from a packaged,
+re-signed `.app`; a plain `cargo run` or `target/release/ghostsun-app`
+reported the library as missing — with the developer's own machine appearing to
+have no camera at all.
+
+Verify before committing:
+
+```sh
+codesign -dv vendor/macos/camera-sdk/libtoupcam.dylib
+```
+
+It must report `Signature=adhoc` (as shipped by the vendor) or a real identity —
+never `code object is not signed at all`. If a dylib has been thinned or
+recombined, re-sign it before committing:
+
+```sh
+codesign -s - -f vendor/macos/camera-sdk/libASICamera2.dylib
+```
+
+Prefer re-copying the vendor's pristine file over re-signing: ToupTek ships
+theirs already ad-hoc/linker-signed, so a straight copy keeps it byte-identical
+to the upstream release.

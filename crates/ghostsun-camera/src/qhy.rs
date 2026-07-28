@@ -129,6 +129,10 @@ fn candidate_paths() -> Vec<PathBuf> {
             v.push(dir.join("..").join("Frameworks").join(LIBNAME));
         }
     }
+    // The library the installer bundles, so development builds match releases.
+    if let Some(p) = crate::vendored_lib(LIBNAME) {
+        v.push(p);
+    }
     // Common install locations (QHYCCD SDK / KStars / Homebrew).
     #[cfg(target_os = "macos")]
     {
@@ -169,7 +173,7 @@ static SDK_INIT: Mutex<bool> = Mutex::new(false);
 
 impl Api {
     fn load() -> crate::Result<Api> {
-        let mut last = String::new();
+        let mut tried = Vec::new();
         for path in candidate_paths() {
             match unsafe { Library::new(&path) } {
                 Ok(lib) => {
@@ -177,11 +181,14 @@ impl Api {
                     api.ensure_resource()?;
                     return Ok(api);
                 }
-                Err(e) => last = format!("{}: {e}", path.display()),
+                Err(e) => tried.push(format!("{}: {e}", path.display())),
             }
         }
+        // Every candidate, not just the last: knowing which locations were
+        // consulted is the whole diagnostic value of this message.
         Err(CameraError::LibraryUnavailable(format!(
-            "{LIBNAME} not found ({last})"
+            "{LIBNAME} not found; tried:\n  {}",
+            tried.join("\n  ")
         )))
     }
 

@@ -17,6 +17,56 @@ pub mod qhy;
 pub mod synth;
 pub mod toupcam;
 
+/// Path to a runtime-loaded camera SDK library inside the checked-in `vendor/`
+/// tree, or `None` on platforms that ship none.
+///
+/// Vendored SDKs were previously reachable only *after* packaging, which copies
+/// them into `GhostSun.app/Contents/Frameworks`. A plain `cargo run` or
+/// `target/release/ghostsun-app` therefore depended on either
+/// `GHOSTSUN_*_LIB` being exported or a dylib hand-copied next to the binary —
+/// and the latter is silently destroyed by `cargo clean`, turning a working
+/// setup into "library not found" with no obvious cause. Offering the vendor
+/// tree as a candidate makes the development build use exactly the library the
+/// installer bundles.
+///
+/// The workspace path is baked in at compile time. On a machine that only has
+/// the packaged app it simply does not exist, and the earlier (bundle)
+/// candidates win, so this costs a failed `stat` and nothing else.
+pub(crate) fn vendored_lib(libname: &str) -> Option<std::path::PathBuf> {
+    // CARGO_MANIFEST_DIR is crates/ghostsun-camera; vendor/ sits at the root.
+    let vendor = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("vendor");
+
+    #[cfg(target_os = "macos")]
+    {
+        return Some(vendor.join("macos").join("camera-sdk").join(libname));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Vendored per-architecture: loading an x86 DLL into an x64 process
+        // fails, so the wrong one must never be offered.
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        return Some(
+            vendor
+                .join("windows")
+                .join("camera-sdk")
+                .join(arch)
+                .join(libname),
+        );
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (vendor, libname);
+        None
+    }
+}
+
 /// Which SDK a camera belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
