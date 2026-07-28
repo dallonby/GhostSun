@@ -6,8 +6,10 @@
 )]
 
 mod focus;
+mod focusmetrics;
 mod gong;
 mod mount;
+mod vcurve;
 
 use eframe::egui;
 use ghostsun_core::image2d::Image;
@@ -149,6 +151,9 @@ struct App {
     color_cache: Option<(Vec<u8>, usize, usize)>,
     opt_deconv: bool,
     opt_denoise: bool,
+    opt_multi_line_composite: bool,
+    /// Empty = AUTO multi-candidate track; otherwise spectral column seed.
+    opt_line_x_text: String,
     opt_motion_strength: f64,
     opt_column_demix_strength: f64,
     selected_ser: Option<std::path::PathBuf>,
@@ -183,6 +188,8 @@ impl App {
             color_cache: None,
             opt_deconv: false,
             opt_denoise: false,
+            opt_multi_line_composite: false,
+            opt_line_x_text: String::new(),
             opt_motion_strength: 1.0,
             opt_column_demix_strength: 1.0,
             selected_ser: None,
@@ -279,10 +286,18 @@ impl App {
         let mut tune = pipeline::TuneParams::default();
         tune.motion_strength = self.opt_motion_strength;
         tune.column_demix_strength = self.opt_column_demix_strength;
+        let line_center_x = self
+            .opt_line_x_text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite() && *x > 0.0);
         let opts = pipeline::ReconOptions {
             verbose: false,
             deconv: self.opt_deconv,
             denoise: self.opt_denoise,
+            multi_line_composite: self.opt_multi_line_composite,
+            line_center_x,
             tune,
             progress: Some(Arc::new(move |m: &str| {
                 let _ = tx_log.send(Job::Log(m.to_string()));
@@ -452,8 +467,17 @@ impl App {
                 }
                 Job::Done { report, source_ser } => {
                     self.running = false;
-                    self.log.push("done.".into());
                     let rep = *report;
+                    if let Some(n) = rep.composite_n_lines {
+                        self.log.push(format!(
+                            "multi-line composite: {n} line(s) at offsets {:?}",
+                            rep.composite_line_offsets_px
+                                .iter()
+                                .map(|o| format!("{o:+.1}"))
+                                .collect::<Vec<_>>()
+                        ));
+                    }
+                    self.log.push("done.".into());
                     self.set_loaded(
                         rep.output.image,
                         rep.velocity,
@@ -889,6 +913,29 @@ impl eframe::App for App {
             }
             ui.checkbox(&mut self.opt_deconv, "PSF deconvolution");
             ui.checkbox(&mut self.opt_denoise, "wavelet denoise");
+            ui.checkbox(
+                &mut self.opt_multi_line_composite,
+                "multi-line composite",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "full-sensor SERs: stack companion lines with primary\n\
+                     (shared registration; opt-in detail product)",
+                )
+                .small()
+                .weak(),
+            );
+            ui.label("line seed (spectral px, blank = auto)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.opt_line_x_text)
+                    .desired_width(120.0)
+                    .hint_text("auto"),
+            );
+            ui.label(
+                egui::RichText::new("override AUTO when multi-line pick is wrong")
+                    .small()
+                    .weak(),
+            );
             ui.label("motion registration strength");
             ui.add(
                 egui::Slider::new(&mut self.opt_motion_strength, 0.0..=1.5)

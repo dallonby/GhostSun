@@ -257,6 +257,10 @@ Packaged builds are available from the `Desktop builds` workflow or a tagged
 GitHub Release. See the [macOS](docs/macos.md) and
 [Windows](docs/windows.md) build and usage guides.
 
+The **Focus** tab measures spectrograph and telescope focus numerically rather
+than by eye — see [Focusing a spectroheliograph](docs/focusing.md) for the
+step-by-step procedure.
+
 ### Command line
 
 ```sh

@@ -3,17 +3,53 @@
 //! Each camera frame carries two perpendicular families of dark lines, which
 //! measure two different focus problems:
 //!   * **Spectral absorption lines** run along the slit (⊥ dispersion). Their
-//!     width is the *spectral* focus (camera-side wavelength resolution).
+//!     width is the *spectral* focus.
 //!   * **Slit jaw / dust / defect lines** run along the dispersion axis
-//!     (⊥ slit). Their width is the *spatial/slit* focus (telescope-on-slit +
-//!     spectrograph imaging), and they are essentially always present.
+//!     (⊥ slit). Their width is the *spatial* focus, and they are essentially
+//!     always present.
 //!
 //! Averaging the frame along one axis cancels the lines parallel to that axis
 //! and preserves the perpendicular family, so the two are measured cleanly and
 //! independently every frame with the *same* core line fitter the
-//! reconstruction uses. Both FWHMs are shown at once; a dispersion-axis toggle
-//! only decides which readout is labelled "spectral" vs "slit". Backend-agnostic
-//! via the `ghostsun_camera::Camera` trait (ToupTek / ZWO / synthetic).
+//! reconstruction uses. Backend-agnostic via the `ghostsun_camera::Camera`
+//! trait (ToupTek / ZWO / synthetic).
+//!
+//! # The three-stage procedure
+//!
+//! There are three focus unknowns — telescope, collimator, camera lens — and
+//! only the camera lens has an obvious reference, which on many builds cannot
+//! be reached because the lens and camera shoulder will not come off as a unit.
+//! The instinctive move is to optimise solar sharpness against all three, which
+//! is a shallow 3-D valley with no unique answer.
+//!
+//! It is not actually degenerate. Write out which observable responds to what:
+//!
+//! | observable                     | telescope | collimator | camera |
+//! |--------------------------------|-----------|------------|--------|
+//! | slit-jaw dust sharpness        | **no**    | yes        | yes    |
+//! | spectral line FWHM             | **no**    | yes        | yes    |
+//! | solar detail along the slit     | yes       | yes        | yes    |
+//!
+//! The system is *triangular*. Dust lies physically in the slit plane and the
+//! spectral line is the dispersed image of that same plane, so the first two
+//! rows carry no dependence on where the telescope's focal plane sits.
+//!
+//! **Stage A** (this module's [`Stage::Spectrograph`]) uses those two rows to
+//! pin collimator and camera with zero telescope contamination. They are only
+//! independent of *each other* because the grating is anamorphic — see
+//! [`crate::vcurve::Split`] — which is why a high-dispersion grating makes this
+//! solvable at all. Being telescope-blind, Stage A can be run at the bench with
+//! a neon lamp on the slit: no sun, no seeing, no cloud.
+//!
+//! **Stage B** ([`Stage::Telescope`]) then has exactly one unknown left, and
+//! uses row three. See [`crate::focusmetrics`] for why it is measured on
+//! continuum columns rather than the line core.
+//!
+//! Order is load-bearing. Focus the telescope against a mis-collimated
+//! spectrograph and it settles wherever best masks the *spatial* blur, while
+//! being unable to touch the astigmatism — the telescope has no leverage in the
+//! dispersion plane at all. The result is a soft compromise on both axes that
+//! feels like a trade-off because it is one.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,19 +58,30 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use eframe::egui;
-use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Text, VLine};
+use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
 
 use ghostsun_camera::{enumerate_all, open, Backend, CameraInfo, Roi};
 use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
 
+use crate::focusmetrics::{self, LuckyBuf, StructureSplit};
+use crate::vcurve::{self, NullPoint, ParabolaFit, VCurve};
+
 const STRIP_W: usize = 1200;
 const STRIP_H: usize = 280;
 const HISTORY: usize = 600;
 const DEPTH_GATE: f64 = 0.03;
+/// Frames averaged into one V-curve sample. At typical focus-tab frame rates
+/// this is a second or two — long enough to beat down seeing, short enough that
+/// nobody stops using it.
+const DEFAULT_CAPTURE_FRAMES: usize = 40;
+/// Rolling window for the live "lucky" Stage B readout.
+const LUCKY_WINDOW: usize = 90;
 
 const SPECTRAL_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 210, 255);
 const SLIT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 90);
+const TELE_COLOR: egui::Color32 = egui::Color32::from_rgb(160, 235, 170);
+const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 205, 100);
 
 #[derive(Clone, Copy)]
 pub struct Fit {
@@ -66,7 +113,7 @@ pub enum DispAxis {
 }
 
 /// How the reported spectral line is chosen from the detected candidates.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineMode {
     /// Sharpest line — the best focus reference.
     Narrowest,
@@ -77,19 +124,26 @@ pub enum LineMode {
 }
 
 /// Pick one line from the candidates per the mode (Manual uses `picked`).
+///
+/// Only lines deep enough to be *used* are candidates. The detector admits
+/// anything 2% deep while tracking and capture require 3%, and on a real
+/// profile photon noise reaches 2% — so without this filter `Narrowest`
+/// reliably selects a noise spike, noise being narrower than any real line.
+/// The genuine line is then never considered and every burst is rejected as
+/// "no usable line" while a 40%-deep line sits in plain view on the plot.
+/// A selection criterion must not be able to choose something the acceptance
+/// criterion will throw away.
 fn choose(lines: &[Fit], mode: LineMode, picked: Option<f64>) -> Option<Fit> {
+    let usable = || lines.iter().filter(|f| f.depth > DEPTH_GATE);
     match mode {
-        LineMode::Narrowest => lines
-            .iter()
+        LineMode::Narrowest => usable()
             .min_by(|a, b| a.fwhm.partial_cmp(&b.fwhm).unwrap())
             .copied(),
-        LineMode::Deepest => lines
-            .iter()
+        LineMode::Deepest => usable()
             .max_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap())
             .copied(),
         LineMode::Manual => picked.and_then(|pc| {
-            lines
-                .iter()
+            usable()
                 .min_by(|a, b| {
                     (a.center - pc)
                         .abs()
@@ -117,6 +171,15 @@ pub struct FocusUpdate {
     pub full_h: usize,
     pub cur_exposure: Option<u32>,
     pub cur_gain: Option<u16>,
+    // -- Stage B (telescope) ------------------------------------------------
+    /// Intensity along the slit, averaged over continuum columns only.
+    pub slit_cut: Vec<f32>,
+    /// Dispersion positions that passed the continuum mask.
+    pub n_continuum: usize,
+    /// Limb knife-edge FWHM in px, when a limb is on the slit.
+    pub limb_width: Option<f64>,
+    /// High-passed along-slit contrast, whole span and outer thirds.
+    pub structure: StructureSplit,
 }
 
 enum FocusMsg {
@@ -128,6 +191,62 @@ enum FocusCmd {
     Exposure(u32),
     Gain(u16),
     AutoExposure(bool),
+    /// The worker needs the dispersion axis to know which way to cut the frame
+    /// for the Stage B profile; the Stage A readouts only need it for labels.
+    Dispersion(bool),
+}
+
+/// Which stage of the procedure the panel is driving.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Collimator + camera lens, via the astigmatism null. Telescope-blind, so
+    /// this runs at the bench with a lamp on the slit.
+    Spectrograph,
+    /// Telescope focuser, once Stage A is closed.
+    Telescope,
+}
+
+/// Stage B metric. They fail differently — see [`crate::focusmetrics`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TeleMetric {
+    /// Solar limb as a knife edge. Dust-immune; needs the limb on the slit.
+    LimbEdge,
+    /// High-passed along-slit contrast. Always available; dust adds a constant
+    /// pedestal, and it is the only one that supports the top/bottom split.
+    Structure,
+}
+
+impl TeleMetric {
+    /// Whether best focus *minimises* this metric.
+    fn want_min(self) -> bool {
+        matches!(self, TeleMetric::LimbEdge)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            TeleMetric::LimbEdge => "limb edge FWHM (px)",
+            TeleMetric::Structure => "along-slit contrast",
+        }
+    }
+}
+
+/// An in-progress capture: accumulate N frames, then commit one V-curve point.
+///
+/// Committing a single frame would sample the seeing, not the focuser.
+struct Capture {
+    remaining: usize,
+    total: usize,
+    pos: f64,
+    spec: Vec<f64>,
+    slit: Vec<f64>,
+    /// Deepest line seen per family during the burst, gated or not. A rejection
+    /// that reports "deepest 1.4%, need 3%" is actionable; a bare "no usable
+    /// line" leaves the user guessing between exposure, the wrong target line,
+    /// and there being no such feature at all.
+    best_spec_depth: f64,
+    best_slit_depth: f64,
+    tele: Vec<f64>,
+    tele_top: Vec<f64>,
+    tele_bot: Vec<f64>,
 }
 
 pub struct SearchCameraRestore {
@@ -170,6 +289,9 @@ impl Track {
 pub struct FocusState {
     pub cameras: Vec<CameraInfo>,
     pub selected: usize,
+    /// The user has picked a camera explicitly, so auto-selection stops
+    /// second-guessing them on the next scan.
+    camera_chosen_by_user: bool,
     pub streaming: bool,
     pub exposure_us: u32,
     pub gain: u16,
@@ -178,6 +300,14 @@ pub struct FocusState {
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
     pub picked_center: Option<f64>,
+    /// Target selection for the slit/dust family, mirroring the spectral one.
+    ///
+    /// Stage A only works if the SAME feature is measured at every camera
+    /// position. With several dust specks of differing intrinsic width,
+    /// `Narrowest` hops between them frame to frame and that scatter lands
+    /// directly in the slit V-curve, and so in the Delta it feeds.
+    pub slit_line_mode: LineMode,
+    pub slit_picked_center: Option<f64>,
     // Spectral identification (assume sunlight).
     pub identify_lines: bool,
     pub grating_l_mm: f64,
@@ -188,6 +318,28 @@ pub struct FocusState {
     calibration: Option<Calibration>,
     labels: Vec<LabeledLine>,
     pub status: String,
+    // -- three-stage focus procedure ---------------------------------------
+    pub stage: Stage,
+    pub tele_metric: TeleMetric,
+    pub capture_frames: usize,
+    /// Camera-lens micrometer reading, as the user reads it (Stage A x-axis).
+    pub camera_pos_text: String,
+    /// Collimator micrometer reading for the current Stage A sweep.
+    pub collimator_pos_text: String,
+    /// Telescope focuser reading (Stage B x-axis).
+    pub focuser_pos_text: String,
+    curve_spec: VCurve,
+    curve_slit: VCurve,
+    curve_tele: VCurve,
+    curve_tele_top: VCurve,
+    curve_tele_bot: VCurve,
+    /// One (collimator, Δ) pair per completed Stage A sweep.
+    null_points: Vec<NullPoint>,
+    capture: Option<Capture>,
+    lucky_limb: LuckyBuf,
+    lucky_struct: LuckyBuf,
+    pub stage_status: String,
+    saved: Option<SavedFocus>,
     sel_spectral: Option<Fit>,
     sel_slit: Option<Fit>,
     track_x: Track, // vertical lines
@@ -206,6 +358,7 @@ impl Default for FocusState {
         FocusState {
             cameras: Vec::new(),
             selected: 0,
+            camera_chosen_by_user: false,
             streaming: false,
             exposure_us: 10_000,
             gain: 200,
@@ -214,6 +367,8 @@ impl Default for FocusState {
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
             picked_center: None,
+            slit_line_mode: LineMode::Narrowest,
+            slit_picked_center: None,
             identify_lines: false,
             grating_l_mm: 2400.0,
             order: 1,
@@ -223,6 +378,23 @@ impl Default for FocusState {
             calibration: None,
             labels: Vec::new(),
             status: String::new(),
+            stage: Stage::Spectrograph,
+            tele_metric: TeleMetric::LimbEdge,
+            capture_frames: DEFAULT_CAPTURE_FRAMES,
+            camera_pos_text: String::new(),
+            collimator_pos_text: String::new(),
+            focuser_pos_text: String::new(),
+            curve_spec: VCurve::new(true),
+            curve_slit: VCurve::new(true),
+            curve_tele: VCurve::new(true),
+            curve_tele_top: VCurve::new(true),
+            curve_tele_bot: VCurve::new(true),
+            null_points: Vec::new(),
+            capture: None,
+            lucky_limb: LuckyBuf::new(LUCKY_WINDOW),
+            lucky_struct: LuckyBuf::new(LUCKY_WINDOW),
+            stage_status: String::new(),
+            saved: SavedFocus::load(),
             sel_spectral: None,
             sel_slit: None,
             track_x: Track::new(),
@@ -243,6 +415,19 @@ impl FocusState {
         self.cameras = enumerate_all();
         if self.selected >= self.cameras.len() {
             self.selected = 0;
+        }
+        // The synthetic camera always enumerates first, so index 0 is never the
+        // one someone with hardware attached wants. Prefer real hardware until
+        // the user picks for themselves — after that their choice stands, so a
+        // deliberate switch to the synthetic source survives a re-scan.
+        if !self.camera_chosen_by_user {
+            if let Some(hw) = self
+                .cameras
+                .iter()
+                .position(|c| c.backend != ghostsun_camera::Backend::Synth)
+            {
+                self.selected = hw;
+            }
         }
         let hardware = self
             .cameras
@@ -275,9 +460,20 @@ impl FocusState {
         let exposure = self.exposure_us;
         let gain = self.gain;
         let auto = self.auto_exposure;
+        let disp_h = self.dispersion == DispAxis::Horizontal;
 
         let handle = std::thread::spawn(move || {
-            worker(info, tx, ctx_rx, stop_thread, ctx, exposure, gain, auto)
+            worker(
+                info,
+                tx,
+                ctx_rx,
+                stop_thread,
+                ctx,
+                exposure,
+                gain,
+                auto,
+                disp_h,
+            )
         });
 
         self.rx = Some(rx);
@@ -372,7 +568,7 @@ impl FocusState {
                 };
                 (
                     choose(spec_lines, self.line_mode, self.picked_center),
-                    choose(slit_lines, LineMode::Narrowest, None),
+                    choose(slit_lines, self.slit_line_mode, self.slit_picked_center),
                 )
             };
             if spec_is_y {
@@ -384,6 +580,16 @@ impl FocusState {
             }
             self.sel_spectral = spec;
             self.sel_slit = slit;
+
+            // Stage B live readouts: rolling "lucky" percentile, so the number
+            // tracks the instrument's ceiling rather than the atmosphere.
+            if let Some(lw) = u.limb_width {
+                self.lucky_limb.push(lw);
+            }
+            if let Some(sc) = u.structure.all {
+                self.lucky_struct.push(sc);
+            }
+            self.accumulate_capture(&spec, &slit, &u);
 
             // Spectral line identification (sunlight): calibrate pixel→λ against
             // the Fraunhofer catalog, seeded by the grating geometry.
@@ -496,6 +702,244 @@ impl FocusState {
         self.dispersion == DispAxis::Vertical
     }
 
+    // -- V-curve capture ---------------------------------------------------
+
+    /// The Stage B metric for one frame, per the selected metric.
+    fn tele_frame_value(&self, u: &FocusUpdate) -> Option<f64> {
+        match self.tele_metric {
+            TeleMetric::LimbEdge => u.limb_width,
+            TeleMetric::Structure => u.structure.all,
+        }
+    }
+
+    /// Micrometer position for the active stage, parsed from its text field.
+    fn active_position(&self) -> Option<f64> {
+        let text = match self.stage {
+            Stage::Spectrograph => &self.camera_pos_text,
+            Stage::Telescope => &self.focuser_pos_text,
+        };
+        text.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    /// Start accumulating frames for one V-curve point.
+    pub fn begin_capture(&mut self) {
+        let Some(pos) = self.active_position() else {
+            self.stage_status = "enter the micrometer reading first".into();
+            return;
+        };
+        if !self.streaming {
+            self.stage_status = "start the camera first".into();
+            return;
+        }
+        let n = self.capture_frames.max(1);
+        self.capture = Some(Capture {
+            remaining: n,
+            total: n,
+            pos,
+            spec: Vec::with_capacity(n),
+            slit: Vec::with_capacity(n),
+            best_spec_depth: 0.0,
+            best_slit_depth: 0.0,
+            tele: Vec::with_capacity(n),
+            tele_top: Vec::with_capacity(n),
+            tele_bot: Vec::with_capacity(n),
+        });
+        self.stage_status = format!("capturing {n} frames at {pos}…");
+    }
+
+    pub fn cancel_capture(&mut self) {
+        self.capture = None;
+        self.stage_status = "capture cancelled".into();
+    }
+
+    fn accumulate_capture(&mut self, spec: &Option<Fit>, slit: &Option<Fit>, u: &FocusUpdate) {
+        let tele = self.tele_frame_value(u);
+        let (top, bottom) = (u.structure.top, u.structure.bottom);
+        let stage = self.stage;
+        let Some(cap) = &mut self.capture else { return };
+
+        match stage {
+            Stage::Spectrograph => {
+                // Only frames where both families actually produced a line are
+                // usable; a dropout must not be averaged in as if it were data.
+                if let Some(f) = spec {
+                    cap.best_spec_depth = cap.best_spec_depth.max(f.depth);
+                    if f.depth > DEPTH_GATE {
+                        cap.spec.push(f.fwhm);
+                    }
+                }
+                if let Some(f) = slit {
+                    cap.best_slit_depth = cap.best_slit_depth.max(f.depth);
+                    if f.depth > DEPTH_GATE {
+                        cap.slit.push(f.fwhm);
+                    }
+                }
+            }
+            Stage::Telescope => {
+                if let Some(v) = tele {
+                    cap.tele.push(v);
+                }
+                if let Some(v) = top {
+                    cap.tele_top.push(v);
+                }
+                if let Some(v) = bottom {
+                    cap.tele_bot.push(v);
+                }
+            }
+        }
+
+        cap.remaining = cap.remaining.saturating_sub(1);
+        if cap.remaining == 0 {
+            self.commit_capture();
+        }
+    }
+
+    fn commit_capture(&mut self) {
+        let Some(cap) = self.capture.take() else { return };
+        match self.stage {
+            Stage::Spectrograph => {
+                // Median over the burst: robust to the odd frame where the
+                // fitter latched onto a neighbouring line.
+                let spec = median(&cap.spec);
+                let slit = median(&cap.slit);
+                match (spec, slit) {
+                    (Some(s), Some(k)) => {
+                        self.curve_spec.push(cap.pos, s, cap.spec.len() as f64);
+                        self.curve_slit.push(cap.pos, k, cap.slit.len() as f64);
+                        self.stage_status = format!(
+                            "captured @ {:.4}: spectral {s:.2} px, slit {k:.2} px ({}/{} frames)",
+                            cap.pos,
+                            cap.spec.len().min(cap.slit.len()),
+                            cap.total
+                        );
+                    }
+                    _ => {
+                        self.stage_status = capture_failure(
+                            spec.is_none(),
+                            slit.is_none(),
+                            cap.best_spec_depth,
+                            cap.best_slit_depth,
+                        );
+                    }
+                }
+            }
+            Stage::Telescope => {
+                let want_min = self.tele_metric.want_min();
+                // Lucky selection rather than the median: the burst is
+                // seeing-limited, and the best frames measure the optics.
+                let pick = |v: &Vec<f64>| lucky_of(v, want_min);
+                match pick(&cap.tele) {
+                    Some(t) => {
+                        self.curve_tele.push(cap.pos, t, cap.tele.len() as f64);
+                        if let Some(v) = pick(&cap.tele_top) {
+                            self.curve_tele_top.push(cap.pos, v, cap.tele_top.len() as f64);
+                        }
+                        if let Some(v) = pick(&cap.tele_bot) {
+                            self.curve_tele_bot.push(cap.pos, v, cap.tele_bot.len() as f64);
+                        }
+                        self.stage_status = format!(
+                            "captured @ {:.4}: {} = {t:.3} ({}/{} frames)",
+                            cap.pos,
+                            self.tele_metric.label(),
+                            cap.tele.len(),
+                            cap.total
+                        );
+                    }
+                    None => {
+                        self.stage_status = match self.tele_metric {
+                            TeleMetric::LimbEdge => {
+                                "no limb on the slit in that burst — point at the limb, or switch \
+                                 to along-slit contrast"
+                                    .into()
+                            }
+                            TeleMetric::Structure => {
+                                "no illuminated slit in that burst — check exposure".into()
+                            }
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Set the Stage B curves' polarity to match the selected metric, and drop
+    /// samples measured with the other one — they are not comparable.
+    fn retarget_tele_curves(&mut self) {
+        let want_min = self.tele_metric.want_min();
+        self.curve_tele = VCurve::new(want_min);
+        self.curve_tele_top = VCurve::new(want_min);
+        self.curve_tele_bot = VCurve::new(want_min);
+        self.lucky_limb.clear();
+        self.lucky_struct.clear();
+    }
+
+    fn clear_stage_a(&mut self) {
+        self.curve_spec.clear();
+        self.curve_slit.clear();
+        self.capture = None;
+        self.stage_status = "Stage A sweep cleared".into();
+    }
+
+    fn clear_stage_b(&mut self) {
+        self.curve_tele.clear();
+        self.curve_tele_top.clear();
+        self.curve_tele_bot.clear();
+        self.capture = None;
+        self.stage_status = "Stage B sweep cleared".into();
+    }
+
+    /// Bank the current sweep's Δ against its collimator reading, then clear the
+    /// sweep so the next collimator setting starts fresh.
+    fn record_null_point(&mut self) {
+        let Some(sp) = vcurve::split(&self.curve_spec, &self.curve_slit) else {
+            self.stage_status = "need a solved Δ before banking a point".into();
+            return;
+        };
+        let Some(coll) = self
+            .collimator_pos_text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+        else {
+            self.stage_status = "enter the collimator reading before banking".into();
+            return;
+        };
+        self.null_points.push(NullPoint {
+            collimator: coll,
+            delta: sp.delta,
+        });
+        self.curve_spec.clear();
+        self.curve_slit.clear();
+        self.stage_status = format!(
+            "banked Δ = {:+.4} at collimator {coll} ({} point(s))",
+            sp.delta,
+            self.null_points.len()
+        );
+    }
+
+    fn save_current(&mut self) {
+        let sp = vcurve::split(&self.curve_spec, &self.curve_slit);
+        let rec = SavedFocus {
+            camera: sp.map(|s| s.spatial.vertex),
+            collimator: self
+                .collimator_pos_text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite()),
+            delta: sp.map(|s| s.delta),
+            focuser: self.curve_tele.fit().map(|f| f.vertex),
+        };
+        match rec.save() {
+            Ok(path) => {
+                self.stage_status = format!("saved to {}", path.display());
+                self.saved = Some(rec);
+            }
+            Err(e) => self.stage_status = format!("save failed: {e}"),
+        }
+    }
+
     // -- UI ----------------------------------------------------------------
 
     pub fn controls_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -531,7 +975,9 @@ impl FocusState {
             )
             .show_ui(ui, |ui| {
                 for (i, n) in names.iter().enumerate() {
-                    ui.selectable_value(&mut self.selected, i, n);
+                    if ui.selectable_value(&mut self.selected, i, n).clicked() {
+                        self.camera_chosen_by_user = true;
+                    }
                 }
             });
 
@@ -600,11 +1046,23 @@ impl FocusState {
         }
 
         ui.add_space(8.0);
+        let mut axis_changed = false;
         ui.horizontal(|ui| {
             ui.label("dispersion axis:");
-            ui.selectable_value(&mut self.dispersion, DispAxis::Vertical, "⇕ vertical");
-            ui.selectable_value(&mut self.dispersion, DispAxis::Horizontal, "⇔ horizontal");
+            axis_changed |= ui
+                .selectable_value(&mut self.dispersion, DispAxis::Vertical, "⇕ vertical")
+                .clicked();
+            axis_changed |= ui
+                .selectable_value(&mut self.dispersion, DispAxis::Horizontal, "⇔ horizontal")
+                .clicked();
         });
+        if axis_changed {
+            // Stage A only relabels, but Stage B genuinely cuts the frame the
+            // other way, so the worker has to be told.
+            self.send_cmd(FocusCmd::Dispersion(self.dispersion == DispAxis::Horizontal));
+            self.lucky_limb.clear();
+            self.lucky_struct.clear();
+        }
         ui.label(
             egui::RichText::new("Spectral lines run ⊥ to this. Sets only which readout is which.")
                 .small()
@@ -694,44 +1152,28 @@ impl FocusState {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("target line:");
-            let mut changed = false;
-            changed |= ui
-                .selectable_value(&mut self.line_mode, LineMode::Narrowest, "narrowest")
-                .clicked();
-            changed |= ui
-                .selectable_value(&mut self.line_mode, LineMode::Deepest, "deepest")
-                .clicked();
-            if self.line_mode == LineMode::Manual {
-                let _ = ui.selectable_label(true, "picked");
-            }
-            if changed {
-                self.picked_center = None;
-                self.reset_holds();
-            }
+            ui.label("spectral target:");
         });
-        if self.line_mode == LineMode::Manual {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "locked @ {:.0} px",
-                        self.picked_center.unwrap_or(0.0)
-                    ))
-                    .small()
-                    .weak(),
-                );
-                if ui.small_button("clear").clicked() {
-                    self.line_mode = LineMode::Narrowest;
-                    self.picked_center = None;
-                    self.reset_holds();
-                }
-            });
-        } else {
-            ui.label(
-                egui::RichText::new("click the spectral plot to lock a line")
-                    .small()
-                    .weak(),
-            );
+        let spec_changed = target_line_ui(
+            ui,
+            "spectral",
+            &mut self.line_mode,
+            &mut self.picked_center,
+            SPECTRAL_COLOR,
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("slit target:");
+        });
+        let slit_changed = target_line_ui(
+            ui,
+            "slit",
+            &mut self.slit_line_mode,
+            &mut self.slit_picked_center,
+            SLIT_COLOR,
+        );
+        if spec_changed || slit_changed {
+            self.reset_holds();
         }
 
         ui.add_space(12.0);
@@ -767,13 +1209,414 @@ impl FocusState {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "frame {}×{}  mean {:.0}",
-                    l.full_w, l.full_h, l.mean
+                    "frame {}×{}  mean {:.0}  ·  {} continuum px",
+                    l.full_w, l.full_h, l.mean, l.n_continuum
                 ))
                 .small()
                 .weak(),
             );
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        self.stage_ui(ui);
+    }
+
+    // -- three-stage procedure UI ------------------------------------------
+
+    fn stage_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.heading("Focus procedure");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.stage, Stage::Spectrograph, "A · spectrograph");
+            ui.selectable_value(&mut self.stage, Stage::Telescope, "B · telescope");
+        });
+
+        match self.stage {
+            Stage::Spectrograph => self.stage_a_ui(ui),
+            Stage::Telescope => self.stage_b_ui(ui),
+        }
+
+        if !self.stage_status.is_empty() {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(&self.stage_status).small().weak());
+        }
+
+        if let Some(s) = self.saved.filter(|s| !s.is_empty()) {
+            ui.add_space(6.0);
+            let mut parts = Vec::new();
+            if let Some(v) = s.collimator {
+                parts.push(format!("collimator {v}"));
+            }
+            if let Some(v) = s.camera {
+                parts.push(format!("camera {v:.4}"));
+            }
+            if let Some(v) = s.delta {
+                parts.push(format!("Δ {v:+.4}"));
+            }
+            if let Some(v) = s.focuser {
+                parts.push(format!("focuser {v:.4}"));
+            }
+            ui.label(
+                egui::RichText::new(format!("saved: {}", parts.join("  ·  ")))
+                    .small()
+                    .color(egui::Color32::LIGHT_GREEN),
+            );
+        }
+    }
+
+    fn stage_a_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Telescope-blind: both metrics live in the slit plane, so this runs at the \
+                 bench with a lamp on the slit. Step the CAMERA micrometer; the two minima \
+                 coincide only when the collimator is truly collimating.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        // Label above the field, matching the exposure/gain controls higher up
+        // this panel. A two-column Grid collapses its label column in the side
+        // rail and wraps "collimator reading" one character per line.
+        ui.label("collimator reading (fixed this sweep)");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.collimator_pos_text)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. 12.40"),
+        );
+        ui.add_space(4.0);
+        ui.label("camera reading (stepped)");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.camera_pos_text)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. 8.15"),
+        );
+
+        self.capture_row_ui(ui);
+        let n = self.curve_spec.samples.len().min(self.curve_slit.samples.len());
+        ui.label(
+            egui::RichText::new(format!("{n} sample(s) in this sweep"))
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(8.0);
+        match vcurve::split(&self.curve_spec, &self.curve_slit) {
+            Some(sp) => {
+                egui::Frame::group(ui.style())
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        vertex_line(ui, "spectral min", SPECTRAL_COLOR, &sp.spectral);
+                        vertex_line(ui, "slit min", SLIT_COLOR, &sp.spatial);
+                        ui.add_space(4.0);
+                        let trusted = sp.spectral.trustworthy() && sp.spatial.trustworthy();
+                        let (verdict, color) = if !trusted {
+                            ("not solved yet", WARN_COLOR)
+                        } else if sp.nulled() {
+                            ("collimated — Δ is zero within 1σ", egui::Color32::LIGHT_GREEN)
+                        } else {
+                            ("astigmatic — move the collimator", WARN_COLOR)
+                        };
+                        let sigma = if sp.delta_sigma.is_finite() {
+                            format!(" ± {:.4}", sp.delta_sigma)
+                        } else {
+                            String::new()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("Δ = {:+.4}{sigma}", sp.delta))
+                                .size(24.0)
+                                .strong()
+                                .color(color),
+                        );
+                        ui.label(egui::RichText::new(verdict).small().color(color));
+                        for note in [
+                            fit_note(&sp.spectral, "spectral"),
+                            fit_note(&sp.spatial, "slit"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            ui.label(egui::RichText::new(note).small().color(WARN_COLOR));
+                        }
+                    });
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(
+                        "Δ needs ≥3 camera positions on both curves, spanning each minimum.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("bank Δ at this collimator").clicked() {
+                self.record_null_point();
+            }
+            if ui.button("clear sweep").clicked() {
+                self.clear_stage_a();
+            }
+        });
+
+        if !self.null_points.is_empty() {
+            ui.add_space(6.0);
+            for p in &self.null_points {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "collimator {:.4}  →  Δ {:+.4}",
+                        p.collimator, p.delta
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            match vcurve::solve_null(&self.null_points) {
+                Some(sol) => {
+                    ui.label(
+                        egui::RichText::new(format!("set collimator to {:.4}", sol.collimator))
+                            .size(18.0)
+                            .strong()
+                            .color(egui::Color32::LIGHT_GREEN),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "dΔ/dcollimator = {:+.4} from {} point(s){}",
+                            sol.gain,
+                            sol.n,
+                            if sol.bracketed {
+                                ""
+                            } else {
+                                " · extrapolated, expect one more iteration"
+                            }
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "bank a second sweep at a different collimator setting to solve for \
+                             the null (this also measures the sign, so it is never assumed)",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            }
+            if ui.button("clear banked points").clicked() {
+                self.null_points.clear();
+                self.stage_status = "banked points cleared".into();
+            }
+        }
+
+        ui.add_space(6.0);
+        if ui.button("💾 save converged settings").clicked() {
+            self.save_current();
+        }
+    }
+
+    fn stage_b_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Run only after Stage A is closed — the telescope cannot correct grating \
+                 astigmatism, so against a mis-collimated spectrograph it just finds a \
+                 compromise. Measured on continuum columns, not the line core.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        let before = self.tele_metric;
+        ui.horizontal(|ui| {
+            ui.label("metric:");
+            ui.selectable_value(&mut self.tele_metric, TeleMetric::LimbEdge, "limb edge");
+            ui.selectable_value(&mut self.tele_metric, TeleMetric::Structure, "contrast");
+        });
+        if before != self.tele_metric {
+            self.retarget_tele_curves();
+            self.stage_status = "metric changed — Stage B sweep reset (values not comparable)".into();
+        }
+        ui.label(
+            egui::RichText::new(match self.tele_metric {
+                TeleMetric::LimbEdge => {
+                    "Solar limb as a knife edge. Dust-immune, so trust this one. Needs the limb \
+                     on the slit."
+                }
+                TeleMetric::Structure => {
+                    "High-passed along-slit contrast. Always available, but slit dust adds a \
+                     constant pedestal — the peak position is still right, the curve is just \
+                     shallower. Only this metric supports the top/bottom split."
+                }
+            })
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(6.0);
+        let want_min = self.tele_metric.want_min();
+        let live = match self.tele_metric {
+            TeleMetric::LimbEdge => self.lucky_limb.lucky(want_min),
+            TeleMetric::Structure => self.lucky_struct.lucky(want_min),
+        };
+        let n_lucky = match self.tele_metric {
+            TeleMetric::LimbEdge => self.lucky_limb.len(),
+            TeleMetric::Structure => self.lucky_struct.len(),
+        };
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} · best decile", self.tele_metric.label()))
+                        .small()
+                        .weak(),
+                );
+                match live {
+                    Some(v) => ui.label(
+                        egui::RichText::new(format!("{v:.3}"))
+                            .size(26.0)
+                            .strong()
+                            .color(TELE_COLOR),
+                    ),
+                    None => ui.label(egui::RichText::new("— no signal —").size(20.0).weak()),
+                };
+                ui.label(
+                    egui::RichText::new(format!("over {n_lucky} frames"))
+                        .small()
+                        .weak(),
+                );
+            });
+
+        ui.add_space(6.0);
+        ui.label("focuser reading (stepped)");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.focuser_pos_text)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. 4.80"),
+        );
+        self.capture_row_ui(ui);
+        ui.label(
+            egui::RichText::new(format!("{} sample(s)", self.curve_tele.samples.len()))
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(8.0);
+        match self.curve_tele.fit() {
+            Some(f) => {
+                egui::Frame::group(ui.style())
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        vertex_line(ui, "best focus", TELE_COLOR, &f);
+                        if let Some(note) = fit_note(&f, "telescope") {
+                            ui.label(egui::RichText::new(note).small().color(WARN_COLOR));
+                        }
+                    });
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("needs ≥3 focuser positions spanning the extremum")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+
+        if self.tele_metric == TeleMetric::Structure {
+            ui.add_space(6.0);
+            match (self.curve_tele_top.fit(), self.curve_tele_bot.fit()) {
+                (Some(t), Some(b)) if t.trustworthy() && b.trustworthy() => {
+                    let split = t.vertex - b.vertex;
+                    let tol = (t.vertex_sigma.max(0.0) + b.vertex_sigma.max(0.0)).max(0.0);
+                    let flat = tol.is_finite() && split.abs() <= tol;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "top {:.4} · bottom {:.4} · split {split:+.4}",
+                            t.vertex, b.vertex
+                        ))
+                        .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new(if flat {
+                            "slit is flat to the field — no tilt or curvature to chase"
+                        } else {
+                            "top and bottom focus at different positions: field curvature or \
+                             slit tilt, not focus. No single setting fixes it — focus for \
+                             mid-disk radius, or fit a flattener."
+                        })
+                        .small()
+                        .color(if flat { egui::Color32::LIGHT_GREEN } else { WARN_COLOR }),
+                    );
+                }
+                _ => {
+                    ui.label(
+                        egui::RichText::new(
+                            "top/bottom split: needs ≥3 positions with the slit lit end to end",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("clear sweep").clicked() {
+                self.clear_stage_b();
+            }
+            if ui.button("💾 save converged settings").clicked() {
+                self.save_current();
+            }
+        });
+    }
+
+    /// Capture / undo row, shared by both stages.
+    fn capture_row_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        let in_progress = self.capture.as_ref().map(|c| (c.total - c.remaining, c.total));
+        ui.horizontal(|ui| match in_progress {
+            Some((done, total)) => {
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .desired_width(150.0)
+                        .text(format!("{done}/{total}")),
+                );
+                if ui.button("cancel").clicked() {
+                    self.cancel_capture();
+                }
+            }
+            None => {
+                if ui.button("◉ capture").clicked() {
+                    self.begin_capture();
+                }
+                if ui.button("undo last").clicked() {
+                    match self.stage {
+                        Stage::Spectrograph => {
+                            self.curve_spec.undo();
+                            self.curve_slit.undo();
+                        }
+                        Stage::Telescope => {
+                            self.curve_tele.undo();
+                            self.curve_tele_top.undo();
+                            self.curve_tele_bot.undo();
+                        }
+                    }
+                    self.stage_status = "last sample removed".into();
+                }
+                ui.add(
+                    egui::DragValue::new(&mut self.capture_frames)
+                        .range(5..=300)
+                        .prefix("frames "),
+                );
+            }
+        });
     }
 
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -796,7 +1639,7 @@ impl FocusState {
         let spec_is_y = self.spectral_is_y();
         // Clone what the plots need so the borrow of self.last is released before
         // a click can mutate self.picked_center.
-        let (spec_prof, slit_prof, spec_cands) = {
+        let (spec_prof, slit_prof, spec_cands, slit_cands) = {
             let last = match &self.last {
                 Some(l) => l,
                 None => return,
@@ -811,11 +1654,17 @@ impl FocusState {
             } else {
                 last.lines_x.iter().map(|f| f.center).collect()
             };
-            (sp, kp, cands)
+            let slit_cands: Vec<f64> = if spec_is_y {
+                last.lines_x.iter().map(|f| f.center).collect()
+            } else {
+                last.lines_y.iter().map(|f| f.center).collect()
+            };
+            (sp, kp, cands, slit_cands)
         };
         let spec_fit = self.sel_spectral;
         let slit_fit = self.sel_slit;
         let picked = self.picked_center;
+        let slit_picked = self.slit_picked_center;
         let spec_labels: Vec<(f64, String)> = self
             .labels
             .iter()
@@ -846,21 +1695,25 @@ impl FocusState {
 
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("Slit profile (across the slit)")
+            egui::RichText::new("Slit profile (across the slit) — click to lock a dust line")
                 .small()
                 .color(SLIT_COLOR),
         );
-        profile_plot(
+        if let Some(x) = profile_plot(
             ui,
             "focus_slit",
             &slit_prof,
             slit_fit,
-            &[],
-            None,
+            &slit_cands,
+            slit_picked,
             &[],
             SLIT_COLOR,
             150.0,
-        );
+        ) {
+            self.slit_picked_center = Some(x);
+            self.slit_line_mode = LineMode::Manual;
+            self.reset_holds();
+        }
 
         // Combined FWHM trend + min-holds.
         let (spec_track, slit_track) = if self.spectral_is_y() {
@@ -892,7 +1745,350 @@ impl FocusState {
                     }
                 });
         }
+
+        // Stage B works on the continuum cut along the slit, not on either of
+        // the profiles above — show it, so "no limb on the slit" is visible
+        // rather than inferred.
+        if self.stage == Stage::Telescope {
+            if let Some(cut) = self.last.as_ref().map(|l| l.slit_cut.clone()) {
+                if !cut.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Continuum cut along the slit (Stage B)")
+                            .small()
+                            .color(TELE_COLOR),
+                    );
+                    profile_plot(ui, "focus_slitcut", &cut, None, &[], None, &[], TELE_COLOR, 150.0);
+                }
+            }
+        }
+
+        // The V-curves being built for the active stage.
+        match self.stage {
+            Stage::Spectrograph => {
+                if !self.curve_spec.is_empty() || !self.curve_slit.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Stage A V-curves — FWHM (px) vs camera micrometer; the gap between \
+                             the two vertices is Δ",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    vcurve_plot(
+                        ui,
+                        "vcurve_stage_a",
+                        &[
+                            ("spectral", SPECTRAL_COLOR, &self.curve_spec),
+                            ("slit", SLIT_COLOR, &self.curve_slit),
+                        ],
+                    );
+                }
+            }
+            Stage::Telescope => {
+                if !self.curve_tele.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Stage B V-curve — {} vs focuser",
+                            self.tele_metric.label()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    let mut series: Vec<(&str, egui::Color32, &VCurve)> =
+                        vec![("focus", TELE_COLOR, &self.curve_tele)];
+                    if self.tele_metric == TeleMetric::Structure {
+                        series.push(("top", SPECTRAL_COLOR, &self.curve_tele_top));
+                        series.push(("bottom", SLIT_COLOR, &self.curve_tele_bot));
+                    }
+                    vcurve_plot(ui, "vcurve_stage_b", &series);
+                }
+            }
+        }
     }
+}
+
+/// Why a Stage A burst produced no sample.
+///
+/// Both families must succeed — a position measured on only one curve cannot
+/// contribute to a difference between them — so a rejection has to say *which*
+/// one failed, and whether it failed for want of depth or was never detected at
+/// all. Those need opposite responses.
+fn capture_failure(
+    spec_failed: bool,
+    slit_failed: bool,
+    best_spec_depth: f64,
+    best_slit_depth: f64,
+) -> String {
+    let gate = DEPTH_GATE * 100.0;
+    let detail = |name: &str, best: f64, hint: &str| {
+        if best <= 0.0 {
+            format!("no {name} detected at all — {hint}")
+        } else {
+            format!(
+                "{name} only {:.1}% deep, needs {gate:.0}% — {hint}",
+                best * 100.0
+            )
+        }
+    };
+    match (spec_failed, slit_failed) {
+        (true, true) => format!(
+            "nothing usable in that burst: {}; {}",
+            detail(
+                "spectral line",
+                best_spec_depth,
+                "only absorption lines are detected, so an emission source (neon) will not work"
+            ),
+            detail("slit-jaw line", best_slit_depth, "jaws may be too clean")
+        ),
+        (true, false) => detail(
+            "spectral line",
+            best_spec_depth,
+            "raise exposure without clipping, or click a deeper line in the spectral plot.              Only absorption lines are detected — an emission source will not register",
+        ),
+        (false, true) => detail(
+            "slit-jaw line",
+            best_slit_depth,
+            "clean jaws give no signal: tape a hair across a jaw, or move the slit end into frame",
+        ),
+        (false, false) => {
+            "burst produced no sample despite both families reporting lines — try more frames"
+                .into()
+        }
+    }
+}
+
+fn vertex_line(ui: &mut egui::Ui, label: &str, color: egui::Color32, f: &ParabolaFit) {
+    let sigma = if f.vertex_sigma.is_finite() {
+        format!(" ± {:.4}", f.vertex_sigma)
+    } else {
+        String::new()
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "{label}: {:.4}{sigma}   (n={}, rms {:.3})",
+            f.vertex, f.n, f.rms
+        ))
+        .small()
+        .color(color),
+    );
+}
+
+/// What is wrong with a fit, if anything — so the panel says "sample further
+/// out" instead of quietly reporting a number that means nothing.
+fn fit_note(f: &ParabolaFit, name: &str) -> Option<String> {
+    if !f.shape_ok {
+        Some(format!(
+            "{name}: curve bends the wrong way — the range is probably too small to see the \
+             extremum, or the metric has no signal"
+        ))
+    } else if !f.bracketed {
+        Some(format!(
+            "{name}: extremum is extrapolated beyond the samples — step past it and capture again"
+        ))
+    } else if f.n < 4 {
+        Some(format!("{name}: a 4th sample gives an uncertainty"))
+    } else {
+        None
+    }
+}
+
+/// Sample points plus their fitted parabolas. The parabola is reconstructed
+/// from (vertex, curvature, extremum): y = extremum + ½·curvature·(x − vertex)².
+fn vcurve_plot(ui: &mut egui::Ui, id: &str, series: &[(&str, egui::Color32, &VCurve)]) {
+    if series.iter().all(|(_, _, c)| c.is_empty()) {
+        return;
+    }
+    Plot::new(id)
+        .height(170.0)
+        .allow_scroll(false)
+        .show(ui, |p| {
+            for (name, color, curve) in series {
+                if curve.is_empty() {
+                    continue;
+                }
+                let pts: Vec<[f64; 2]> = curve.samples.iter().map(|s| [s.pos, s.value]).collect();
+                p.points(
+                    Points::new(PlotPoints::from(pts))
+                        .color(*color)
+                        .radius(3.5)
+                        .name(*name),
+                );
+                let Some(f) = curve.fit() else { continue };
+                let lo = curve.samples.iter().map(|s| s.pos).fold(f64::MAX, f64::min);
+                let hi = curve.samples.iter().map(|s| s.pos).fold(f64::MIN, f64::max);
+                // Extend a little past the samples so a near-edge vertex is visible.
+                let pad = 0.1 * (hi - lo).abs().max(1e-9);
+                let (a, b) = (lo - pad, hi + pad);
+                let curve_pts: PlotPoints = (0..=100)
+                    .map(|i| {
+                        let x = a + (b - a) * i as f64 / 100.0;
+                        let d = x - f.vertex;
+                        [x, f.extremum + 0.5 * f.curvature * d * d]
+                    })
+                    .collect();
+                p.line(Line::new(curve_pts).color(*color).name(*name));
+                if f.shape_ok {
+                    p.vline(VLine::new(f.vertex).color(*color));
+                }
+            }
+        });
+}
+
+fn median(v: &[f64]) -> Option<f64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    Some(if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        0.5 * (s[n / 2 - 1] + s[n / 2])
+    })
+}
+
+/// Best decile of a burst, for the metric's polarity. Shares the live
+/// readout's selection so a captured sample means the same thing as the number
+/// the user watched before pressing capture.
+fn lucky_of(v: &[f64], want_min: bool) -> Option<f64> {
+    focusmetrics::lucky_mean(v, want_min, focusmetrics::LUCKY_FRACTION)
+}
+
+// -- converged-setting persistence -----------------------------------------
+
+/// The converged readings from a closed procedure.
+///
+/// Stage A drifts far more slowly than Stage B — a short metal path with no
+/// tube — so on a normal morning only the telescope is re-focused, and Stage A
+/// is *verified* against these numbers rather than re-derived.
+#[derive(Clone, Copy, Default)]
+struct SavedFocus {
+    camera: Option<f64>,
+    collimator: Option<f64>,
+    delta: Option<f64>,
+    focuser: Option<f64>,
+}
+
+fn saved_focus_path() -> Option<std::path::PathBuf> {
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    }?;
+    Some(base.join("GhostSun").join("focus.txt"))
+}
+
+impl SavedFocus {
+    /// Hand-rolled key=value rather than a serde dependency: four optional
+    /// numbers do not justify one, and the file stays readable at the scope.
+    fn save(&self) -> Result<std::path::PathBuf, String> {
+        let path = saved_focus_path().ok_or("no config directory")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let mut s = String::from("# GhostSun converged focus settings\n");
+        for (k, v) in [
+            ("camera", self.camera),
+            ("collimator", self.collimator),
+            ("delta", self.delta),
+            ("focuser", self.focuser),
+        ] {
+            if let Some(v) = v {
+                s.push_str(&format!("{k}={v}\n"));
+            }
+        }
+        std::fs::write(&path, s).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    fn load() -> Option<SavedFocus> {
+        let text = std::fs::read_to_string(saved_focus_path()?).ok()?;
+        let mut out = SavedFocus::default();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
+            let Ok(v) = v.trim().parse::<f64>() else {
+                continue;
+            };
+            match k.trim() {
+                "camera" => out.camera = Some(v),
+                "collimator" => out.collimator = Some(v),
+                "delta" => out.delta = Some(v),
+                "focuser" => out.focuser = Some(v),
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.camera.is_none()
+            && self.collimator.is_none()
+            && self.delta.is_none()
+            && self.focuser.is_none()
+    }
+}
+
+/// Target-line selector for one family. Returns true when the selection changed,
+/// so the caller can reset the min-holds — a held minimum measured on a
+/// different feature is meaningless.
+fn target_line_ui(
+    ui: &mut egui::Ui,
+    family: &str,
+    mode: &mut LineMode,
+    picked: &mut Option<f64>,
+    color: egui::Color32,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .selectable_value(mode, LineMode::Narrowest, "narrowest")
+            .clicked();
+        changed |= ui
+            .selectable_value(mode, LineMode::Deepest, "deepest")
+            .clicked();
+        if *mode == LineMode::Manual {
+            let _ = ui.selectable_label(true, "picked");
+        }
+    });
+    if changed {
+        *picked = None;
+    }
+    if *mode == LineMode::Manual {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("locked @ {:.0} px", picked.unwrap_or(0.0)))
+                    .small()
+                    .color(color),
+            );
+            if ui.small_button("clear").clicked() {
+                *mode = LineMode::Narrowest;
+                *picked = None;
+                changed = true;
+            }
+        });
+    } else {
+        ui.label(
+            egui::RichText::new(format!("click the {family} plot to lock a line"))
+                .small()
+                .weak(),
+        );
+    }
+    changed
 }
 
 fn readout(
@@ -1039,7 +2235,9 @@ fn worker(
     exposure_us: u32,
     gain: u16,
     auto_exposure: bool,
+    dispersion_horizontal: bool,
 ) {
+    let mut disp_h = dispersion_horizontal;
     let mut cam = match open(&info) {
         Ok(c) => c,
         Err(e) => {
@@ -1067,6 +2265,7 @@ fn worker(
                 FocusCmd::AutoExposure(on) => {
                     cam.set_auto_exposure(on).ok();
                 }
+                FocusCmd::Dispersion(h) => disp_h = h,
             }
         }
         match cam.next_frame(1000) {
@@ -1088,10 +2287,31 @@ fn worker(
                 } else {
                     (prof_x.iter().map(|&v| v as f64).sum::<f64>() / prof_x.len() as f64) as f32
                 };
+                // Stage B: cut the frame along the slit using continuum
+                // dispersion positions only. The line core is low-contrast
+                // chromosphere and its focus curve is flattened by scattered
+                // light; the continuum carries granulation and a hard limb.
+                let spec_prof = if disp_h { &prof_x } else { &prof_y };
+                let mask = focusmetrics::continuum_mask(spec_prof);
+                let n_continuum = mask.iter().filter(|&&m| m).count();
+                let slit_cut = focusmetrics::slit_profile_continuum(
+                    &frame.data,
+                    frame.width,
+                    frame.height,
+                    disp_h,
+                    &mask,
+                );
+                let limb_width = focusmetrics::limb_edge_width(&slit_cut);
+                let structure = focusmetrics::structure_split(&slit_cut);
+
                 let (strip, sw, sh) = make_strip(&frame);
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
                 let _ = tx.send(FocusMsg::Frame(Box::new(FocusUpdate {
+                    slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
+                    n_continuum,
+                    limb_width,
+                    structure,
                     strip,
                     strip_w: sw,
                     strip_h: sh,
@@ -1158,5 +2378,273 @@ pub fn full_roi(info: &CameraInfo) -> Roi {
         y: 0,
         w: info.max_width,
         h: info.max_height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fit_with(fwhm: f64) -> Fit {
+        Fit {
+            fwhm,
+            depth: 0.5, // comfortably above DEPTH_GATE
+            center: 100.0,
+            sigma: fwhm / 2.3548,
+            continuum: 1000.0,
+        }
+    }
+
+    fn blank_update() -> FocusUpdate {
+        FocusUpdate {
+            strip: Vec::new(),
+            strip_w: 0,
+            strip_h: 0,
+            prof_x: Vec::new(),
+            prof_y: Vec::new(),
+            lines_x: Vec::new(),
+            lines_y: Vec::new(),
+            mean: 0.0,
+            full_w: 0,
+            full_h: 0,
+            cur_exposure: None,
+            cur_gain: None,
+            slit_cut: Vec::new(),
+            n_continuum: 0,
+            limb_width: None,
+            structure: StructureSplit::default(),
+        }
+    }
+
+    /// Drive one full capture burst at `pos` with the given per-frame values.
+    fn capture_at(st: &mut FocusState, pos: f64, spec: Option<f64>, slit: Option<f64>) {
+        st.camera_pos_text = pos.to_string();
+        st.begin_capture();
+        let u = blank_update();
+        for _ in 0..st.capture_frames {
+            st.accumulate_capture(&spec.map(fit_with), &slit.map(fit_with), &u);
+        }
+    }
+
+    fn stage_a_state() -> FocusState {
+        let mut st = FocusState::default();
+        st.stage = Stage::Spectrograph;
+        st.streaming = true; // begin_capture refuses to run without a camera
+        st.capture_frames = 8;
+        st
+    }
+
+    fn fit_deep(fwhm: f64, depth: f64) -> Fit {
+        Fit {
+            fwhm,
+            depth,
+            center: 100.0,
+            sigma: fwhm / 2.3548,
+            continuum: 1000.0,
+        }
+    }
+
+    #[test]
+    fn narrowest_ignores_sub_threshold_noise_spikes() {
+        // The real failure seen on sky: a 42%-deep line alongside noise the
+        // detector admitted at just over 2%. Noise is always narrower, so an
+        // unfiltered "narrowest" picks it and the burst is then rejected by the
+        // 3% capture gate.
+        let lines = vec![
+            fit_deep(1.8, 0.021), // noise spike, narrower than anything real
+            fit_deep(2.2, 0.025), // ditto
+            fit_deep(5.6, 0.42),  // the actual line
+            fit_deep(7.9, 0.11),
+        ];
+        let pick = choose(&lines, LineMode::Narrowest, None).expect("a usable line exists");
+        assert!(pick.depth > DEPTH_GATE, "picked depth {}", pick.depth);
+        // Narrowest among the *usable* lines, not narrowest overall.
+        assert!((pick.fwhm - 5.6).abs() < 1e-9, "picked fwhm {}", pick.fwhm);
+    }
+
+    #[test]
+    fn choose_returns_nothing_when_every_candidate_is_too_shallow() {
+        let lines = vec![fit_deep(1.8, 0.021), fit_deep(2.4, 0.029)];
+        assert!(choose(&lines, LineMode::Narrowest, None).is_none());
+        assert!(choose(&lines, LineMode::Deepest, None).is_none());
+        assert!(choose(&lines, LineMode::Manual, Some(100.0)).is_none());
+    }
+
+    #[test]
+    fn both_families_select_independently() {
+        // The slit family used to be hardwired to Narrowest with no pick. Stage
+        // A only works if the same feature is tracked at every camera position,
+        // so each family needs its own lock.
+        let mut st = stage_a_state();
+        assert_eq!(st.slit_line_mode, LineMode::Narrowest);
+        assert!(st.slit_picked_center.is_none());
+
+        st.slit_line_mode = LineMode::Manual;
+        st.slit_picked_center = Some(155.0);
+        // Choosing for one family must not disturb the other.
+        assert_eq!(st.line_mode, LineMode::Narrowest);
+        assert!(st.picked_center.is_none());
+
+        let mut near = fit_deep(3.0, 0.14);
+        near.center = 154.0;
+        let mut far = fit_deep(2.0, 0.07);
+        far.center = 300.0;
+        let lines = vec![near, far];
+        let pick = choose(&lines, st.slit_line_mode, st.slit_picked_center).unwrap();
+        assert!((pick.center - 154.0).abs() < 1e-9, "picked {}", pick.center);
+        // Narrowest would have taken the other one; the lock overrides that.
+        assert!(pick.fwhm > far.fwhm);
+    }
+
+    #[test]
+    fn manual_pick_snaps_to_the_nearest_usable_line_not_the_nearest_noise() {
+        let mut noise = fit_deep(1.5, 0.022);
+        noise.center = 240.0; // right where the user clicked
+        let mut real = fit_deep(6.0, 0.40);
+        real.center = 244.0; // the line they meant
+        let lines = vec![noise, real];
+        let pick = choose(&lines, LineMode::Manual, Some(240.0)).unwrap();
+        assert!((pick.center - 244.0).abs() < 1e-9, "picked {}", pick.center);
+    }
+
+    #[test]
+    fn stage_a_capture_builds_both_curves_and_signs_delta_spectral_minus_slit() {
+        let mut st = stage_a_state();
+        // Spectral minimum at 0.34, slit minimum at 0.28 ⇒ Δ = +0.06.
+        for pos in [0.10, 0.20, 0.30, 0.40, 0.50] {
+            let spec = 4.0 * (pos - 0.34) * (pos - 0.34) + 2.0;
+            let slit = 3.0 * (pos - 0.28) * (pos - 0.28) + 3.0;
+            capture_at(&mut st, pos, Some(spec), Some(slit));
+        }
+        assert_eq!(st.curve_spec.samples.len(), 5);
+        assert_eq!(st.curve_slit.samples.len(), 5);
+
+        let sp = vcurve::split(&st.curve_spec, &st.curve_slit).expect("Δ should solve");
+        assert!((sp.spectral.vertex - 0.34).abs() < 1e-6, "{}", sp.spectral.vertex);
+        assert!((sp.spatial.vertex - 0.28).abs() < 1e-6, "{}", sp.spatial.vertex);
+        // The sign convention the whole procedure hangs on.
+        assert!((sp.delta - 0.06).abs() < 1e-6, "delta {}", sp.delta);
+        assert!(sp.spectral.trustworthy() && sp.spatial.trustworthy());
+    }
+
+    #[test]
+    fn a_burst_with_no_usable_line_is_dropped_rather_than_recorded() {
+        let mut st = stage_a_state();
+        capture_at(&mut st, 0.20, None, None);
+        assert!(st.curve_spec.is_empty(), "a dropout must not become a sample");
+        assert!(st.curve_slit.is_empty());
+        assert!(st.capture.is_none(), "capture should have completed, not stalled");
+    }
+
+    #[test]
+    fn shallow_lines_below_the_depth_gate_are_not_averaged_in() {
+        let mut st = stage_a_state();
+        st.camera_pos_text = "0.2".into();
+        st.begin_capture();
+        let u = blank_update();
+        let mut shallow = fit_with(3.0);
+        shallow.depth = DEPTH_GATE * 0.5;
+        for _ in 0..st.capture_frames {
+            st.accumulate_capture(&Some(shallow), &Some(fit_with(4.0)), &u);
+        }
+        // The slit family was fine, the spectral one was not, so neither curve
+        // gains a point — a half-measured position is not a sample.
+        assert!(st.curve_spec.is_empty());
+        assert!(st.curve_slit.is_empty());
+    }
+
+    #[test]
+    fn capture_requires_a_parsed_position() {
+        let mut st = stage_a_state();
+        st.camera_pos_text = "about 12".into();
+        st.begin_capture();
+        assert!(st.capture.is_none());
+        assert!(st.stage_status.contains("micrometer"));
+    }
+
+    #[test]
+    fn undo_removes_the_last_sample_from_both_stage_a_curves() {
+        let mut st = stage_a_state();
+        for pos in [0.1, 0.2, 0.3] {
+            capture_at(&mut st, pos, Some(2.0), Some(3.0));
+        }
+        st.curve_spec.undo();
+        st.curve_slit.undo();
+        assert_eq!(st.curve_spec.samples.len(), 2);
+        assert_eq!(st.curve_slit.samples.len(), 2);
+    }
+
+    #[test]
+    fn banking_a_null_point_clears_the_sweep_and_keeps_the_delta() {
+        let mut st = stage_a_state();
+        for pos in [0.10, 0.20, 0.30, 0.40, 0.50] {
+            let spec = 4.0 * (pos - 0.34) * (pos - 0.34) + 2.0;
+            let slit = 3.0 * (pos - 0.28) * (pos - 0.28) + 3.0;
+            capture_at(&mut st, pos, Some(spec), Some(slit));
+        }
+        st.collimator_pos_text = "12.0".into();
+        st.record_null_point();
+        assert_eq!(st.null_points.len(), 1);
+        assert!((st.null_points[0].delta - 0.06).abs() < 1e-6);
+        assert!(st.curve_spec.is_empty(), "sweep should reset for the next setting");
+    }
+
+    #[test]
+    fn banking_without_a_collimator_reading_is_refused() {
+        let mut st = stage_a_state();
+        for pos in [0.10, 0.20, 0.30, 0.40, 0.50] {
+            capture_at(&mut st, pos, Some((pos - 0.3) * (pos - 0.3)), Some((pos - 0.2) * (pos - 0.2)));
+        }
+        st.collimator_pos_text.clear();
+        st.record_null_point();
+        assert!(st.null_points.is_empty());
+        assert!(!st.curve_spec.is_empty(), "a refused bank must not discard the sweep");
+    }
+
+    #[test]
+    fn stage_b_capture_uses_the_selected_metric_and_its_polarity() {
+        let mut st = FocusState::default();
+        st.stage = Stage::Telescope;
+        st.streaming = true;
+        st.capture_frames = 8;
+        st.tele_metric = TeleMetric::LimbEdge;
+        st.retarget_tele_curves();
+
+        for pos in [10.0, 10.5, 11.0, 11.5, 12.0] {
+            st.focuser_pos_text = pos.to_string();
+            st.begin_capture();
+            let mut u = blank_update();
+            u.limb_width = Some(2.0 * (pos - 11.2) * (pos - 11.2) + 1.5);
+            for _ in 0..st.capture_frames {
+                st.accumulate_capture(&None, &None, &u);
+            }
+        }
+        let f = st.curve_tele.fit().expect("Stage B curve should solve");
+        assert!((f.vertex - 11.2).abs() < 1e-6, "vertex {}", f.vertex);
+        assert!(f.curvature > 0.0, "limb width is minimised at focus");
+        assert!(f.trustworthy());
+    }
+
+    #[test]
+    fn switching_stage_b_metric_discards_incomparable_samples() {
+        let mut st = FocusState::default();
+        st.stage = Stage::Telescope;
+        st.streaming = true;
+        st.capture_frames = 4;
+        st.tele_metric = TeleMetric::LimbEdge;
+
+        st.focuser_pos_text = "11.0".into();
+        st.begin_capture();
+        let mut u = blank_update();
+        u.limb_width = Some(3.0);
+        for _ in 0..st.capture_frames {
+            st.accumulate_capture(&None, &None, &u);
+        }
+        assert_eq!(st.curve_tele.samples.len(), 1);
+
+        st.tele_metric = TeleMetric::Structure;
+        st.retarget_tele_curves();
+        assert!(st.curve_tele.is_empty(), "px and contrast are not the same axis");
+        assert!(!st.curve_tele.want_min, "contrast is maximised, not minimised");
     }
 }
