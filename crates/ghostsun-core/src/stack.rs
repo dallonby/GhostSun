@@ -266,6 +266,100 @@ pub fn stack(images: &[Image], flow: bool, verbose: bool) -> Option<StackReport>
     stack_with_reference(images, flow, verbose, None)
 }
 
+/// Combine images that are already on a shared canvas (e.g. multi-line
+/// extractions warped with the same geometry). No disk re-fit or optical
+/// flow — only per-image median gain matching to the reference + robust
+/// sharpness-weighted mean.
+pub fn stack_coregistered(images: &[Image], reference: usize) -> Option<StackReport> {
+    if images.is_empty() {
+        return None;
+    }
+    if images.len() == 1 {
+        return Some(StackReport {
+            image: images[0].clone(),
+            n_used: 1,
+            weights: vec![1.0],
+        });
+    }
+    let w = images[0].w;
+    let h = images[0].h;
+    if images.iter().any(|im| im.w != w || im.h != h) {
+        return None;
+    }
+    let ref_idx = reference.min(images.len() - 1);
+    let refimg = &images[ref_idx];
+
+    // Per-image median gain vs reference over bright pixels.
+    let mut aligned: Vec<Image> = Vec::with_capacity(images.len());
+    let mut energies = Vec::with_capacity(images.len());
+    for (k, img) in images.iter().enumerate() {
+        let mut gimg = img.clone();
+        if k != ref_idx {
+            let mut ratios = Vec::new();
+            let step = 4usize;
+            for y in (0..h).step_by(step) {
+                for x in (0..w).step_by(step) {
+                    let a = refimg.at(x, y) as f64;
+                    let b = img.at(x, y) as f64;
+                    if a > 500.0 && b > 500.0 {
+                        ratios.push(a / b);
+                    }
+                }
+            }
+            if ratios.len() > 50 {
+                ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let g = ratios[ratios.len() / 2].clamp(0.25, 4.0) as f32;
+                for v in gimg.data.iter_mut() {
+                    *v *= g;
+                }
+            }
+        }
+        // HF energy as sharpness proxy (full image, no disk fit required).
+        let blur = crate::mathutil::gaussian_blur_2d(&gimg, 2.0, 2.0);
+        let mut e = 0.0f64;
+        let mut n = 0.0f64;
+        for i in (0..gimg.data.len()).step_by(4) {
+            e += ((gimg.data[i] - blur.data[i]) as f64).powi(2);
+            n += 1.0;
+        }
+        energies.push(e / n.max(1.0));
+        aligned.push(gimg);
+    }
+    let emax = energies.iter().cloned().fold(f64::MIN, f64::max).max(1e-12);
+    let weights: Vec<f64> = energies.iter().map(|e| (e / emax).clamp(0.25, 1.0)).collect();
+
+    let k_scans = aligned.len();
+    let mut out = Image::new(w, h);
+    let mut vals = vec![0.0f64; k_scans];
+    for i in 0..w * h {
+        for (k, a) in aligned.iter().enumerate() {
+            vals[k] = a.data[i] as f64;
+        }
+        let mut sorted = vals.clone();
+        let med = crate::mathutil::median_inplace(&mut sorted);
+        let mut devs: Vec<f64> = vals.iter().map(|v| (v - med).abs()).collect();
+        let mad = crate::mathutil::median_inplace(&mut devs).max(1e-6);
+        let mut acc = 0.0;
+        let mut wsum = 0.0;
+        for k in 0..k_scans {
+            if (vals[k] - med).abs() < 3.0 * 1.4826 * mad + 1e-3 * med.abs() + 1.0 {
+                acc += weights[k] * vals[k];
+                wsum += weights[k];
+            }
+        }
+        out.data[i] = if wsum > 0.0 {
+            (acc / wsum) as f32
+        } else {
+            med as f32
+        };
+    }
+    Some(StackReport {
+        image: out,
+        n_used: k_scans,
+        weights,
+    })
+}
+
 /// Stack with an explicit reference index (None = sharpest scan).
 pub fn stack_with_reference(
     images: &[Image],

@@ -160,6 +160,20 @@ enum Cmd {
         /// tuning overrides, e.g. --tune pca_k=4,w_fit=10
         #[arg(long)]
         tune: Option<String>,
+        /// Spectral dispersion axis on raw SER frames: auto (default),
+        /// horizontal (along width — full-sensor landscape), or vertical
+        /// (along height — transpose so dispersion becomes horizontal).
+        #[arg(long, value_parser = ["auto", "horizontal", "vertical"], default_value = "auto")]
+        dispersion: String,
+        /// Multi-line composite: stack companion absorption lines with the
+        /// primary (shared registration/photometry). Opt-in detail product
+        /// for full-sensor multi-line SERs; default is primary-only.
+        #[arg(long)]
+        composite: bool,
+        /// Force primary line seed at this spectral column (px on oriented
+        /// mean frame). Default: multi-candidate continuous AUTO tracking.
+        #[arg(long)]
+        line_x: Option<f64>,
         /// output name stem
         #[arg(long, default_value = "recon")]
         name: String,
@@ -304,9 +318,15 @@ fn main() {
         Cmd::Recon {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
-            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_gpu, map_iterations, tune, name,
+            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_gpu, map_iterations, tune, dispersion, composite, line_x, name,
         } => {
             std::fs::create_dir_all(&out_dir).unwrap();
+            let force_transpose = match dispersion.as_str() {
+                "auto" => None,
+                "horizontal" => Some(false), // dispersion already along SER width
+                "vertical" => Some(true),    // rotate so height becomes dispersion
+                _ => None,
+            };
             let mut opts = pipeline::ReconOptions {
                 baseline,
                 shift,
@@ -326,6 +346,9 @@ fn main() {
                 temporal_nlm: !no_nlm,
                 use_gpu: !no_gpu,
                 map_iterations,
+                force_transpose,
+                multi_line_composite: composite,
+                line_center_x: line_x,
                 ..Default::default()
             };
             if let Some(t) = &tune {
@@ -340,6 +363,15 @@ fn main() {
                             output::write_png_rgb(&out_dir.join(format!("{name}_color.png")), w, h, &rgb).unwrap();
                             println!("wrote {}/{name}_color.png", out_dir.display());
                         }
+                    }
+                    if let Some(n) = rep.composite_n_lines {
+                        println!(
+                            "multi-line composite: {n} line(s) at offsets {:?} px",
+                            rep.composite_line_offsets_px
+                                .iter()
+                                .map(|o| format!("{o:+.1}"))
+                                .collect::<Vec<_>>()
+                        );
                     }
                     println!("wrote {}/{{{name}.fits,{name}_linear.png,{name}_display.png}}", out_dir.display());
                 }

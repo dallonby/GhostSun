@@ -219,6 +219,76 @@ pub struct RansacResult {
     pub residual_rms: f64,
 }
 
+/// When the fitted circle is much larger than the raw-disk FOV, the limb
+/// arcs were nearly parallel (sun fills / exceeds the slit; few scan frames).
+/// The conic is ill-conditioned and produces a giant empty canvas. Replace
+/// with a FOV-based circular model: diameter from the observed limb box,
+/// sx from scan-width / diameter.
+pub fn regularize_partial_fov(
+    geom: &EllipseGeom,
+    points: &[EdgePoint],
+    disk_w: usize,
+    disk_h: usize,
+) -> EllipseGeom {
+    if points.is_empty() {
+        return *geom;
+    }
+    let (mut xmin, mut xmax, mut ymin, mut ymax) =
+        (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for p in points {
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+    let extent_x = (xmax - xmin).max(1.0);
+    let extent_y = (ymax - ymin).max(1.0);
+    let extent = extent_x.max(extent_y);
+    // Healthy: radius comparable to the limb box (classic Sol'Ex or a correct
+    // sparse full-disk fit after proper orientation). Extreme sx with huge r
+    // still encodes the physical scan scale — only resize the circle to the
+    // observed slit span so the canvas is not 18k px empty.
+    let healthy = geom.radius < 1.8 * extent && geom.sx >= 0.04 && geom.sx <= 6.0;
+    if healthy {
+        return *geom;
+    }
+    // Keep measured sx/shear (JSolEx X/Y ~ 0.07 is physical). Set radius from
+    // the longer limb span so warp samples a full circle covering the data.
+    let diameter = extent_y.max(extent_x / geom.sx.max(1e-6)).max(32.0);
+    // Prefer diameter that makes 2*r*sx ≈ extent_x (scan covers the disk).
+    let diameter = if geom.sx > 1e-6 {
+        let d_from_scan = extent_x / geom.sx;
+        // Blend: trust scan span when sx is tiny (sparse frames).
+        if geom.sx < 0.12 {
+            d_from_scan.max(extent_y)
+        } else {
+            diameter.max(d_from_scan * 0.5)
+        }
+    } else {
+        diameter
+    };
+    let radius = 0.5 * diameter;
+    let sx = geom.sx.clamp(0.02, 6.0);
+    let shear = geom.shear.clamp(-0.5, 0.5);
+    let xc = geom.xc;
+    let yc = geom.yc;
+    let r2 = radius * radius;
+    let an = 1.0 / (r2 * sx * sx);
+    let bn = -2.0 * shear / (r2 * sx);
+    let cn = (shear * shear + 1.0) / r2;
+    let _ = (disk_w, disk_h);
+    EllipseGeom {
+        xc,
+        yc,
+        an,
+        bn,
+        cn,
+        sx,
+        shear,
+        radius,
+    }
+}
+
 /// RANSAC + IRLS ellipse fit.
 ///
 /// Samples are STRATIFIED over y so the 8 points span the disk instead of
@@ -250,12 +320,16 @@ pub fn fit_robust(points: &[EdgePoint], seed: u64) -> Option<RansacResult> {
     order.sort_by(|&a, &b| points[a].y.partial_cmp(&points[b].y).unwrap());
     let band = (n / 8).max(1);
 
+    // Partial-FOV full-sensor scans (sun larger than the slit, few scan
+    // frames) produce nearly-parallel limb arcs: small sx and large radius.
+    // Classic Sol'Ex fills the frame more completely (sx ≳ 0.3). Both are
+    // physical; only reject clearly degenerate conics.
     let plausible = |g: &EllipseGeom| -> bool {
-        g.radius > 0.10 * extent
-            && g.radius < 1.5 * extent
-            && g.sx > 0.15
+        g.radius > 0.08 * extent
+            && g.radius < 25.0 * extent
+            && g.sx > 0.02
             && g.sx < 8.0
-            && g.shear.abs() < 0.35
+            && g.shear.abs() < 0.5
     };
 
     let mut best_inliers: Vec<usize> = Vec::new();

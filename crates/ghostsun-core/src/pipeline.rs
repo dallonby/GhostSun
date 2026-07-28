@@ -14,6 +14,7 @@ use crate::metrics::DiskFit;
 use crate::profile::{self, ProfileTune};
 use crate::quality;
 use crate::ser::SerReader;
+use crate::stack;
 use crate::warp::{warp_baseline, warp_single, WarpOutput, WarpParams};
 use std::path::Path;
 
@@ -118,6 +119,17 @@ pub struct ReconOptions {
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
     pub map_iterations: usize,
     pub tune: TuneParams,
+    /// `None` = auto-detect from absorption contrast; `Some(true)` force
+    /// transpose; `Some(false)` keep SER orientation (dispersion = width).
+    pub force_transpose: Option<bool>,
+    /// Opt-in multi-line composite: extract companion absorption lines on
+    /// full-sensor / multi-line SERs, share primary registration + photometry,
+    /// co-register and sharpness-weighted stack into the main disk product.
+    /// Primary-only path is unchanged when false or when no companions exist.
+    pub multi_line_composite: bool,
+    /// Optional forced spectral column (px on the oriented mean frame) for
+    /// the primary line. `None` = multi-candidate continuous AUTO tracking.
+    pub line_center_x: Option<f64>,
     pub verbose: bool,
     /// optional log/progress sink (UI); when set, vlog! goes here too
     pub progress: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
@@ -148,6 +160,9 @@ impl Default for ReconOptions {
             use_gpu: true,
             map_iterations: 0,
             tune: TuneParams::default(),
+            force_transpose: None,
+            multi_line_composite: false,
+            line_center_x: None,
             verbose: true,
             progress: None,
         }
@@ -184,6 +199,12 @@ pub struct ReconReport {
     pub burst_flags: Vec<bool>,
     /// per-column photometric gain divided out
     pub column_gain: Vec<f64>,
+    /// Multi-line composite: number of spectral lines stacked (primary +
+    /// companions). `None` when the option was off or no companions found.
+    pub composite_n_lines: Option<usize>,
+    /// Spectral offsets (px) of composite lines relative to the primary core,
+    /// primary first at 0.0 when composite ran.
+    pub composite_line_offsets_px: Vec<f64>,
 }
 
 macro_rules! vlog {
@@ -213,11 +234,9 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let hdr = &reader.header;
     vlog!(opts, "SER: {}x{} x{} frames, {} bit", hdr.width, hdr.height, hdr.frame_count, hdr.bit_depth);
 
-    // orientation: slit must be vertical (dispersion horizontal)
-    let transpose = hdr.width > hdr.height;
-
     // ---- mean image over frames with signal (rayon: this was the single
     // largest stage at ~11 s on a 9100-frame scan when serial) ----
+    // Built in *native* SER orientation first so we can choose dispersion axis.
     use rayon::prelude::*;
     let n = hdr.frame_count;
     let frame_means: Vec<f64> = (0..n)
@@ -243,8 +262,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let good_thresh = p90 * 0.4;
     let good: Vec<usize> = (0..n).filter(|&t| frame_means[t] > good_thresh).collect();
     let use_frames: &[usize] = if good.len() > 50 { &good } else { &(0..n).collect::<Vec<_>>() };
-    let mean_img = {
-        // parallel partial sums over frame chunks, then reduce
+    let mean_native = {
         let partials: Vec<(Vec<f64>, usize, usize)> = use_frames
             .par_chunks(256)
             .map(|chunk| {
@@ -252,10 +270,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 let mut w = 0;
                 let mut h = 0;
                 for &t in chunk {
-                    let mut f = reader.frame(t);
-                    if transpose {
-                        f = f.transpose();
-                    }
+                    let f = reader.frame(t);
                     w = f.w;
                     h = f.h;
                     let a = acc.get_or_insert_with(|| vec![0.0; w * h]);
@@ -287,19 +302,59 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     vlog!(opts, "mean image from {}/{} frames", use_frames.len(), n);
     stage!("mean image");
 
+    // orientation: slit vertical, dispersion horizontal
+    let (transpose, row_c, col_c) = match opts.force_transpose {
+        Some(t) => (t, 0.0, 0.0),
+        None => linefit::should_transpose_for_dispersion(&mean_native),
+    };
+    let mean_img = if transpose {
+        mean_native.transpose()
+    } else {
+        mean_native
+    };
+    vlog!(
+        opts,
+        "orientation: {} (max-line-depth native {:.3} / transposed {:.3}; SER {}x{})",
+        if transpose {
+            "transposed → dispersion along width"
+        } else {
+            "native → dispersion along width"
+        },
+        row_c,
+        col_c,
+        hdr.width,
+        hdr.height
+    );
+
     // ---- spectral line geometry ----
+    let (x_lit0, x_lit1) = linefit::detect_spectrum_cols(&mean_img);
+    vlog!(
+        opts,
+        "lit spectral band: columns {}..{} (of {})",
+        x_lit0,
+        x_lit1,
+        mean_img.w
+    );
     let geom = if opts.baseline {
         linefit::fit_line_geometry_baseline(&mean_img)
+    } else if let Some(seed) = opts.line_center_x {
+        vlog!(opts, "line seed forced at {:.1} px", seed);
+        linefit::fit_line_geometry_at(&mean_img, 2, seed)
     } else {
         linefit::fit_line_geometry(&mean_img, 2)
     }
     .ok_or("line geometry fit failed")?;
+    let primary_mid = {
+        let ymid = (geom.y1 + geom.y2) as f64 * 0.5;
+        polyval(&geom.coeffs, ymid)
+    };
     vlog!(
         opts,
-        "line poly: {:?} (rms {:.3} px, {} rows)",
+        "line poly: {:?} (rms {:.3} px, {} rows, primary ~{:.1} px)",
         geom.coeffs.iter().map(|c| format!("{c:.4e}")).collect::<Vec<_>>(),
         geom.rms,
-        geom.n_rows_used
+        geom.n_rows_used,
+        primary_mid
     );
 
     // ---- extraction (F1 profile model or B-spline / baseline) ----
@@ -656,13 +711,46 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         limb::detect_limb_points(&disk)
     };
     vlog!(opts, "limb points: {}", pts.len());
-    let fit = if opts.baseline {
+    let aspect = disk.w.max(1) as f64 / disk.h.max(1) as f64;
+    // Sparse full-disk scans can hit ~0.07 (JSolEx reports X/Y≈0.07 on 338-frame
+    // 16_00_03.ser). Only reject truly absurd shapes.
+    if !(0.05..=20.0).contains(&aspect) {
+        return Err(format!(
+            "raw disk is extremely elongated ({}×{}, aspect {:.2}). \
+             Usually wrong SER orientation (full-sensor multi-line needs auto-detect or \
+             --dispersion horizontal|vertical) or an incomplete scan (too few frames).",
+            disk.w, disk.h, aspect
+        ));
+    }
+    let mut fit = if opts.baseline {
         let conic = ellipse::fit_direct(&pts).ok_or("baseline ellipse fit failed")?;
         let geom2 = conic.geometry().ok_or("baseline conic not an ellipse")?;
         ellipse::RansacResult { conic, geom: geom2, inliers: pts.len(), total: pts.len(), residual_rms: 0.0 }
     } else {
-        ellipse::fit_robust(&pts, 1234).ok_or("robust ellipse fit failed")?
+        ellipse::fit_robust(&pts, 1234).ok_or_else(|| {
+            format!(
+                "robust ellipse fit failed ({} limb points on {}×{} disk). \
+                 Check orientation (--dispersion), line selection, and that the scan covers a circular solar disk.",
+                pts.len(),
+                disk.w,
+                disk.h
+            )
+        })?
     };
+    let geom_before = fit.geom;
+    fit.geom = ellipse::regularize_partial_fov(&fit.geom, &pts, disk.w, disk.h);
+    if (fit.geom.radius - geom_before.radius).abs() > 1.0
+        || (fit.geom.sx - geom_before.sx).abs() > 0.01
+    {
+        vlog!(
+            opts,
+            "ellipse regularized (partial-FOV / sparse scan): sx {:.4}→{:.4} r {:.1}→{:.1}",
+            geom_before.sx,
+            fit.geom.sx,
+            geom_before.radius,
+            fit.geom.radius
+        );
+    }
     vlog!(
         opts,
         "ellipse: center ({:.1},{:.1}) sx {:.4} shear {:.5} radius {:.1} (inliers {}/{}, rms {:.2})",
@@ -717,6 +805,166 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     });
     vlog!(opts, "output: {}x{}", output.image.w, output.image.h);
     stage!("limb+ellipse+warp");
+
+    // ---- multi-line composite (opt-in detail product) ----
+    // Primary science path above is unchanged. When enabled and companions
+    // exist, extract each neighbour line with the same shared corrections
+    // (transparency, jitter, x-reg), warp with primary geometry, and
+    // sharpness-weighted stack onto the primary (reference index 0).
+    // Optical flow is off: formation-height differences would hallucinate
+    // structure if we tried to warp features line-to-line.
+    let mut composite_n_lines: Option<usize> = None;
+    let mut composite_line_offsets_px: Vec<f64> = Vec::new();
+    if opts.multi_line_composite && !opts.baseline {
+        let primary_cx = {
+            let ymid = (geom.y1 + geom.y2) as f64 * 0.5;
+            polyval(&geom.coeffs, ymid)
+        };
+        // Continuous multi-candidate seeds (same engine as primary AUTO), not
+        // just residual dips on a de-smiled profile — more reliable on
+        // full-sensor multi-line frames.
+        let companion_seeds =
+            linefit::detect_companion_seeds(&mean_img, primary_cx, 0.04, 14.0, 5);
+        if companion_seeds.is_empty() {
+            vlog!(
+                opts,
+                "multi-line composite: no companion lines (primary at {:.1} px)",
+                primary_cx
+            );
+        } else {
+            let flex_off: Option<Vec<f64>> = if flex.iter().any(|f| f.abs() > 0.0) {
+                Some(flex.clone())
+            } else {
+                None
+            };
+            let mut warped_lines: Vec<Image> = vec![output.image.clone()];
+            composite_line_offsets_px.push(0.0);
+            let mut used_mids: Vec<f64> = vec![primary_cx];
+            for &seed_x in &companion_seeds {
+                let offset = seed_x - primary_cx;
+                // Track companion with primary smile slope + spectral offset.
+                let seed = |y: f64| polyval(&geom.coeffs, y) + offset;
+                let Some(cgeom) = linefit::fit_line_geometry_seeded(&mean_img, 2, 10, &seed)
+                    .or_else(|| linefit::fit_line_geometry_at(&mean_img, 2, seed_x))
+                else {
+                    vlog!(opts, "multi-line: seed {:.1} px — track failed", seed_x);
+                    continue;
+                };
+                let c_mid = {
+                    let ymid = (cgeom.y1 + cgeom.y2) as f64 * 0.5;
+                    polyval(&cgeom.coeffs, ymid)
+                };
+                // Reject tracks that wandered away from the seed or collapsed
+                // onto another already-used line.
+                if (c_mid - seed_x).abs() > 50.0 {
+                    vlog!(
+                        opts,
+                        "multi-line: seed {:.1} wandered to {:.1}, skip",
+                        seed_x,
+                        c_mid
+                    );
+                    continue;
+                }
+                if cgeom.n_rows_used < 200 || cgeom.rms > 2.5 {
+                    vlog!(
+                        opts,
+                        "multi-line: seed {:.1} weak track ({} rows, rms {:.2}), skip",
+                        seed_x,
+                        cgeom.n_rows_used,
+                        cgeom.rms
+                    );
+                    continue;
+                }
+                if used_mids.iter().any(|m| (c_mid - m).abs() < 20.0) {
+                    vlog!(opts, "multi-line: seed {:.1} duplicate of existing line, skip", seed_x);
+                    continue;
+                }
+                let mut cdisk = reconstruct_disk(
+                    &reader,
+                    &cgeom,
+                    &ExtractOptions {
+                        shift: opts.shift,
+                        transpose_input: transpose,
+                        kernel: SpectralKernel::Point,
+                        frame_offsets: flex_off.clone(),
+                    },
+                );
+                if opts.transparency_correction {
+                    flatfield::apply_column_gains(&mut cdisk, &column_gain);
+                }
+                if jitter_applied.iter().any(|v| v.abs() > 1e-6) {
+                    cdisk = jitter::apply_shifts(&cdisk, &jitter_applied);
+                }
+                if xreg_applied.iter().any(|v| v.abs() > 1e-6) {
+                    cdisk = jitter::apply_x_offsets(&cdisk, &xreg_applied);
+                }
+                if opts.transversalium_correction {
+                    flatfield::correct_transversalium(&mut cdisk, opts.tune.transv_deadband);
+                }
+                if opts.temporal_nlm {
+                    let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
+                    if let Some((sigma, h2, thresh)) =
+                        quality::nlm_params(&cdisk, opts.tune.nlm_h)
+                    {
+                        cdisk = if opts.use_gpu {
+                            crate::gpu::temporal_nlm(&cdisk, radius, h2, sigma, thresh)
+                                .unwrap_or_else(|| {
+                                    quality::temporal_nlm(&cdisk, radius, opts.tune.nlm_h)
+                                })
+                        } else {
+                            quality::temporal_nlm(&cdisk, radius, opts.tune.nlm_h)
+                        };
+                    }
+                }
+                let cwarp = if opts.use_gpu {
+                    crate::gpu::warp_single(&cdisk, &fit.geom, &wp)
+                        .unwrap_or_else(|| warp_single(&cdisk, &fit.geom, &wp))
+                } else {
+                    warp_single(&cdisk, &fit.geom, &wp)
+                };
+                warped_lines.push(cwarp.image);
+                used_mids.push(c_mid);
+                composite_line_offsets_px.push(c_mid - primary_cx);
+                vlog!(
+                    opts,
+                    "multi-line: companion at {:+.1} px (seed {:.1}, smile rms {:.3}, {} rows)",
+                    c_mid - primary_cx,
+                    seed_x,
+                    cgeom.rms,
+                    cgeom.n_rows_used
+                );
+            }
+            // Already co-registered via shared warp geometry — do not re-fit disks.
+            match stack::stack_coregistered(&warped_lines, 0) {
+                Some(sr) if sr.n_used > 1 => {
+                    output.image = sr.image;
+                    composite_n_lines = Some(sr.n_used);
+                    vlog!(
+                        opts,
+                        "multi-line composite: stacked {} line(s) at offsets {:?} px (weights {:?})",
+                        sr.n_used,
+                        composite_line_offsets_px
+                            .iter()
+                            .map(|o| format!("{o:+.1}"))
+                            .collect::<Vec<_>>(),
+                        sr.weights
+                            .iter()
+                            .map(|w| format!("{w:.2}"))
+                            .collect::<Vec<_>>()
+                    );
+                    stage!("multi-line composite");
+                }
+                _ => {
+                    if warped_lines.len() == 1 {
+                        vlog!(opts, "multi-line composite: no valid companions, keeping primary");
+                    } else {
+                        vlog!(opts, "multi-line composite: stack failed, keeping primary");
+                    }
+                    composite_line_offsets_px.clear();
+                }
+            }
+        }
+    }
 
     // Wing-difference Dopplergram: intensities at +-wing_offset from the
     // (flexure-corrected) line center; the normalized difference cancels
@@ -830,6 +1078,8 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         xreg_applied,
         burst_flags,
         column_gain,
+        composite_n_lines,
+        composite_line_offsets_px,
     })
 }
 
@@ -898,8 +1148,21 @@ fn correct_transversalium_baseline(disk: &mut Image) {
 pub fn mean_spectrum(ser_path: &Path) -> Result<(Vec<i64>, Vec<f64>), String> {
     let reader = SerReader::open(ser_path).map_err(|e| format!("SER open: {e}"))?;
     let hdr = &reader.header;
-    let transpose = hdr.width > hdr.height;
     let n = hdr.frame_count;
+    let sample_n = n.min(32).max(1);
+    let mut probe_acc = vec![0.0f64; hdr.width * hdr.height];
+    for t in 0..sample_n {
+        let f = reader.frame(t);
+        for (i, &v) in f.data.iter().enumerate() {
+            probe_acc[i] += v as f64;
+        }
+    }
+    let mut probe = Image::new(hdr.width, hdr.height);
+    let pc = sample_n as f64;
+    for (i, v) in probe_acc.iter().enumerate() {
+        probe.data[i] = (v / pc) as f32;
+    }
+    let (transpose, _, _) = linefit::should_transpose_for_dispersion(&probe);
     // mean image over a subsample of frames with signal
     let step = (n / 600).max(1);
     let mut acc: Option<Vec<f64>> = None;
