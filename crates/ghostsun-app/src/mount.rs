@@ -32,18 +32,38 @@ const SAMPLE_TIMEOUT: Duration = Duration::from_secs(8);
 const SLEW_TIMEOUT: Duration = Duration::from_secs(180);
 const AUTO_CENTER_TIMEOUT: Duration = Duration::from_secs(600);
 
-const RATES: [(&str, u8); 10] = [
-    ("0.25x", 0),
-    ("0.5x", 1),
-    ("1x", 2),
-    ("2x", 3),
-    ("4x", 4),
-    ("8x", 5),
-    ("20x", 6),
-    ("60x", 7),
-    ("720x", 8),
-    ("1440x", 9),
+/// Rate the auto-center spiral always uses (60x sidereal); see the note above.
+const AUTO_CENTER_RATE: u8 = 7;
+/// A return-to-mark beyond this separation is almost certainly a stale mark
+/// rather than a jog to undo, so it asks before moving the telescope.
+const RETURN_CONFIRM_DEG: f64 = 5.0;
+
+/// (label, ZWO `:R<n>#` code, multiple of the sidereal rate).
+const RATES: [(&str, u8, f64); 10] = [
+    ("0.25x", 0, 0.25),
+    ("0.5x", 1, 0.5),
+    ("1x", 2, 1.0),
+    ("2x", 3, 2.0),
+    ("4x", 4, 4.0),
+    ("8x", 5, 8.0),
+    ("20x", 6, 20.0),
+    ("60x", 7, 60.0),
+    ("720x", 8, 720.0),
+    ("1440x", 9, 1440.0),
 ];
+
+/// Sidereal rate in arcseconds of sky per second of time.
+const SIDEREAL_ARCSEC_PER_SEC: f64 = 15.041;
+
+/// Approximate sky distance a timed jog covers, in arcminutes.
+///
+/// Nominal: the mount's actual rate is firmware-dependent and the declination
+/// axis need not match right ascension exactly. It is shown to answer the
+/// question the feature exists for — "will this cross the disc?", the Sun being
+/// about 32 arcminutes — not as a calibration.
+fn jog_arcmin(rate_multiple: f64, seconds: f64) -> f64 {
+    rate_multiple * SIDEREAL_ARCSEC_PER_SEC * seconds / 60.0
+}
 
 #[derive(Clone)]
 struct PortInfo {
@@ -64,6 +84,33 @@ enum Direction {
 enum ConfirmedMotion {
     GoHome,
     Park,
+}
+
+/// A recorded pointing to return to.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    ra_hours: f64,
+    dec_deg: f64,
+}
+
+/// A timed jog in flight. The worker owns the deadline and reports completion,
+/// so this only carries what the UI needs to show progress.
+#[derive(Clone, Copy, Debug)]
+struct TimedJog {
+    direction: Direction,
+    started: Instant,
+    duration: Duration,
+}
+
+impl Direction {
+    fn label(self) -> &'static str {
+        match self {
+            Direction::North => "N",
+            Direction::South => "S",
+            Direction::East => "E",
+            Direction::West => "W",
+        }
+    }
 }
 
 impl Direction {
@@ -111,8 +158,22 @@ enum WorkerCommand {
     Nudge {
         direction: Direction,
         duration_ms: u64,
+        /// ZWO rate index (`:R<n>#`). The auto-center spiral always uses 7
+        /// (60×); a user timed jog uses whatever the panel has selected.
+        rate: u8,
     },
     SlewSun {
+        ra_hours: f64,
+        dec_deg: f64,
+    },
+    /// Read the current pointing so it can be returned to later.
+    ///
+    /// Deliberately a round-trip to the mount rather than a copy of the polled
+    /// snapshot: the snapshot can be up to `POLL_INTERVAL` stale, and a mark
+    /// taken from stale data is a mark that returns to the wrong place.
+    MarkPosition,
+    /// GoTo arbitrary coordinates, leaving the tracking rate untouched.
+    SlewTo {
         ra_hours: f64,
         dec_deg: f64,
     },
@@ -125,6 +186,7 @@ enum WorkerMessage {
     Snapshot(MountSnapshot),
     Notice(String),
     NudgeDone,
+    Marked { ra_hours: f64, dec_deg: f64 },
     Error(String),
 }
 
@@ -225,6 +287,30 @@ pub struct MountState {
     snapshot: MountSnapshot,
     rate_index: usize,
     active_direction: Option<Direction>,
+    /// Pointing recorded as the origin for timed jogs, in equatorial coords so
+    /// it survives tracking: the mount follows the sky, so a marked RA/Dec
+    /// stays on the same solar feature while a marked alt/az would not.
+    mark: Option<Mark>,
+    /// A timed jog awaiting its `NudgeDone`.
+    timed_jog: Option<TimedJog>,
+    jog_seconds: f64,
+    jog_direction: Direction,
+    /// Rate for timed jogs, kept separate from the hold-to-jog rate: holding a
+    /// button wants something slow and controllable, while crossing the disc in
+    /// a few seconds wants something fast.
+    jog_rate_index: usize,
+    confirm_return: bool,
+    /// Direction whose jog button the current press started on.
+    ///
+    /// egui cannot be asked "is this button still held": a plain `Button`
+    /// senses clicks only, so `Response::is_pointer_button_down_on()` is backed
+    /// by `potential_click_id`, which egui clears as soon as the press outlives
+    /// `max_click_duration` (0.8 s, `interaction.rs`). The press is still
+    /// physically down, but the button reports released — and the jog stopped
+    /// after about a second, mid-slew. Latching the direction ourselves and
+    /// releasing it on the actual pointer-up decouples "held" from egui's
+    /// click/drag bookkeeping.
+    jog_latch: Option<Direction>,
     confirm_motion: Option<ConfirmedMotion>,
     confirm_sun: bool,
     confirm_auto_center: bool,
@@ -276,6 +362,14 @@ impl Default for MountState {
             snapshot: MountSnapshot::default(),
             rate_index: 4,
             active_direction: None,
+            mark: None,
+            timed_jog: None,
+            jog_seconds: 2.0,
+            jog_direction: Direction::North,
+            // 60x sidereal crosses the solar disc in roughly two seconds.
+            jog_rate_index: 7,
+            confirm_return: false,
+            jog_latch: None,
             confirm_motion: None,
             confirm_sun: false,
             confirm_auto_center: false,
@@ -517,6 +611,7 @@ impl MountState {
                     self.connecting = false;
                     self.connected_port = None;
                     self.active_direction = None;
+                    self.jog_latch = None;
                     self.poll_inflight = false;
                     self.status = reason;
                 }
@@ -525,7 +620,24 @@ impl MountState {
                     self.poll_inflight = false;
                 }
                 WorkerMessage::Notice(notice) => self.status = notice,
-                WorkerMessage::NudgeDone => self.auto_center_nudge_done(),
+                WorkerMessage::NudgeDone => {
+                    // The two cannot overlap -- a timed jog is refused while
+                    // auto-center runs -- but route explicitly rather than
+                    // relying on that invariant holding forever.
+                    if self.timed_jog.take().is_some() {
+                        self.status = "Timed jog complete".into();
+                    } else {
+                        self.auto_center_nudge_done();
+                    }
+                }
+                WorkerMessage::Marked { ra_hours, dec_deg } => {
+                    self.mark = Some(Mark { ra_hours, dec_deg });
+                    self.status = format!(
+                        "Marked {} {}",
+                        format_ra(ra_hours),
+                        format_dec(dec_deg)
+                    );
+                }
                 WorkerMessage::Error(error) => {
                     self.cancel_auto_center(focus, "Sun auto-center stopped by mount error");
                     self.connecting = false;
@@ -1071,7 +1183,13 @@ impl MountState {
         ui.add_space(20.0);
         let enabled = self.connected;
         let jog_enabled = enabled && self.auto_center.is_none();
-        let mut held = None;
+        // Seed from the latch so a held button survives egui dropping its
+        // click interaction after 0.8 s; the buttons below only ever re-assert
+        // it. Released at the bottom of this block on the real pointer-up.
+        let mut held = self.jog_latch;
+        // Losing window focus is treated as a release: a mouse-up delivered to
+        // another application would otherwise leave the mount slewing.
+        let pointer_held = ui.input(|i| i.pointer.primary_down() && i.focused);
 
         // D-pad geometry: N/S share the same horizontal centre as STOP.
         // Zero egui item_spacing so only our `gap` separates W–STOP–E.
@@ -1170,7 +1288,7 @@ impl MountState {
                         .selected_text(RATES[self.rate_index].0)
                         .width(100.0)
                         .show_ui(ui, |ui| {
-                            for (index, (label, _)) in RATES.iter().enumerate() {
+                            for (index, (label, _, _)) in RATES.iter().enumerate() {
                                 ui.selectable_value(&mut self.rate_index, index, *label);
                             }
                         });
@@ -1188,7 +1306,13 @@ impl MountState {
                 );
             });
         }
-        self.update_held_direction(held);
+        if !pointer_held {
+            held = None;
+        }
+        self.jog_latch = held;
+        self.update_held_direction(if jog_enabled { held } else { None });
+
+        self.timed_jog_ui(ui);
 
         ui.add_space(14.0);
         let tracking_on = self.snapshot.tracking.as_deref() == Some("On");
@@ -1533,6 +1657,289 @@ impl MountState {
     fn stop_motion(&mut self) {
         let _ = self.tx.send(WorkerCommand::Stop);
         self.active_direction = None;
+        self.jog_latch = None;
+        self.timed_jog = None;
+    }
+
+    // -- timed jog / return to mark ----------------------------------------
+
+    /// Run one jog of a fixed duration at the panel's selected rate.
+    ///
+    /// The origin is marked first when nothing is marked yet, so "jog, look,
+    /// come back" works without the user having to remember a setup step. The
+    /// worker processes commands in order and `MarkPosition` is a synchronous
+    /// round-trip, so the mark is always read before the mount starts moving.
+    fn start_timed_jog(&mut self) {
+        if !self.connected {
+            self.status = "Connect the mount first".into();
+            return;
+        }
+        if self.auto_center.is_some() {
+            self.status = "Sun auto-center is running; stop it before jogging".into();
+            return;
+        }
+        if self.timed_jog.is_some() {
+            return;
+        }
+        let seconds = self.jog_seconds.clamp(0.1, 120.0);
+        let duration = Duration::from_millis((seconds * 1000.0).round() as u64);
+        if self.mark.is_none() {
+            let _ = self.tx.send(WorkerCommand::MarkPosition);
+        }
+        let _ = self.tx.send(WorkerCommand::Nudge {
+            direction: self.jog_direction,
+            duration_ms: duration.as_millis() as u64,
+            rate: RATES[self.jog_rate_index].1,
+        });
+        self.timed_jog = Some(TimedJog {
+            direction: self.jog_direction,
+            started: Instant::now(),
+            duration,
+        });
+        self.status = format!(
+            "Jogging {} for {seconds:.1} s at {}",
+            self.jog_direction.label(),
+            RATES[self.jog_rate_index].0
+        );
+    }
+
+    fn cancel_timed_jog(&mut self) {
+        self.timed_jog = None;
+        self.stop_motion();
+        self.status = "Timed jog stopped".into();
+    }
+
+    fn mark_here(&mut self) {
+        if !self.connected {
+            self.status = "Connect the mount first".into();
+            return;
+        }
+        let _ = self.tx.send(WorkerCommand::MarkPosition);
+    }
+
+    /// Separation between the mark and where the mount currently reports being.
+    /// `None` when either is unknown.
+    fn return_separation_deg(&self) -> Option<f64> {
+        let mark = self.mark?;
+        let ra = parse_ra_hours(self.snapshot.ra.as_deref()?)?;
+        let dec = parse_dec_deg(self.snapshot.dec.as_deref()?)?;
+        Some(angular_separation_deg(
+            mark.ra_hours,
+            mark.dec_deg,
+            ra,
+            dec,
+        ))
+    }
+
+    fn return_to_mark(&mut self, confirmed: bool) {
+        let Some(mark) = self.mark else {
+            self.status = "Nothing marked yet".into();
+            return;
+        };
+        if !self.connected {
+            self.status = "Connect the mount first".into();
+            return;
+        }
+        // A GoTo moves at slew speed. Undoing a jog is arcminutes; anything
+        // larger means the mark is stale, and that is worth a question before
+        // the telescope crosses the sky on a single click.
+        if !confirmed {
+            if let Some(sep) = self.return_separation_deg() {
+                if sep > RETURN_CONFIRM_DEG {
+                    self.confirm_return = true;
+                    self.status =
+                        format!("Marked position is {sep:.1}° away — confirm before slewing");
+                    return;
+                }
+            }
+        }
+        self.confirm_return = false;
+        self.timed_jog = None;
+        let _ = self.tx.send(WorkerCommand::SlewTo {
+            ra_hours: mark.ra_hours,
+            dec_deg: mark.dec_deg,
+        });
+    }
+
+    fn timed_jog_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Timed jog").strong());
+        ui.label(
+            egui::RichText::new(
+                "Moves a fixed distance per click at the jog rate above — repeatable, \
+                 unlike holding a button.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+
+        let busy = self.timed_jog.is_some();
+        let enabled = self.connected && self.auto_center.is_none() && !busy;
+
+        ui.horizontal(|ui| {
+            ui.label("direction:");
+            for d in [
+                Direction::North,
+                Direction::South,
+                Direction::East,
+                Direction::West,
+            ] {
+                ui.add_enabled_ui(enabled, |ui| {
+                    ui.selectable_value(&mut self.jog_direction, d, d.label());
+                });
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("duration");
+            ui.add_enabled(
+                enabled,
+                egui::DragValue::new(&mut self.jog_seconds)
+                    .range(0.1..=120.0)
+                    .speed(0.1)
+                    .suffix(" s")
+                    .fixed_decimals(1),
+            );
+            ui.add_space(8.0);
+            ui.label("speed");
+            ui.add_enabled_ui(enabled, |ui| {
+                egui::ComboBox::from_id_salt("timed_jog_rate")
+                    .selected_text(RATES[self.jog_rate_index].0)
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for (index, (label, _, _)) in RATES.iter().enumerate() {
+                            ui.selectable_value(&mut self.jog_rate_index, index, *label);
+                        }
+                    });
+            });
+        });
+
+        // The distance is what makes a duration meaningful; the solar diameter
+        // is the reference the user is actually working against.
+        let arcmin = jog_arcmin(RATES[self.jog_rate_index].2, self.jog_seconds);
+        let span = if arcmin >= 60.0 {
+            format!("{:.2}°", arcmin / 60.0)
+        } else {
+            format!("{arcmin:.1}′")
+        };
+        ui.label(
+            egui::RichText::new(format!("≈ {span} of sky  ·  solar diameter is ~32′"))
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(4.0);
+        match self.timed_jog {
+            Some(jog) => {
+                let elapsed = jog.started.elapsed().as_secs_f32();
+                let total = jog.duration.as_secs_f32().max(0.001);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::ProgressBar::new((elapsed / total).clamp(0.0, 1.0))
+                            .desired_width(150.0)
+                            .text(format!("{} {elapsed:.1}/{total:.1} s", jog.direction.label())),
+                    );
+                    if ui.button("stop").clicked() {
+                        self.cancel_timed_jog();
+                    }
+                });
+            }
+            None => {
+                let label = format!(
+                    "▶ jog {} for {:.1} s",
+                    self.jog_direction.label(),
+                    self.jog_seconds
+                );
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                    self.start_timed_jog();
+                }
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Return").strong());
+        match self.mark {
+            Some(mark) => {
+                let sep = self
+                    .return_separation_deg()
+                    .map(|s| {
+                        if s < 1.0 {
+                            format!("{:.1}′ away", s * 60.0)
+                        } else {
+                            format!("{s:.2}° away")
+                        }
+                    })
+                    .unwrap_or_else(|| "separation unknown".into());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "marked {} {}  ·  {sep}",
+                        format_ra(mark.ra_hours),
+                        format_dec(mark.dec_deg)
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("nothing marked — the first timed jog marks the origin")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.connected, egui::Button::new("⌖ mark here"))
+                .clicked()
+            {
+                self.mark_here();
+            }
+            if ui
+                .add_enabled(
+                    self.connected && self.mark.is_some() && self.auto_center.is_none(),
+                    egui::Button::new("⟲ return to mark"),
+                )
+                .clicked()
+            {
+                self.return_to_mark(false);
+            }
+            if self.mark.is_some() && ui.button("clear").clicked() {
+                self.mark = None;
+                self.confirm_return = false;
+            }
+        });
+        ui.label(
+            egui::RichText::new("Return is a GoTo — the mount slews at full speed.")
+                .small()
+                .weak(),
+        );
+
+        if self.confirm_return {
+            let sep = self
+                .return_separation_deg()
+                .map(|s| format!("{s:.1}°"))
+                .unwrap_or_else(|| "an unknown distance".into());
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "DANGER: the marked position is {sep} away. Confirm a solar filter is \
+                     fitted and the slew path is clear."
+                ))
+                .small()
+                .color(egui::Color32::from_rgb(255, 120, 90)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Confirm slew").clicked() {
+                    self.return_to_mark(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_return = false;
+                }
+            });
+        }
     }
 
     fn auto_center_progress_label(&self) -> Option<String> {
@@ -1643,6 +2050,7 @@ impl MountState {
             let _ = self.tx.send(WorkerCommand::Nudge {
                 direction,
                 duration_ms,
+                rate: AUTO_CENTER_RATE,
             });
         } else {
             state.phase = AutoCenterPhase::Moving {
@@ -1850,6 +2258,7 @@ impl MountState {
                         let _ = self.tx.send(WorkerCommand::Nudge {
                             direction,
                             duration_ms,
+                            rate: AUTO_CENTER_RATE,
                         });
                     } else {
                         let seq = focus.sun_signal_sample().map(|(s, _)| s).unwrap_or(0);
@@ -2244,14 +2653,53 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                     }
                 }
             }
+            Ok(WorkerCommand::MarkPosition) => {
+                let result = match port.as_deref_mut() {
+                    Some(opened) => query(opened, ":GR#").and_then(|ra| {
+                        let dec = query(opened, ":GD#")?;
+                        let ra_hours = parse_ra_hours(&ra)
+                            .ok_or_else(|| format!("could not read right ascension: {ra:?}"))?;
+                        let dec_deg = parse_dec_deg(&dec)
+                            .ok_or_else(|| format!("could not read declination: {dec:?}"))?;
+                        Ok((ra_hours, dec_deg))
+                    }),
+                    None => Err("mount is not connected".into()),
+                };
+                match result {
+                    Ok((ra_hours, dec_deg)) => {
+                        let _ = tx.send(WorkerMessage::Marked { ra_hours, dec_deg });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(WorkerMessage::Error(error));
+                    }
+                }
+            }
+            Ok(WorkerCommand::SlewTo { ra_hours, dec_deg }) => {
+                timed_move_deadline = None;
+                let result = match port.as_deref_mut() {
+                    Some(opened) => slew_to_coords(opened, ra_hours, dec_deg, false),
+                    None => Err("mount is not connected".into()),
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = tx.send(WorkerMessage::Notice(
+                            "Returning to the marked position".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = tx.send(WorkerMessage::Error(error));
+                    }
+                }
+            }
             Ok(WorkerCommand::Nudge {
                 direction,
                 duration_ms,
+                rate,
             }) => {
                 timed_move_deadline = None;
                 if let Some(opened) = port.as_deref_mut() {
                     let result = blind(opened, ":Q#")
-                        .and_then(|_| blind(opened, ":R7#"))
+                        .and_then(|_| blind(opened, &format!(":R{}#", rate.min(9))))
                         .and_then(|_| blind(opened, direction.move_command()));
                     match result {
                         Ok(()) => {
@@ -2586,6 +3034,20 @@ fn open_and_probe(name: &str) -> Result<(Box<dyn SerialPort>, String), String> {
 }
 
 fn slew_to_sun(port: &mut dyn SerialPort, ra_hours: f64, dec_deg: f64) -> Result<(), String> {
+    slew_to_coords(port, ra_hours, dec_deg, true)
+}
+
+/// GoTo the given coordinates.
+///
+/// `solar_rate` selects the solar tracking rate before the slew. That is right
+/// when acquiring the Sun, but wrong for a return-to-mark, which must not
+/// silently change a tracking mode the user chose.
+fn slew_to_coords(
+    port: &mut dyn SerialPort,
+    ra_hours: f64,
+    dec_deg: f64,
+    solar_rate: bool,
+) -> Result<(), String> {
     blind(port, ":Q#")?;
     expect_ack(
         port,
@@ -2593,15 +3055,77 @@ fn slew_to_sun(port: &mut dyn SerialPort, ra_hours: f64, dec_deg: f64) -> Result
         "right ascension",
     )?;
     expect_ack(port, &format!(":Sd{}#", format_dec(dec_deg)), "declination")?;
-    // A successful ZWO GoTo enables tracking on arrival. Select the solar
-    // rate first so a separate tracking command cannot race the active slew.
-    blind(port, ":TS#")?;
+    if solar_rate {
+        // A successful ZWO GoTo enables tracking on arrival. Select the solar
+        // rate first so a separate tracking command cannot race the active slew.
+        blind(port, ":TS#")?;
+    }
     let response = transaction(port, ":MS#", false)?;
     match response.chars().next() {
         Some('0') => Ok(()),
         _ if response.starts_with('e') => Err(goto_error(&response)),
         _ => Err(format!("mount rejected GoTo: {response:?}")),
     }
+}
+
+/// Parse an LX200 `:GR#` reply into hours.
+///
+/// The mount answers in either low precision (`HH:MM.T`) or high precision
+/// (`HH:MM:SS`) depending on its own setting, and GhostSun never forces one, so
+/// both must be accepted.
+fn parse_ra_hours(text: &str) -> Option<f64> {
+    let t = text.trim().trim_end_matches('#').trim();
+    let (h, rest) = t.split_once(':')?;
+    let h: f64 = h.trim().parse().ok()?;
+    let (m, s) = match rest.split_once(':') {
+        // HH:MM:SS
+        Some((m, s)) => (m.trim().parse::<f64>().ok()?, s.trim().parse::<f64>().ok()?),
+        // HH:MM.T — the fraction is tenths of a minute, not seconds.
+        None => (rest.trim().parse::<f64>().ok()?, 0.0),
+    };
+    let hours = h.abs() + m / 60.0 + s / 3600.0;
+    hours.is_finite().then_some(hours)
+}
+
+/// Parse an LX200 `:GD#` reply into degrees.
+///
+/// Degrees are separated by `*` (or `°`/`:` on some firmwares) and the reply is
+/// either `sDD*MM` or `sDD*MM:SS`. The sign belongs to the whole value, so it
+/// must be applied after the arcminute and arcsecond terms are added — negating
+/// only the degree field puts a target at −0°30′ on the wrong side of the
+/// equator.
+fn parse_dec_deg(text: &str) -> Option<f64> {
+    let t = text.trim().trim_end_matches('#').trim();
+    let negative = t.starts_with('-');
+    let body = t.trim_start_matches(['+', '-']);
+    let idx = body.find(['*', '°', ':'])?;
+    let (d, rest) = body.split_at(idx);
+    let d: f64 = d.trim().parse().ok()?;
+    let rest = &rest[rest.chars().next()?.len_utf8()..];
+    let (m, s) = match rest.split_once([':', '\'']) {
+        Some((m, s)) => (
+            m.trim().parse::<f64>().ok()?,
+            s.trim().trim_end_matches('"').parse::<f64>().ok().unwrap_or(0.0),
+        ),
+        None => (rest.trim().parse::<f64>().ok()?, 0.0),
+    };
+    let deg = d.abs() + m / 60.0 + s / 3600.0;
+    if !deg.is_finite() {
+        return None;
+    }
+    Some(if negative { -deg } else { deg })
+}
+
+/// Great-circle separation between two equatorial positions, in degrees.
+///
+/// Used to sanity-check a return-to-mark before it moves the telescope: a mark
+/// taken hours ago on a different target would otherwise slew across the sky on
+/// a one-click button.
+fn angular_separation_deg(ra1_hours: f64, dec1_deg: f64, ra2_hours: f64, dec2_deg: f64) -> f64 {
+    let (d1, d2) = (dec1_deg.to_radians(), dec2_deg.to_radians());
+    let dra = ((ra1_hours - ra2_hours) * 15.0).to_radians();
+    let cos_sep = d1.sin() * d2.sin() + d1.cos() * d2.cos() * dra.cos();
+    cos_sep.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 fn goto_error(response: &str) -> String {
@@ -2748,6 +3272,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn jog_distance_matches_the_rate_table() {
+        // 60x sidereal is 15.041 * 60 arcsec/s = ~15.04 arcmin/s, so a two
+        // second jog is about one solar diameter. That relationship is the
+        // whole reason the default is 60x.
+        let two_sec_at_60x = jog_arcmin(60.0, 2.0);
+        assert!(
+            (two_sec_at_60x - 30.08).abs() < 0.1,
+            "{two_sec_at_60x} arcmin"
+        );
+        assert!(two_sec_at_60x > 25.0 && two_sec_at_60x < 40.0, "~1 solar diameter");
+        // Linear in both arguments.
+        assert!((jog_arcmin(20.0, 6.0) - jog_arcmin(60.0, 2.0)).abs() < 1e-9);
+        assert!((jog_arcmin(4.0, 1.0) * 2.0 - jog_arcmin(4.0, 2.0)).abs() < 1e-9);
+        // A slow hold-to-jog rate barely moves: 1x sidereal for a second is
+        // 15 arcsec, a quarter of an arcminute.
+        assert!((jog_arcmin(1.0, 1.0) - 0.2507).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rate_table_multiples_agree_with_their_labels() {
+        for (label, _, multiple) in RATES {
+            let parsed: f64 = label.trim_end_matches('x').parse().unwrap();
+            assert!(
+                (parsed - multiple).abs() < 1e-9,
+                "{label} carries multiple {multiple}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_high_and_low_precision_right_ascension() {
+        let hp = parse_ra_hours("12:34:56").unwrap();
+        assert!((hp - (12.0 + 34.0 / 60.0 + 56.0 / 3600.0)).abs() < 1e-9, "{hp}");
+        // Low precision: the fraction is tenths of a MINUTE, not seconds.
+        let lp = parse_ra_hours("12:34.5").unwrap();
+        assert!((lp - (12.0 + 34.5 / 60.0)).abs() < 1e-9, "{lp}");
+        // The mount's own reply may still carry its terminator.
+        assert!((parse_ra_hours("12:34:56#").unwrap() - hp).abs() < 1e-9);
+        assert!(parse_ra_hours("garbage").is_none());
+    }
+
+    #[test]
+    fn parses_declination_with_the_sign_applied_to_the_whole_value() {
+        let north = parse_dec_deg("+12*34:56").unwrap();
+        assert!((north - (12.0 + 34.0 / 60.0 + 56.0 / 3600.0)).abs() < 1e-9, "{north}");
+        // The trap: negating only the degree field would give -0 + 30/60 =
+        // +0.5°, putting the target on the wrong side of the equator.
+        let just_south = parse_dec_deg("-00*30:00").unwrap();
+        assert!((just_south + 0.5).abs() < 1e-9, "{just_south}");
+        let south = parse_dec_deg("-12*34").unwrap();
+        assert!((south + (12.0 + 34.0 / 60.0)).abs() < 1e-9, "{south}");
+        // Some firmwares use a degree glyph rather than '*'.
+        assert!((parse_dec_deg("+12°34:56").unwrap() - north).abs() < 1e-9);
+        assert!(parse_dec_deg("nonsense").is_none());
+    }
+
+    #[test]
+    fn coordinate_parse_round_trips_through_the_formatters() {
+        for (ra, dec) in [(0.0, 0.0), (12.5827, -23.4561), (23.999, 89.5), (6.25, -0.25)] {
+            let ra_back = parse_ra_hours(&format_ra(ra)).unwrap();
+            let dec_back = parse_dec_deg(&format_dec(dec)).unwrap();
+            // The formatters round to whole seconds/arcseconds.
+            assert!((ra_back - ra).abs() < 1.0 / 3600.0 + 1e-9, "RA {ra} -> {ra_back}");
+            assert!(
+                (dec_back - dec).abs() < 1.0 / 3600.0 + 1e-9,
+                "Dec {dec} -> {dec_back}"
+            );
+        }
+    }
+
+    #[test]
+    fn angular_separation_matches_known_geometry() {
+        // Same point.
+        assert!(angular_separation_deg(5.0, 20.0, 5.0, 20.0) < 1e-9);
+        // One hour of RA at the equator is exactly 15 degrees.
+        let h = angular_separation_deg(0.0, 0.0, 1.0, 0.0);
+        assert!((h - 15.0).abs() < 1e-9, "{h}");
+        // Pure declination difference.
+        let d = angular_separation_deg(3.0, 10.0, 3.0, -5.0);
+        assert!((d - 15.0).abs() < 1e-9, "{d}");
+        // RA separation shrinks with the cosine of declination.
+        let high = angular_separation_deg(0.0, 60.0, 1.0, 60.0);
+        assert!(high < 15.0 && high > 7.0, "{high}");
+    }
+
+    #[test]
+    fn a_small_return_stays_under_the_confirmation_threshold() {
+        // A jog of a few arcminutes -- the case the return button exists for --
+        // must not trip the slew confirmation.
+        let sep = angular_separation_deg(12.0, 20.0, 12.0 + 5.0 / 60.0 / 15.0, 20.05);
+        assert!(sep < RETURN_CONFIRM_DEG, "{sep}");
+        // A stale mark on another target must trip it.
+        let stale = angular_separation_deg(12.0, 20.0, 14.0, 35.0);
+        assert!(stale > RETURN_CONFIRM_DEG, "{stale}");
+    }
+
+    #[test]
     fn formats_mount_coordinates_with_carry() {
         assert_eq!(format_ra(23.999_999_9), "00:00:00");
         assert_eq!(format_ra(5.5), "05:30:00");
@@ -2775,8 +3396,8 @@ mod tests {
 
     #[test]
     fn zwo_rate_and_goto_error_tables_match_protocol_v2_1() {
-        assert_eq!(RATES.first(), Some(&("0.25x", 0)));
-        assert_eq!(RATES.last(), Some(&("1440x", 9)));
+        assert_eq!(RATES.first(), Some(&("0.25x", 0, 0.25)));
+        assert_eq!(RATES.last(), Some(&("1440x", 9, 1440.0)));
         assert!(goto_error("e5").contains("below the horizon"));
         assert!(goto_error("e7").contains("time and location"));
     }
