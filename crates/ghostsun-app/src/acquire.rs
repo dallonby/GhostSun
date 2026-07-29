@@ -107,7 +107,12 @@ impl Default for AcquireState {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("GhostSun Captures");
         Self {
-            capture_height: 1024,
+            // ~200 px around the line is the user's working crop: the Halpha
+            // core is ~10-30 px and the pipeline's continuum offset and
+            // telluric anchors live within +-90 px, so 256 covers science
+            // needs at a fifth of the file size of the old 1024 default
+            // (a 900-frame scan: ~1.3 GB rather than ~6.6 GB).
+            capture_height: 256,
             anchor_y: None,
             output_dir,
             scan_span_deg: 0.80,
@@ -998,9 +1003,27 @@ fn process_scans(
             "Registering and robust-stacking {} reconstructions",
             images.len()
         )));
-        stack::stack(&images, true, false)
-            .ok_or("multi-scan registration/stacking failed")?
-            .image
+        let n_in = images.len();
+        let srep = stack::stack(&images, true, false)
+            .ok_or("multi-scan registration/stacking failed")?;
+        if srep.n_flipped > 0 {
+            // Recovered, but never routine: the stacker had to deduce an
+            // orientation this code claims to know.
+            let _ = tx.send(ProcessMessage::Log(format!(
+                "WARNING: {} scan(s) arrived mirrored and were auto-flipped; direction bookkeeping is wrong",
+                srep.n_flipped
+            )));
+        }
+        if srep.n_used < n_in {
+            // A dropped scan is survivable but never routine -- it means a
+            // reconstruction failed to fit or refused to correlate with the
+            // reference (wrong direction/flip bookkeeping reads exactly so).
+            let _ = tx.send(ProcessMessage::Log(format!(
+                "WARNING: only {}/{} scans survived registration — check scan                  direction bookkeeping",
+                srep.n_used, n_in
+            )));
+        }
+        srep.image
     };
     let stem = if files.len() == 1 {
         "ghostsun-final"

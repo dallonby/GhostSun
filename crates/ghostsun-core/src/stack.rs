@@ -221,6 +221,10 @@ fn optical_flow(refimg: &Image, img: &Image, disk: &DiskFit, block: usize, searc
 
 #[allow(dead_code)]
 pub struct StackReport {
+    /// Scans that arrived x-mirrored and were auto-flipped to match the
+    /// reference. Nonzero means direction/flip bookkeeping upstream is wrong,
+    /// even though the data was recovered.
+    pub n_flipped: usize,
     pub image: Image,
     pub n_used: usize,
     pub weights: Vec<f64>,
@@ -276,6 +280,7 @@ pub fn stack_coregistered(images: &[Image], reference: usize) -> Option<StackRep
     }
     if images.len() == 1 {
         return Some(StackReport {
+            n_flipped: 0,
             image: images[0].clone(),
             n_used: 1,
             weights: vec![1.0],
@@ -354,6 +359,7 @@ pub fn stack_coregistered(images: &[Image], reference: usize) -> Option<StackRep
         };
     }
     Some(StackReport {
+        n_flipped: 0,
         image: out,
         n_used: k_scans,
         weights,
@@ -361,6 +367,23 @@ pub fn stack_coregistered(images: &[Image], reference: usize) -> Option<StackRep
 }
 
 /// Stack with an explicit reference index (None = sharpest scan).
+/// Minimum NCC against the reference for a scan to join the stack in a given
+/// orientation. Correct pairs measure ~0.999 and even photometrically poor
+/// scans stay above ~0.95; a mirrored scan measures ~0.2 — below this it is
+/// re-tried flipped before being given up on.
+const NCC_MIN: f64 = 0.85;
+
+/// Horizontal mirror, for re-trying a scan whose flip bookkeeping was wrong.
+fn mirror_x(img: &Image) -> Image {
+    let mut out = Image::new(img.w, img.h);
+    for y in 0..img.h {
+        for x in 0..img.w {
+            out.set(x, y, img.at(img.w - 1 - x, y));
+        }
+    }
+    out
+}
+
 pub fn stack_with_reference(
     images: &[Image],
     flow: bool,
@@ -371,21 +394,36 @@ pub fn stack_with_reference(
         return None;
     }
     if images.len() == 1 {
-        return Some(StackReport { image: images[0].clone(), n_used: 1, weights: vec![1.0] });
+        return Some(StackReport { n_flipped: 0, image: images[0].clone(), n_used: 1, weights: vec![1.0] });
     }
-    let fits: Vec<DiskFit> = images.iter().map(|i| fit_disk(i)).collect::<Option<Vec<_>>>()?;
+    // One unfittable scan used to abort the whole stack through `?`. That is the
+    // wrong trade: dropping a single scan of N costs a little SNR, whereas
+    // returning None discards every scan including the good ones -- and to the
+    // caller it is indistinguishable from "no multi-scan result", which is how
+    // an over-large dither presented itself.
+    let fits: Vec<Option<DiskFit>> = images.iter().map(fit_disk).collect();
+    let energies: Vec<f64> = images
+        .iter()
+        .zip(&fits)
+        .map(|(i, f)| f.as_ref().map(|f| hf_energy(i, f)).unwrap_or(0.0))
+        .collect();
 
-    // reference = sharpest scan (or caller-specified)
-    let energies: Vec<f64> = images.iter().zip(&fits).map(|(i, f)| hf_energy(i, f)).collect();
+    // reference = sharpest scan (or caller-specified); it must itself be fittable
+    let fitted = |i: &usize| fits[*i].is_some();
     let ref_idx = match reference {
-        Some(i) => i.min(images.len() - 1),
-        None => energies
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .map(|(i, _)| i)?,
+        Some(i) => {
+            let i = i.min(images.len() - 1);
+            if fits[i].is_some() {
+                i
+            } else {
+                (0..images.len()).find(fitted)?
+            }
+        }
+        None => (0..images.len())
+            .filter(fitted)
+            .max_by(|a, b| energies[*a].partial_cmp(&energies[*b]).unwrap())?,
     };
-    let rf = &fits[ref_idx];
+    let rf = fits[ref_idx].as_ref()?;
     let size = (images[ref_idx].w, images[ref_idx].h);
     let refimg = &images[ref_idx];
     if verbose {
@@ -394,31 +432,89 @@ pub fn stack_with_reference(
 
     // register each scan: global + NCC translation refine + optional flow
     let mut aligned: Vec<Image> = Vec::new();
+    // Indices actually stacked, so the sharpness weights stay in step with
+    // `aligned` once scans can be dropped.
+    let mut kept: Vec<usize> = Vec::new();
+    let mut n_flipped = 0usize;
     for (k, img) in images.iter().enumerate() {
         if k == ref_idx {
             aligned.push(img.clone());
+            kept.push(k);
             continue;
         }
-        let mut best = (0.0f64, 0.0f64, f64::MIN);
-        for step in [1.0f64, 0.25, 0.05] {
-            let (cx, cy, _) = best;
-            let mut local = best;
-            let mut dy = cy - 2.0 * step;
-            while dy <= cy + 2.0 * step + 1e-12 {
-                let mut dx = cx - 2.0 * step;
-                while dx <= cx + 2.0 * step + 1e-12 {
-                    let r = to_ref_grid(img, &fits[k], rf, size, dx, dy);
-                    let v = ncc(&r, refimg, rf);
-                    if v > local.2 {
-                        local = (dx, dy, v);
-                    }
-                    dx += step;
-                }
-                dy += step;
+        let Some(fk) = fits[k].as_ref() else {
+            if verbose {
+                println!("stack: scan {k} dropped (no disk fit)");
             }
-            best = local;
+            continue;
+        };
+        let search = |im: &Image, fit: &DiskFit| {
+            let mut best = (0.0f64, 0.0f64, f64::MIN);
+            for step in [1.0f64, 0.25, 0.05] {
+                let (cx, cy, _) = best;
+                let mut local = best;
+                let mut dy = cy - 2.0 * step;
+                while dy <= cy + 2.0 * step + 1e-12 {
+                    let mut dx = cx - 2.0 * step;
+                    while dx <= cx + 2.0 * step + 1e-12 {
+                        let r = to_ref_grid(im, fit, rf, size, dx, dy);
+                        let v = ncc(&r, refimg, rf);
+                        if v > local.2 {
+                            local = (dx, dy, v);
+                        }
+                        dx += step;
+                    }
+                    dy += step;
+                }
+                best = local;
+            }
+            best
+        };
+        let mut best = search(img, fk);
+        // A mirrored scan (direction/flip bookkeeping gone wrong) registers at
+        // NCC ~0.2 against ~0.999 for a correct pair, and the robust mean
+        // cannot reject a wholesale mirror -- with two scans the MAD clip has
+        // no majority -- so unhandled it silently blends into a plausible-
+        // looking 22 dB result. But orientation is DETERMINISTIC, not noise:
+        // sweep direction is known upstream, and even when its bookkeeping
+        // fails the mirror is trivially recoverable. So recover first -- flip
+        // and re-register, with the enormous NCC margin as confirmation -- and
+        // drop only a scan that correlates in NEITHER orientation, which is
+        // genuinely bad data rather than a labelling mistake.
+        let mut flipped_src: Option<(Image, DiskFit)> = None;
+        if best.2 < NCC_MIN {
+            let mirrored = mirror_x(img);
+            let mfit = DiskFit {
+                xc: (img.w as f64 - 1.0) - fk.xc,
+                yc: fk.yc,
+                r: fk.r,
+            };
+            let mbest = search(&mirrored, &mfit);
+            if mbest.2 >= NCC_MIN {
+                if verbose {
+                    println!(
+                        "stack: scan {k} arrived x-mirrored (ncc {:.3} → {:.3});                          auto-flipped — check direction/flip bookkeeping",
+                        best.2, mbest.2
+                    );
+                }
+                n_flipped += 1;
+                best = mbest;
+                flipped_src = Some((mirrored, mfit));
+            } else {
+                if verbose {
+                    println!(
+                        "stack: scan {k} correlates in neither orientation                          (ncc {:.3} direct, {:.3} mirrored) — dropped",
+                        best.2, mbest.2
+                    );
+                }
+                continue;
+            }
         }
-        let mut reg = to_ref_grid(img, &fits[k], rf, size, best.0, best.1);
+        let (src_img, src_fit) = flipped_src
+            .as_ref()
+            .map(|(i, f)| (i, f))
+            .unwrap_or((img, fk));
+        let mut reg = to_ref_grid(src_img, src_fit, rf, size, best.0, best.1);
         if flow {
             let (fx, fy) = optical_flow(refimg, &reg, rf, 32, 4);
             let mut warped = Image::new(size.0, size.1);
@@ -437,6 +533,10 @@ pub fn stack_with_reference(
             println!("stack: scan {k} registered (ncc {:.4})", best.2);
         }
         aligned.push(reg);
+        kept.push(k);
+    }
+    if aligned.len() < 2 {
+        return None;
     }
 
     // Photometric matching to the reference: each scan carries its own
@@ -457,8 +557,8 @@ pub fn stack_with_reference(
     let scale: Vec<f64> = vec![1.0; aligned.len()];
 
     // sharpness weights (floored)
-    let emax = energies.iter().cloned().fold(f64::MIN, f64::max).max(1e-12);
-    let weights: Vec<f64> = energies.iter().map(|e| (e / emax).clamp(0.2, 1.0)).collect();
+    let emax = kept.iter().map(|&k| energies[k]).fold(f64::MIN, f64::max).max(1e-12);
+    let weights: Vec<f64> = kept.iter().map(|&k| (energies[k] / emax).clamp(0.2, 1.0)).collect();
 
     // robust weighted mean per pixel: reject > 3*MAD from the median
     let k_scans = aligned.len();
@@ -482,5 +582,53 @@ pub fn stack_with_reference(
         }
         out.data[i] = if wsum > 0.0 { (acc / wsum) as f32 } else { med as f32 };
     }
-    Some(StackReport { image: out, n_used: k_scans, weights })
+    Some(StackReport { n_flipped, image: out, n_used: k_scans, weights })
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// Limb-darkened disk with strong mirror-asymmetric texture. `mirror`
+    /// evaluates the same field at the flipped x, i.e. exactly what a
+    /// forgotten flip_x produces.
+    fn textured_disk(mirror: bool) -> Image {
+        let (w, h) = (240usize, 240usize);
+        let (cx, cy, r) = (120.0f64, 120.0f64, 80.0f64);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let fx = if mirror { (w - 1 - x) as f64 } else { x as f64 };
+                let d = ((fx - cx).powi(2) + (y as f64 - cy).powi(2)).sqrt() / r;
+                if d < 1.0 {
+                    let mu = (1.0 - d * d).sqrt();
+                    let limb = 1.0 - 0.6 * (1.0 - mu);
+                    let tex = 1.0
+                        + 0.5
+                            * ((0.37 * fx + 0.11 * y as f64).sin()
+                                * (0.23 * fx - 0.31 * y as f64).cos());
+                    img.set(x, y, (10_000.0 * limb * tex) as f32);
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn a_mirrored_scan_is_recovered_by_flipping_not_dropped() {
+        let a = textured_disk(false);
+        let m = textured_disk(true);
+        // Orientation is deterministic, so a mirrored scan is good data with a
+        // wrong label: the stack must flip it back and use it, reporting the
+        // recovery so the upstream bookkeeping bug is visible.
+        let rep = stack_with_reference(&[a.clone(), m], false, false, Some(0))
+            .expect("a mirrored scan must be recovered, not rejected");
+        assert_eq!(rep.n_used, 2, "both scans must survive");
+        assert_eq!(rep.n_flipped, 1, "the recovery must be reported");
+        // Sanity: the same disk twice stacks with no flips.
+        let rep = stack_with_reference(&[a.clone(), a], false, false, Some(0))
+            .expect("identical scans must stack");
+        assert_eq!(rep.n_used, 2);
+        assert_eq!(rep.n_flipped, 0);
+    }
 }
