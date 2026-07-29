@@ -40,6 +40,43 @@ panel (latitude/longitude, UTC offset, optional OpenStreetMap place search) and
 saved under `~/.ghostsun/mount_site.json`. Mechanical home position and
 polar/alignment setup still require ASI Mount / the hand controller.
 
+Camera-assisted centering offers two separately confirmed starts:
+**GoTo + center** first slews to the calculated Sun, while **Center from here**
+keeps the current pointing as the search origin. Both modes sample a bounded
+0.2° coarse spiral, use the mean of the brightest one percent of camera pixels
+as a hot-pixel-resistant peak signal, refine the strongest point on a 0.1°
+grid, and return to that refined maximum. Set the search radius so every
+possible nudge remains mechanically and optically safe. The Mount tab displays
+the selected camera's live spectrum and can start or stop its preview directly;
+during auto-center the Stop camera control is locked, while Cancel auto-center
+stops mount motion and restores the previous camera state.
+
+## Guided acquisition
+
+The cross-platform **Acquire** tab combines the live camera, direct ZWO serial
+control, lossless mono16 SER recording, reconstruction, and optional
+multi-scan stacking. It assumes a prepared observing state: the filtered solar
+disc must already be reasonably centred and the telescope and SHG focused.
+That prerequisite is shown explicitly and must be acknowledged before motion.
+
+Select a detected horizontal spectral-line anchor and vertical crop height,
+then choose N/S/E/W manually or run **Auto-detect scan axis**. Calibration uses
+small reversible N/S and E/W probes to compare motion along the slit,
+recommends the more nearly perpendicular scan axis, and estimates sensor
+off-axis angle. Estimates above 10° require a separate acknowledgement.
+
+GhostSun pre-positions from the current centred point, records pre/post-roll,
+and scans at 60× sidereal. Multiple scans alternate direction; each is
+reconstructed independently, reverse passes are normalised to the same
+orientation, and the results are registered and robust-stacked. Every SER,
+individual PNG/FITS reconstruction, and final PNG/FITS product is retained in
+the selected session folder. Preview updates are kept to the newest frame so
+the display cannot accumulate latency or drop recorder frames.
+
+Automated motion requires explicit prepared-observation and safe-motion
+confirmations. **STOP**, leaving Acquire, a mount error, or a disconnect stops
+the mount and closes an active SER.
+
 Tagged releases are signed with GhostSun's Developer ID Application identity,
 submitted to Apple's notary service, and distributed with the notarization
 ticket stapled to the app. Ordinary branch and pull-request artifacts use an

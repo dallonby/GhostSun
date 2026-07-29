@@ -23,6 +23,9 @@ const IO_DEADLINE: Duration = Duration::from_millis(1200);
 
 /// Grid step for the expanding square spiral (matches the UI copy).
 const SPIRAL_STEP_DEG: f32 = 0.2;
+/// Local refinement step around the strongest coarse-grid sample.
+const REFINE_STEP_DEG: f32 = SPIRAL_STEP_DEG / 2.0;
+const COARSE_GRID_SCALE: i32 = 2;
 /// Worker nudges always use ZWO rate 7 (60× sidereal) — see `WorkerCommand::Nudge`.
 const NUDGE_SIDEREAL_MULT: f64 = 60.0;
 const SIDEREAL_DEG_PER_S: f64 = 15.0 / 3600.0;
@@ -73,7 +76,7 @@ struct PortInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
+pub enum Direction {
     North,
     South,
     East,
@@ -84,6 +87,21 @@ enum Direction {
 enum ConfirmedMotion {
     GoHome,
     Park,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCenterOrigin {
+    SunGoTo,
+    CurrentPoint,
+}
+
+impl AutoCenterOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SunGoTo => "Sun GoTo + center",
+            Self::CurrentPoint => "center from current point",
+        }
+    }
 }
 
 /// A recorded pointing to return to.
@@ -103,12 +121,21 @@ struct TimedJog {
 }
 
 impl Direction {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Direction::North => "N",
             Direction::South => "S",
             Direction::East => "E",
             Direction::West => "W",
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::North => Self::South,
+            Self::South => Self::North,
+            Self::East => Self::West,
+            Self::West => Self::East,
         }
     }
 }
@@ -211,13 +238,22 @@ enum AutoCenterPhase {
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCenterPass {
+    Coarse,
+    Refine,
+}
+
 struct AutoCenterState {
     restore: focus::SearchCameraRestore,
+    origin: AutoCenterOrigin,
+    pass: AutoCenterPass,
     points: Vec<(i32, i32)>,
     point_index: usize,
     current: (i32, i32),
     best: (i32, i32),
     best_signal: f32,
+    max_units: i32,
     duration_ms: u64,
     overall_deadline: Instant,
     phase: AutoCenterPhase,
@@ -226,7 +262,7 @@ struct AutoCenterState {
 /// One grid step duration at the worker's fixed 60× nudge rate.
 fn spiral_nudge_duration_ms() -> u64 {
     let deg_per_s = NUDGE_SIDEREAL_MULT * SIDEREAL_DEG_PER_S;
-    ((f64::from(SPIRAL_STEP_DEG) / deg_per_s) * 1000.0).round() as u64
+    ((f64::from(REFINE_STEP_DEG) / deg_per_s) * 1000.0).round() as u64
 }
 
 /// Expanding square spiral in grid units (Chebyshev radius `max_r`).
@@ -251,6 +287,23 @@ fn square_spiral(max_r: i32) -> Vec<(i32, i32)> {
         }
     }
     out
+}
+
+/// Coarse 0.2-degree scan represented in 0.1-degree fine-grid units.
+fn coarse_spiral(max_r: i32) -> Vec<(i32, i32)> {
+    square_spiral(max_r)
+        .into_iter()
+        .map(|(x, y)| (x * COARSE_GRID_SCALE, y * COARSE_GRID_SCALE))
+        .collect()
+}
+
+/// Bounded 3x3 local search around the strongest coarse-grid sample.
+fn refinement_grid(center: (i32, i32), max_units: i32) -> Vec<(i32, i32)> {
+    square_spiral(1)
+        .into_iter()
+        .map(|(x, y)| (center.0 + x, center.1 + y))
+        .filter(|(x, y)| x.abs() <= max_units && y.abs() <= max_units)
+        .collect()
 }
 
 fn grid_step_direction(from: (i32, i32), to: (i32, i32)) -> Option<(Direction, (i32, i32))> {
@@ -293,6 +346,11 @@ pub struct MountState {
     mark: Option<Mark>,
     /// A timed jog awaiting its `NudgeDone`.
     timed_jog: Option<TimedJog>,
+    /// Motion owned by the acquisition workflow. Kept separate so its
+    /// completion cannot advance a manual timed jog or Sun auto-center.
+    acquisition_nudge_inflight: bool,
+    acquisition_nudge_done: bool,
+    acquisition_error: Option<String>,
     jog_seconds: f64,
     jog_direction: Direction,
     /// Rate for timed jogs, kept separate from the hold-to-jog rate: holding a
@@ -314,9 +372,12 @@ pub struct MountState {
     confirm_motion: Option<ConfirmedMotion>,
     confirm_sun: bool,
     confirm_auto_center: bool,
+    auto_center_origin: AutoCenterOrigin,
     auto_center: Option<AutoCenterState>,
     search_exposure_ms: u32,
     search_radius_deg: f32,
+    capture_height: usize,
+    capture_anchor_y: Option<f64>,
     /// East-positive degrees [-180, 180].
     site_latitude_deg: f64,
     /// East-positive degrees [-180, 180].
@@ -364,6 +425,9 @@ impl Default for MountState {
             active_direction: None,
             mark: None,
             timed_jog: None,
+            acquisition_nudge_inflight: false,
+            acquisition_nudge_done: false,
+            acquisition_error: None,
             jog_seconds: 2.0,
             jog_direction: Direction::North,
             // 60x sidereal crosses the solar disc in roughly two seconds.
@@ -373,9 +437,12 @@ impl Default for MountState {
             confirm_motion: None,
             confirm_sun: false,
             confirm_auto_center: false,
+            auto_center_origin: AutoCenterOrigin::SunGoTo,
             auto_center: None,
             search_exposure_ms: 250,
             search_radius_deg: 0.6,
+            capture_height: 1024,
+            capture_anchor_y: None,
             site_latitude_deg: 0.0,
             site_longitude_deg: 0.0,
             site_utc_offset_hours: system_utc_offset_hours(),
@@ -576,6 +643,9 @@ impl MountState {
 
     pub fn leave_tab(&mut self, focus: &mut focus::FocusState) {
         self.cancel_auto_center(focus, "Sun auto-center cancelled");
+        if focus.recording {
+            focus.stop_ser_recording();
+        }
         self.stop_motion();
         self.confirm_motion = None;
         self.confirm_sun = false;
@@ -607,6 +677,10 @@ impl MountState {
                 }
                 WorkerMessage::Disconnected(reason) => {
                     self.cancel_auto_center(focus, "Sun auto-center stopped: mount disconnected");
+                    if self.acquisition_nudge_inflight {
+                        self.acquisition_error = Some("mount disconnected during acquisition motion".into());
+                    }
+                    self.acquisition_nudge_inflight = false;
                     self.connected = false;
                     self.connecting = false;
                     self.connected_port = None;
@@ -624,7 +698,11 @@ impl MountState {
                     // The two cannot overlap -- a timed jog is refused while
                     // auto-center runs -- but route explicitly rather than
                     // relying on that invariant holding forever.
-                    if self.timed_jog.take().is_some() {
+                    if self.acquisition_nudge_inflight {
+                        self.acquisition_nudge_inflight = false;
+                        self.acquisition_nudge_done = true;
+                        self.status = "Acquisition motion complete".into();
+                    } else if self.timed_jog.take().is_some() {
                         self.status = "Timed jog complete".into();
                     } else {
                         self.auto_center_nudge_done();
@@ -640,6 +718,10 @@ impl MountState {
                 }
                 WorkerMessage::Error(error) => {
                     self.cancel_auto_center(focus, "Sun auto-center stopped by mount error");
+                    if self.acquisition_nudge_inflight {
+                        self.acquisition_error = Some(error.clone());
+                    }
+                    self.acquisition_nudge_inflight = false;
                     self.connecting = false;
                     self.poll_inflight = false;
                     self.status = format!("Mount error: {error}");
@@ -1079,7 +1161,7 @@ impl MountState {
         });
         ui.label(
             egui::RichText::new(
-                "Uses a 0.2° square spiral at 60×, averages three frames per point, then returns to the strongest signal.",
+                "Uses a 0.2° coarse spiral at 60×, then a bounded 0.1° refinement around the strongest robust camera peak.",
             )
             .small()
             .weak(),
@@ -1125,6 +1207,53 @@ impl MountState {
                 .weak(),
             );
         });
+
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Live auto-center camera");
+            let camera_name = focus
+                .cameras
+                .get(focus.selected)
+                .map(|camera| format!("{} · {}", camera.backend.label(), camera.name))
+                .unwrap_or_else(|| "no camera selected".into());
+            ui.label(egui::RichText::new(camera_name).small().weak());
+            if focus.streaming {
+                if ui
+                    .add_enabled(
+                        self.auto_center.is_none() && !focus.recording,
+                        egui::Button::new("Stop camera"),
+                    )
+                    .clicked()
+                {
+                    focus.stop();
+                }
+            } else if ui
+                .add_enabled(
+                    !focus.cameras.is_empty(),
+                    egui::Button::new("Start camera preview"),
+                )
+                .clicked()
+            {
+                focus.start(ctx);
+            }
+        });
+        if focus.streaming {
+            let peak = focus
+                .sun_signal_sample()
+                .map(|(_, peak)| format!("{peak:.0}"))
+                .unwrap_or_else(|| "waiting".into());
+            ui.label(
+                egui::RichText::new(format!(
+                    "Exposure {:.0} ms · gain {} · robust peak {peak}",
+                    focus.exposure_us as f64 / 1000.0,
+                    focus.gain
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        focus.camera_preview_ui(ui, 240.0);
+        self.ser_acquisition_ui(ui, ctx, focus);
 
         // Entire mount control surface is inert until Connect succeeds.
         let enabled = self.connected;
@@ -1180,7 +1309,7 @@ impl MountState {
             status_card(ui, "Park", self.snapshot.park.as_deref().unwrap_or("--"));
         });
 
-        ui.add_space(20.0);
+        ui.add_space(10.0);
         let enabled = self.connected;
         let jog_enabled = enabled && self.auto_center.is_none();
         // Seed from the latch so a held button survives egui dropping its
@@ -1190,13 +1319,17 @@ impl MountState {
         // Losing window focus is treated as a release: a mouse-up delivered to
         // another application would otherwise leave the mount slewing.
         let pointer_held = ui.input(|i| i.pointer.primary_down() && i.focused);
+        let wide_controls = ui.available_width() >= 700.0;
 
-        // D-pad geometry: N/S share the same horizontal centre as STOP.
-        // Zero egui item_spacing so only our `gap` separates W–STOP–E.
-        {
-            let btn = egui::vec2(86.0, 52.0);
-            let stop_sz = egui::vec2(112.0, 58.0);
-            let gap = 8.0_f32;
+        if wide_controls {
+            ui.columns(2, |columns| {
+                let ui = &mut columns[0];
+                // D-pad geometry: N/S share the same horizontal centre as STOP.
+                // Zero egui item_spacing so only our `gap` separates W–STOP–E.
+                {
+            let btn = egui::vec2(58.0, 34.0);
+            let stop_sz = egui::vec2(78.0, 38.0);
+            let gap = 5.0_f32;
             let mid_w = btn.x + gap + stop_sz.x + gap + btn.x;
             let mid_h = btn.y.max(stop_sz.y);
             // STOP starts after W + gap; its centre is the N/S alignment axis.
@@ -1279,7 +1412,7 @@ impl MountState {
             });
 
             // Jog rate lives in the main window (not the left rail).
-            ui.add_space(10.0);
+            ui.add_space(4.0);
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Jog rate").strong());
@@ -1305,6 +1438,12 @@ impl MountState {
                         .weak(),
                 );
             });
+                }
+                self.timed_jog_ui(&mut columns[1]);
+            });
+        } else {
+            self.manual_jog_ui(ui, focus, jog_enabled, &mut held);
+            self.timed_jog_ui(ui);
         }
         if !pointer_held {
             held = None;
@@ -1312,9 +1451,7 @@ impl MountState {
         self.jog_latch = held;
         self.update_held_direction(if jog_enabled { held } else { None });
 
-        self.timed_jog_ui(ui);
-
-        ui.add_space(14.0);
+        ui.add_space(8.0);
         let tracking_on = self.snapshot.tracking.as_deref() == Some("On");
         let equatorial = self
             .snapshot
@@ -1459,7 +1596,7 @@ impl MountState {
                 egui::Frame::group(ui.style())
                     .fill(egui::Color32::from_rgb(70, 32, 18))
                     .stroke(egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         egui::Color32::from_rgb(255, 160, 80),
                     ))
                     .show(ui, |ui| {
@@ -1579,7 +1716,7 @@ impl MountState {
             ui.heading("Camera-assisted Sun center");
             ui.label(
                 egui::RichText::new(
-                    "Slews to the Sun, then walks a 0.2° square spiral at 60×, sampling camera brightness at each point and returning to the strongest signal.",
+                    "Choose whether to slew to the calculated Sun first or search around the current pointing. A 0.2° coarse spiral is refined to 0.1° around the strongest robust peak.",
                 )
                 .small()
                 .weak(),
@@ -1597,43 +1734,73 @@ impl MountState {
                 egui::Frame::group(ui.style())
                     .fill(egui::Color32::from_rgb(50, 25, 16))
                     .show(ui, |ui| {
+                        let warning = match self.auto_center_origin {
+                            AutoCenterOrigin::SunGoTo => {
+                                "DANGER: The mount will first slew to the Sun, then scan. Confirm only with a solar filter fitted, a clear slew path, and mount time/location/alignment set."
+                            }
+                            AutoCenterOrigin::CurrentPoint => {
+                                "DANGER: The mount will scan around its current pointing. Confirm that a solar filter is fitted and the full search radius is safe."
+                            }
+                        };
                         ui.label(
-                            egui::RichText::new(
-                                "DANGER: Confirm only with a solar filter fitted, a clear slew path, and mount time/location/alignment set. The mount will move.",
-                            )
-                            .strong()
-                            .color(egui::Color32::from_rgb(255, 170, 80)),
+                            egui::RichText::new(warning)
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 170, 80)),
                         );
                         ui.horizontal(|ui| {
                             let confirm = egui::Button::new(
-                                egui::RichText::new("Confirm Sun auto-center")
+                                egui::RichText::new(format!(
+                                    "Confirm {}",
+                                    self.auto_center_origin.label()
+                                ))
                                     .strong()
                                     .color(egui::Color32::WHITE),
                             )
                             .fill(ACCENT_DIM);
                             if ui.add_enabled(enabled, confirm).clicked() {
                                 self.confirm_auto_center = false;
-                                self.begin_auto_center(ctx, focus);
+                                self.begin_auto_center(ctx, focus, self.auto_center_origin);
                             }
                             if ui.button("Cancel").clicked() {
                                 self.confirm_auto_center = false;
                             }
                         });
                     });
-            } else if ui
-                .add_enabled(
-                    enabled && self.auto_center.is_none(),
-                    egui::Button::new(
-                        egui::RichText::new("Prepare Sun auto-center")
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(ACCENT_DIM),
-                )
-                .clicked()
-            {
-                self.confirm_sun = false;
-                self.confirm_auto_center = true;
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            enabled && self.auto_center.is_none(),
+                            egui::Button::new(
+                                egui::RichText::new("Prepare GoTo + center")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM),
+                        )
+                        .clicked()
+                    {
+                        self.confirm_sun = false;
+                        self.auto_center_origin = AutoCenterOrigin::SunGoTo;
+                        self.confirm_auto_center = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            enabled && self.auto_center.is_none(),
+                            egui::Button::new(
+                                egui::RichText::new("Prepare center from here")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM),
+                        )
+                        .clicked()
+                    {
+                        self.confirm_sun = false;
+                        self.auto_center_origin = AutoCenterOrigin::CurrentPoint;
+                        self.confirm_auto_center = true;
+                    }
+                });
             }
         });
     }
@@ -1659,6 +1826,62 @@ impl MountState {
         self.active_direction = None;
         self.jog_latch = None;
         self.timed_jog = None;
+        self.acquisition_nudge_inflight = false;
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    /// Start one bounded move owned by the acquisition workflow.
+    ///
+    /// The rate is a ZWO rate index (0..=9), matching the mount protocol.
+    pub fn start_acquisition_nudge(
+        &mut self,
+        direction: Direction,
+        duration: Duration,
+        rate: u8,
+    ) -> Result<(), String> {
+        if !self.connected {
+            return Err("connect the mount first".into());
+        }
+        if self.auto_center.is_some()
+            || self.timed_jog.is_some()
+            || self.active_direction.is_some()
+            || self.acquisition_nudge_inflight
+        {
+            return Err("another mount motion is already active".into());
+        }
+        let duration_ms = duration.as_millis().clamp(1, u64::MAX as u128) as u64;
+        self.acquisition_nudge_done = false;
+        self.acquisition_error = None;
+        self.tx
+            .send(WorkerCommand::Nudge {
+                direction,
+                duration_ms,
+                rate: rate.min(9),
+            })
+            .map_err(|_| "mount worker is not running".to_owned())?;
+        self.acquisition_nudge_inflight = true;
+        self.status = format!(
+            "Acquisition motion: {} for {:.2} s",
+            direction.label(),
+            duration.as_secs_f64()
+        );
+        Ok(())
+    }
+
+    pub fn take_acquisition_nudge_done(&mut self) -> bool {
+        std::mem::take(&mut self.acquisition_nudge_done)
+    }
+
+    pub fn take_acquisition_error(&mut self) -> Option<String> {
+        self.acquisition_error.take()
+    }
+
+    pub fn stop_acquisition_motion(&mut self) {
+        self.stop_motion();
+        self.acquisition_nudge_done = false;
     }
 
     // -- timed jog / return to mark ----------------------------------------
@@ -1761,20 +1984,286 @@ impl MountState {
         });
     }
 
+    fn manual_jog_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        focus: &mut focus::FocusState,
+        jog_enabled: bool,
+        held: &mut Option<Direction>,
+    ) {
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Manual jog").strong());
+                    ui.label("rate");
+                    let old_rate = self.rate_index;
+                    egui::ComboBox::from_id_salt("mount_rate_main")
+                        .selected_text(RATES[self.rate_index].0)
+                        .width(72.0)
+                        .show_ui(ui, |ui| {
+                            for (index, (label, _, _)) in RATES.iter().enumerate() {
+                                ui.selectable_value(&mut self.rate_index, index, *label);
+                            }
+                        });
+                    if self.rate_index != old_rate && self.connected {
+                        self.stop_motion();
+                        *held = None;
+                        let _ = self
+                            .tx
+                            .send(WorkerCommand::SetRate(RATES[self.rate_index].1));
+                    }
+                });
+
+                let btn = egui::vec2(58.0, 34.0);
+                let stop_sz = egui::vec2(78.0, 38.0);
+                let gap = 5.0_f32;
+                let mid_w = btn.x + gap + stop_sz.x + gap + btn.x;
+                let mid_h = btn.y.max(stop_sz.y);
+                let stop_left = btn.x + gap;
+                let ns_left = stop_left + stop_sz.x * 0.5 - btn.x * 0.5;
+                let pad_h = btn.y + gap + mid_h + gap + btn.y;
+
+                ui.horizontal(|ui| {
+                    let indent = ((ui.available_width() - mid_w) * 0.5).max(0.0);
+                    ui.add_space(indent);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(mid_w, pad_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(ns_left);
+                                let north = ui.add_enabled(
+                                    jog_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("N").size(16.0).strong(),
+                                    )
+                                    .min_size(btn),
+                                );
+                                if north.is_pointer_button_down_on() {
+                                    *held = Some(Direction::North);
+                                }
+                            });
+                            ui.add_space(gap);
+                            ui.horizontal(|ui| {
+                                let west = ui.add_enabled(
+                                    jog_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("W").size(16.0).strong(),
+                                    )
+                                    .min_size(btn),
+                                );
+                                if west.is_pointer_button_down_on() {
+                                    *held = Some(Direction::West);
+                                }
+                                ui.add_space(gap);
+                                let stop = egui::Button::new(
+                                    egui::RichText::new("STOP")
+                                        .size(15.0)
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(160, 35, 25))
+                                .min_size(stop_sz);
+                                if ui.add(stop).clicked() {
+                                    self.cancel_auto_center(focus, "Sun auto-center stopped");
+                                    self.stop_motion();
+                                    *held = None;
+                                }
+                                ui.add_space(gap);
+                                let east = ui.add_enabled(
+                                    jog_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("E").size(16.0).strong(),
+                                    )
+                                    .min_size(btn),
+                                );
+                                if east.is_pointer_button_down_on() {
+                                    *held = Some(Direction::East);
+                                }
+                            });
+                            ui.add_space(gap);
+                            ui.horizontal(|ui| {
+                                ui.add_space(ns_left);
+                                let south = ui.add_enabled(
+                                    jog_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("S").size(16.0).strong(),
+                                    )
+                                    .min_size(btn),
+                                );
+                                if south.is_pointer_button_down_on() {
+                                    *held = Some(Direction::South);
+                                }
+                            });
+                        },
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("Hold a direction; release to stop.")
+                        .small()
+                        .weak(),
+                );
+            });
+    }
+
+    fn ser_acquisition_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        focus: &mut focus::FocusState,
+    ) {
+        let anchors = focus.vertical_anchor_lines();
+        if !focus.recording {
+            let tracked = self.capture_anchor_y.and_then(|selected| {
+                anchors
+                    .iter()
+                    .min_by(|a, b| {
+                        (a.0 - selected)
+                            .abs()
+                            .partial_cmp(&(b.0 - selected).abs())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .filter(|(center, _)| (*center - selected).abs() <= 20.0)
+                    .map(|(center, _)| *center)
+            });
+            self.capture_anchor_y = tracked.or_else(|| {
+                anchors
+                    .iter()
+                    .max_by(|a, b| {
+                        a.1.partial_cmp(&b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(center, _)| *center)
+            });
+        }
+
+        let sensor_height = focus
+            .current_frame_height()
+            .or_else(|| focus.cameras.get(focus.selected).map(|camera| camera.max_height))
+            .unwrap_or(1024)
+            .max(1);
+        self.capture_height = self.capture_height.clamp(1, sensor_height);
+        let vertical_dispersion = focus.dispersion == focus::DispAxis::Vertical;
+
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("SER acquisition").strong());
+                    ui.label(
+                        egui::RichText::new(&focus.recording_status)
+                            .small()
+                            .color(if focus.recording {
+                                egui::Color32::from_rgb(255, 110, 90)
+                            } else {
+                                ui.visuals().weak_text_color()
+                            }),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("anchor line");
+                    let selected_text = self
+                        .capture_anchor_y
+                        .map(|center| format!("Y {center:.1} px"))
+                        .unwrap_or_else(|| "no line detected".into());
+                    ui.add_enabled_ui(!focus.recording && vertical_dispersion, |ui| {
+                        egui::ComboBox::from_id_salt("ser_anchor_line")
+                            .selected_text(selected_text)
+                            .width(126.0)
+                            .show_ui(ui, |ui| {
+                                for (index, (center, depth)) in anchors.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.capture_anchor_y,
+                                        Some(*center),
+                                        format!(
+                                            "{} · Y {:.1} · depth {:.0}%",
+                                            index + 1,
+                                            center,
+                                            depth * 100.0
+                                        ),
+                                    );
+                                }
+                            });
+                    });
+                    ui.label("vertical capture");
+                    ui.add_enabled(
+                        !focus.recording,
+                        egui::DragValue::new(&mut self.capture_height)
+                            .range(1..=sensor_height)
+                            .speed(16.0)
+                            .suffix(" px"),
+                    );
+
+                    if focus.recording {
+                        let stop = egui::Button::new(
+                            egui::RichText::new("■ Stop recording")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(160, 35, 25));
+                        if ui.add(stop).clicked() {
+                            focus.stop_ser_recording();
+                        }
+                    } else {
+                        let can_record = focus.streaming
+                            && vertical_dispersion
+                            && self.capture_anchor_y.is_some()
+                            && self.auto_center.is_none();
+                        let record = egui::Button::new(
+                            egui::RichText::new("● Start recording")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(145, 35, 28));
+                        if ui.add_enabled(can_record, record).clicked() {
+                            let stamp = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            if let Some(mut path) = rfd::FileDialog::new()
+                                .add_filter("SER video", &["ser"])
+                                .set_file_name(format!("ghostsun-{stamp}.ser"))
+                                .save_file()
+                            {
+                                if path.extension().is_none() {
+                                    path.set_extension("ser");
+                                }
+                                if let Some(anchor_y) = self.capture_anchor_y {
+                                    if let Err(error) = focus.start_ser_recording(
+                                        ctx,
+                                        path,
+                                        self.capture_height,
+                                        anchor_y,
+                                    ) {
+                                        focus.recording_status = error;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                let hint = if !vertical_dispersion {
+                    "Set dispersion to Vertical in Focus before selecting a horizontal spectral line."
+                } else if anchors.is_empty() {
+                    "Start the camera and expose a spectral line; detected lines appear in the anchor menu."
+                } else {
+                    "Records raw mono16 frames, vertically cropped around the fixed selected line."
+                };
+                ui.label(egui::RichText::new(hint).small().weak());
+            });
+    }
+
     fn timed_jog_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("Timed jog").strong());
+        ui.label(egui::RichText::new("Timed jog and return").strong());
         ui.label(
-            egui::RichText::new(
-                "Moves a fixed distance per click at the jog rate above — repeatable, \
-                 unlike holding a button.",
-            )
-            .small()
-            .weak(),
+            egui::RichText::new("Repeatable fixed move; the first jog marks its origin.")
+                .small()
+                .weak(),
         );
-        ui.add_space(4.0);
 
         let busy = self.timed_jog.is_some();
         let enabled = self.connected && self.auto_center.is_none() && !busy;
@@ -1858,8 +2347,8 @@ impl MountState {
             }
         }
 
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new("Return").strong());
+        ui.add_space(4.0);
+        ui.separator();
         match self.mark {
             Some(mark) => {
                 let sep = self
@@ -1946,29 +2435,55 @@ impl MountState {
         let state = self.auto_center.as_ref()?;
         let n = state.points.len().max(1);
         let i = state.point_index.min(n - 1) + 1;
+        let pass = match state.pass {
+            AutoCenterPass::Coarse => "coarse",
+            AutoCenterPass::Refine => "refine",
+        };
         let phase = match &state.phase {
             AutoCenterPhase::AwaitingSlew { .. } => "waiting for slew".into(),
-            AutoCenterPhase::Settling { .. } => "settling after slew".into(),
+            AutoCenterPhase::Settling { .. } => match state.origin {
+                AutoCenterOrigin::SunGoTo => "settling after slew".into(),
+                AutoCenterOrigin::CurrentPoint => "settling at current point".into(),
+            },
             AutoCenterPhase::Sampling { samples, .. } => {
                 format!(
-                    "sampling point {i}/{n} ({}/{})",
+                    "{pass} sampling {i}/{n} ({}/{})",
                     samples.len(),
                     SAMPLE_FRAMES
                 )
             }
             AutoCenterPhase::Moving { target, .. } => {
-                format!("nudging to ({}, {}) — point {i}/{n}", target.0, target.1)
+                format!(
+                    "{pass} nudge to ({:.1}°, {:.1}°) — point {i}/{n}",
+                    target.0 as f32 * REFINE_STEP_DEG,
+                    target.1 as f32 * REFINE_STEP_DEG
+                )
             }
-            AutoCenterPhase::ReturnReady => "returning to best signal".into(),
+            AutoCenterPhase::ReturnReady => "returning to refined peak".into(),
             AutoCenterPhase::Finished => "finishing".into(),
         };
+        let best = if state.best_signal.is_finite() {
+            format!(
+                " · best peak {:.0} at ({:.1}°, {:.1}°)",
+                state.best_signal,
+                state.best.0 as f32 * REFINE_STEP_DEG,
+                state.best.1 as f32 * REFINE_STEP_DEG
+            )
+        } else {
+            String::new()
+        };
         Some(format!(
-            "Auto-center: {phase} · best {:.4} at ({}, {})",
-            state.best_signal, state.best.0, state.best.1
+            "Auto-center ({}) — {phase}{best}",
+            state.origin.label()
         ))
     }
 
-    fn begin_auto_center(&mut self, ctx: &egui::Context, focus: &mut focus::FocusState) {
+    fn begin_auto_center(
+        &mut self,
+        ctx: &egui::Context,
+        focus: &mut focus::FocusState,
+        origin: AutoCenterOrigin,
+    ) {
         if self.auto_center.is_some() {
             return;
         }
@@ -1988,35 +2503,50 @@ impl MountState {
         let max_r = (self.search_radius_deg / SPIRAL_STEP_DEG)
             .round()
             .clamp(1.0, 6.0) as i32;
-        let points = square_spiral(max_r);
+        let max_units = max_r * COARSE_GRID_SCALE;
+        let points = coarse_spiral(max_r);
         let duration_ms = spiral_nudge_duration_ms().max(100);
-        let sun = sun_equatorial_now();
 
         self.stop_motion();
         self.confirm_sun = false;
         self.confirm_motion = None;
-        let _ = self.tx.send(WorkerCommand::SlewSun {
-            ra_hours: sun.ra_hours,
-            dec_deg: sun.dec_deg,
-        });
+        let phase = match origin {
+            AutoCenterOrigin::SunGoTo => {
+                let sun = sun_equatorial_now();
+                let _ = self.tx.send(WorkerCommand::SlewSun {
+                    ra_hours: sun.ra_hours,
+                    dec_deg: sun.dec_deg,
+                });
+                AutoCenterPhase::AwaitingSlew {
+                    started: Instant::now(),
+                    saw_motion: false,
+                }
+            }
+            AutoCenterOrigin::CurrentPoint => AutoCenterPhase::Settling {
+                until: Instant::now() + SETTLE_AFTER_SLEW,
+            },
+        };
 
         self.auto_center = Some(AutoCenterState {
             restore,
+            origin,
+            pass: AutoCenterPass::Coarse,
             points,
             point_index: 0,
             current: (0, 0),
             best: (0, 0),
             best_signal: f32::NEG_INFINITY,
+            max_units,
             duration_ms,
             overall_deadline: Instant::now() + AUTO_CENTER_TIMEOUT,
-            phase: AutoCenterPhase::AwaitingSlew {
-                started: Instant::now(),
-                saw_motion: false,
-            },
+            phase,
         });
         self.status = format!(
-            "Sun auto-center started (radius {max_r}×{SPIRAL_STEP_DEG}°, nudge {} ms @ 60×)",
-            duration_ms
+            "Auto-center started: {} (radius {:.1}°, coarse {:.1}°, refine {:.1}°)",
+            origin.label(),
+            max_r as f32 * SPIRAL_STEP_DEG,
+            SPIRAL_STEP_DEG,
+            REFINE_STEP_DEG
         );
     }
 
@@ -2126,65 +2656,68 @@ impl MountState {
                     samples,
                     deadline,
                 } => {
-                    if let Some((seq, mean)) = focus.sun_signal_sample() {
+                    if let Some((seq, peak)) = focus.sun_signal_sample() {
                         if seq > *last_seq {
                             *last_seq = seq;
-                            samples.push(mean);
+                            samples.push(peak);
                         }
                     }
-                    if samples.len() >= SAMPLE_FRAMES {
-                        let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+                    let sample_ready =
+                        samples.len() >= SAMPLE_FRAMES || Instant::now() >= *deadline;
+                    if !sample_ready {
+                        Next::Idle
+                    } else if samples.is_empty() {
+                        Next::Cancel("Sun auto-center: no camera frames while sampling")
+                    } else {
+                        // Average several robust per-frame peaks to suppress
+                        // scintillation while still seeking the local maximum.
+                        let peak = samples.iter().sum::<f32>() / samples.len() as f32;
                         let at = state
                             .points
                             .get(state.point_index)
                             .copied()
                             .unwrap_or(state.current);
-                        if mean > state.best_signal {
-                            state.best_signal = mean;
+                        if peak > state.best_signal {
+                            state.best_signal = peak;
                             state.best = at;
                         }
+                        let pass = match state.pass {
+                            AutoCenterPass::Coarse => "coarse",
+                            AutoCenterPass::Refine => "refine",
+                        };
                         self.status = format!(
-                            "Sun auto-center: point {}/{} signal {:.4} (best {:.4} @ {:?})",
+                            "Sun auto-center: {pass} point {}/{} peak {:.0} (best {:.0})",
                             state.point_index + 1,
                             state.points.len(),
-                            mean,
-                            state.best_signal,
-                            state.best
+                            peak,
+                            state.best_signal
                         );
                         state.point_index += 1;
-                        if state.point_index >= state.points.len() {
-                            state.phase = AutoCenterPhase::ReturnReady;
-                            Next::Idle
-                        } else {
+                        if state.point_index < state.points.len() {
                             let target = state.points[state.point_index];
                             Next::StartMove { target }
-                        }
-                    } else if Instant::now() >= *deadline {
-                        if samples.is_empty() {
-                            Next::Cancel("Sun auto-center: no camera frames while sampling")
                         } else {
-                            // Partial average is better than abort mid-spiral.
-                            let mean = samples.iter().sum::<f32>() / samples.len() as f32;
-                            let at = state
-                                .points
-                                .get(state.point_index)
-                                .copied()
-                                .unwrap_or(state.current);
-                            if mean > state.best_signal {
-                                state.best_signal = mean;
-                                state.best = at;
-                            }
-                            state.point_index += 1;
-                            if state.point_index >= state.points.len() {
-                                state.phase = AutoCenterPhase::ReturnReady;
-                                Next::Idle
-                            } else {
-                                let target = state.points[state.point_index];
-                                Next::StartMove { target }
+                            match state.pass {
+                                AutoCenterPass::Coarse => {
+                                    let coarse_best = state.best;
+                                    state.pass = AutoCenterPass::Refine;
+                                    state.points =
+                                        refinement_grid(coarse_best, state.max_units);
+                                    state.point_index = 0;
+                                    state.best = coarse_best;
+                                    state.best_signal = f32::NEG_INFINITY;
+                                    let target = state.points[0];
+                                    self.status =
+                                        "Sun auto-center: coarse maximum found; refining at 0.1°"
+                                            .into();
+                                    Next::StartMove { target }
+                                }
+                                AutoCenterPass::Refine => {
+                                    state.phase = AutoCenterPhase::ReturnReady;
+                                    Next::Idle
+                                }
                             }
                         }
-                    } else {
-                        Next::Idle
                     }
                 }
                 AutoCenterPhase::Moving {
@@ -2214,16 +2747,19 @@ impl MountState {
             Next::Idle => {}
             Next::Cancel(reason) => self.cancel_auto_center(focus, reason),
             Next::FinishSuccess => {
-                let best = self
+                let (origin, best, peak) = self
                     .auto_center
                     .as_ref()
-                    .map(|s| (s.best, s.best_signal))
-                    .unwrap_or(((0, 0), 0.0));
+                    .map(|s| (s.origin, s.best, s.best_signal))
+                    .unwrap_or((AutoCenterOrigin::CurrentPoint, (0, 0), 0.0));
                 self.cancel_auto_center(
                     focus,
                     &format!(
-                        "Sun auto-center complete: best signal {:.4} at grid {:?}",
-                        best.1, best.0
+                        "Auto-center complete ({}): peak {:.0} at offset ({:.1}°, {:.1}°)",
+                        origin.label(),
+                        peak,
+                        best.0 as f32 * REFINE_STEP_DEG,
+                        best.1 as f32 * REFINE_STEP_DEG
                     ),
                 );
             }
@@ -3416,9 +3952,32 @@ mod tests {
     }
 
     #[test]
-    fn spiral_nudge_duration_matches_0_2_deg_at_60x() {
-        // 60× × 15″/s = 0.25 °/s → 0.2° takes 800 ms.
-        assert_eq!(spiral_nudge_duration_ms(), 800);
+    fn spiral_nudge_duration_matches_0_1_deg_at_60x() {
+        // 60× × 15″/s = 0.25 °/s → 0.1° takes 400 ms.
+        assert_eq!(spiral_nudge_duration_ms(), 400);
+    }
+
+    #[test]
+    fn coarse_spiral_uses_two_fine_units_per_point() {
+        let pts = coarse_spiral(1);
+        assert_eq!(pts.len(), 9);
+        assert!(pts.iter().all(|(x, y)| x % 2 == 0 && y % 2 == 0));
+        assert!(pts.contains(&(2, 0)));
+    }
+
+    #[test]
+    fn refinement_grid_is_local_and_respects_radius() {
+        let middle = refinement_grid((2, -1), 4);
+        assert_eq!(middle.len(), 9);
+        assert!(middle.iter().all(|(x, y)| {
+            (x - 2).abs() <= 1 && (y + 1).abs() <= 1
+        }));
+
+        let edge = refinement_grid((4, 4), 4);
+        assert!(edge.len() < 9);
+        assert!(edge
+            .iter()
+            .all(|(x, y)| x.abs() <= 4 && y.abs() <= 4));
     }
 
     #[test]

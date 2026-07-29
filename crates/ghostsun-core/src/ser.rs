@@ -4,10 +4,12 @@
 use crate::image2d::Image;
 use memmap2::Mmap;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const HEADER_SIZE: usize = 178;
+const DOTNET_UNIX_EPOCH_SECONDS: i64 = 62_135_596_800;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -116,30 +118,167 @@ impl SerReader {
     }
 }
 
+/// Incremental mono16 SER writer for live acquisition.
+pub struct SerRecorder {
+    file: File,
+    width: usize,
+    height: usize,
+    frame_count: usize,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl SerRecorder {
+    pub fn create(
+        path: &Path,
+        width: usize,
+        height: usize,
+        instrument: &str,
+        telescope: &str,
+    ) -> io::Result<Self> {
+        if width == 0 || height == 0 || width > i32::MAX as usize || height > i32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SER dimensions must be non-zero 32-bit values",
+            ));
+        }
+        let mut file = File::create(path)?;
+        let mut header = vec![0u8; HEADER_SIZE];
+        header[..14].copy_from_slice(b"LUCAM-RECORDER");
+        put_i32(&mut header, 14, 0); // LuID
+        put_i32(&mut header, 18, 0); // MONO
+        put_i32(&mut header, 22, 0); // little endian
+        put_i32(&mut header, 26, width as i32);
+        put_i32(&mut header, 30, height as i32);
+        put_i32(&mut header, 34, 16);
+        put_i32(&mut header, 38, 0); // patched on finish
+        put_header_str(&mut header, 42, "GhostSun");
+        put_header_str(&mut header, 82, instrument);
+        put_header_str(&mut header, 122, telescope);
+        let ticks = dotnet_ticks_now();
+        header[162..170].copy_from_slice(&ticks.to_le_bytes());
+        header[170..178].copy_from_slice(&ticks.to_le_bytes());
+        file.write_all(&header)?;
+        Ok(Self {
+            file,
+            width,
+            height,
+            frame_count: 0,
+            buffer: Vec::with_capacity(width * height * 2),
+            finished: false,
+        })
+    }
+
+    pub fn write_frame(&mut self, pixels: &[u16]) -> io::Result<()> {
+        let expected = self.width * self.height;
+        if pixels.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "SER frame has {} pixels; expected {expected}",
+                    pixels.len()
+                ),
+            ));
+        }
+        self.buffer.clear();
+        for &pixel in pixels {
+            self.buffer.extend_from_slice(&pixel.to_le_bytes());
+        }
+        self.file.write_all(&self.buffer)?;
+        self.frame_count += 1;
+        Ok(())
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
+    pub fn finish(mut self) -> io::Result<usize> {
+        self.finalize()?;
+        Ok(self.frame_count)
+    }
+
+    fn finalize(&mut self) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.frame_count > i32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SER frame count exceeded the format limit",
+            ));
+        }
+        self.file.flush()?;
+        self.file.seek(SeekFrom::Start(38))?;
+        self.file
+            .write_all(&(self.frame_count as i32).to_le_bytes())?;
+        self.file.flush()?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for SerRecorder {
+    fn drop(&mut self) {
+        let _ = self.finalize();
+    }
+}
+
+fn put_i32(header: &mut [u8], offset: usize, value: i32) {
+    header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_header_str(header: &mut [u8], offset: usize, value: &str) {
+    let bytes = value.as_bytes();
+    let count = bytes.len().min(40);
+    header[offset..offset + count].copy_from_slice(&bytes[..count]);
+}
+
+fn dotnet_ticks_now() -> i64 {
+    let since_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    DOTNET_UNIX_EPOCH_SECONDS
+        .saturating_mul(10_000_000)
+        .saturating_add((since_unix.as_nanos() / 100).min(i64::MAX as u128) as i64)
+}
+
 /// Write a mono SER file from 16-bit frames (used by the synthetic generator).
 pub fn write_ser(path: &Path, width: usize, height: usize, frames: &[Vec<u16>]) -> io::Result<()> {
-    let mut f = File::create(path)?;
-    let mut header = vec![0u8; HEADER_SIZE];
-    header[..14].copy_from_slice(b"LUCAM-RECORDER");
-    let put_i32 = |h: &mut [u8], off: usize, v: i32| h[off..off + 4].copy_from_slice(&v.to_le_bytes());
-    put_i32(&mut header, 14, 0); // LuID
-    put_i32(&mut header, 18, 0); // MONO
-    put_i32(&mut header, 22, 0); // endianness flag (ignored by most readers)
-    put_i32(&mut header, 26, width as i32);
-    put_i32(&mut header, 30, height as i32);
-    put_i32(&mut header, 34, 16); // bit depth
-    put_i32(&mut header, 38, frames.len() as i32);
-    header[42..42 + 8].copy_from_slice(b"GhostSun");
-    header[82..82 + 5].copy_from_slice(b"Synth");
-    header[122..122 + 5].copy_from_slice(b"Synth");
-    f.write_all(&header)?;
-    let mut buf = Vec::with_capacity(width * height * 2);
+    let mut recorder = SerRecorder::create(path, width, height, "Synth", "Synth")?;
     for frame in frames {
-        buf.clear();
-        for &v in frame {
-            buf.extend_from_slice(&v.to_le_bytes());
-        }
-        f.write_all(&buf)?;
+        recorder.write_frame(frame)?;
     }
-    Ok(())
+    recorder.finish().map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_recorder_patches_count_and_timestamp() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ghostsun-ser-recorder-{}-{unique}.ser",
+            std::process::id()
+        ));
+        let mut recorder =
+            SerRecorder::create(&path, 3, 2, "Test camera", "Test SHG").unwrap();
+        recorder.write_frame(&[1, 2, 3, 4, 5, 6]).unwrap();
+        recorder.write_frame(&[7, 8, 9, 10, 11, 12]).unwrap();
+        assert_eq!(recorder.finish().unwrap(), 2);
+
+        let reader = SerReader::open(&path).unwrap();
+        assert_eq!(reader.header.width, 3);
+        assert_eq!(reader.header.height, 2);
+        assert_eq!(reader.header.frame_count, 2);
+        assert_eq!(reader.header.instrument, "Test camera");
+        assert!(reader.header.date_time_utc > DOTNET_UNIX_EPOCH_SECONDS * 10_000_000);
+        assert_eq!(reader.frame(1).data, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        std::fs::remove_file(path).unwrap();
+    }
 }

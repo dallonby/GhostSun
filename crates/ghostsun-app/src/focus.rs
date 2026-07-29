@@ -52,6 +52,7 @@
 //! feels like a trade-off because it is one.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -63,6 +64,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
 use ghostsun_camera::{enumerate_all, open, Backend, CameraInfo, Roi};
 use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
+use ghostsun_core::ser::SerRecorder;
 
 use crate::focusmetrics::{self, LuckyBuf, StructureSplit};
 use crate::vcurve::{self, NullPoint, ParabolaFit, VCurve};
@@ -77,6 +79,12 @@ const DEPTH_GATE: f64 = 0.03;
 const DEFAULT_CAPTURE_FRAMES: usize = 40;
 /// Rolling window for the live "lucky" Stage B readout.
 const LUCKY_WINDOW: usize = 90;
+/// Fraction of the brightest pixels averaged for the Sun-search signal.
+///
+/// A literal maximum is too easy for one hot pixel or cosmic ray to win.
+/// Averaging the brightest one percent follows the illuminated spectrum while
+/// remaining a peak-like metric rather than a whole-frame centroid or mean.
+const SUN_PEAK_FRACTION: usize = 100;
 
 const SPECTRAL_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 210, 255);
 const SLIT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 170, 90);
@@ -167,6 +175,7 @@ pub struct FocusUpdate {
     pub lines_x: Vec<Fit>, // vertical-line candidates
     pub lines_y: Vec<Fit>, // horizontal-line candidates
     pub mean: f32,
+    pub peak: f32,
     pub full_w: usize,
     pub full_h: usize,
     pub cur_exposure: Option<u32>,
@@ -184,6 +193,17 @@ pub struct FocusUpdate {
 
 enum FocusMsg {
     Frame(Box<FocusUpdate>),
+    RecordingStarted {
+        path: PathBuf,
+        width: usize,
+        height: usize,
+    },
+    RecordingProgress(usize),
+    RecordingStopped {
+        path: PathBuf,
+        frames: usize,
+    },
+    RecordingError(String),
     Error(String),
 }
 
@@ -194,6 +214,25 @@ enum FocusCmd {
     /// The worker needs the dispersion axis to know which way to cut the frame
     /// for the Stage B profile; the Stage A readouts only need it for labels.
     Dispersion(bool),
+    StartSer {
+        path: PathBuf,
+        capture_height: usize,
+        anchor_y: f64,
+    },
+    StopSer,
+}
+
+struct SerRequest {
+    path: PathBuf,
+    capture_height: usize,
+    anchor_y: f64,
+}
+
+struct ActiveSer {
+    path: PathBuf,
+    y0: usize,
+    height: usize,
+    recorder: SerRecorder,
 }
 
 /// Which stage of the procedure the panel is driving.
@@ -296,6 +335,10 @@ pub struct FocusState {
     pub exposure_us: u32,
     pub gain: u16,
     pub auto_exposure: bool,
+    pub recording: bool,
+    pub recorded_frames: usize,
+    pub recording_path: Option<PathBuf>,
+    pub recording_status: String,
     pub dispersion: DispAxis,
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
@@ -350,6 +393,11 @@ pub struct FocusState {
     rx: Option<Receiver<FocusMsg>>,
     cmd: Option<Sender<FocusCmd>>,
     stop: Option<Arc<AtomicBool>>,
+    /// True while one processed frame is waiting in `rx`.
+    ///
+    /// Without this gate an unbounded mpsc queue grows whenever acquisition is
+    /// faster than egui, and the preview gradually falls behind real time.
+    frame_pending: Option<Arc<AtomicBool>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -363,6 +411,10 @@ impl Default for FocusState {
             exposure_us: 10_000,
             gain: 200,
             auto_exposure: false,
+            recording: false,
+            recorded_frames: 0,
+            recording_path: None,
+            recording_status: "not recording".into(),
             dispersion: DispAxis::Vertical,
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
@@ -405,6 +457,7 @@ impl Default for FocusState {
             rx: None,
             cmd: None,
             stop: None,
+            frame_pending: None,
             handle: None,
         }
     }
@@ -456,6 +509,8 @@ impl FocusState {
         let (ctx_tx, ctx_rx) = channel::<FocusCmd>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let frame_pending = Arc::new(AtomicBool::new(false));
+        let frame_pending_thread = frame_pending.clone();
         let ctx = ctx.clone();
         let exposure = self.exposure_us;
         let gain = self.gain;
@@ -473,12 +528,14 @@ impl FocusState {
                 gain,
                 auto,
                 disp_h,
+                frame_pending_thread,
             )
         });
 
         self.rx = Some(rx);
         self.cmd = Some(ctx_tx);
         self.stop = Some(stop);
+        self.frame_pending = Some(frame_pending);
         self.handle = Some(handle);
         self.streaming = true;
         self.track_x.reset();
@@ -496,7 +553,13 @@ impl FocusState {
         self.rx = None;
         self.cmd = None;
         self.stop = None;
+        self.frame_pending = None;
         self.streaming = false;
+        if self.recording {
+            self.recording = false;
+            self.recording_status =
+                format!("recording stopped with camera ({} frames)", self.recorded_frames);
+        }
         self.status = "stopped".into();
     }
 
@@ -509,10 +572,22 @@ impl FocusState {
     pub fn poll(&mut self, ctx: &egui::Context) {
         let mut latest: Option<Box<FocusUpdate>> = None;
         let mut err = None;
+        let mut recording_event = None;
         if let Some(rx) = &self.rx {
             loop {
                 match rx.try_recv() {
-                    Ok(FocusMsg::Frame(u)) => latest = Some(u),
+                    Ok(FocusMsg::Frame(u)) => {
+                        if let Some(pending) = &self.frame_pending {
+                            pending.store(false, Ordering::Release);
+                        }
+                        latest = Some(u);
+                    }
+                    Ok(
+                        event @ (FocusMsg::RecordingStarted { .. }
+                        | FocusMsg::RecordingProgress(_)
+                        | FocusMsg::RecordingStopped { .. }
+                        | FocusMsg::RecordingError(_)),
+                    ) => recording_event = Some(event),
                     Ok(FocusMsg::Error(e)) => {
                         err = Some(e);
                         break;
@@ -521,7 +596,36 @@ impl FocusState {
                 }
             }
         }
+        if let Some(event) = recording_event {
+            match event {
+                FocusMsg::RecordingStarted {
+                    path,
+                    width,
+                    height,
+                } => {
+                    self.recording = true;
+                    self.recording_path = Some(path);
+                    self.recording_status = format!("recording {width}×{height} mono16");
+                }
+                FocusMsg::RecordingProgress(frames) => {
+                    self.recorded_frames = frames;
+                    self.recording_status = format!("recording · {frames} frames");
+                }
+                FocusMsg::RecordingStopped { path, frames } => {
+                    self.recording = false;
+                    self.recorded_frames = frames;
+                    self.recording_path = Some(path);
+                    self.recording_status = format!("saved {frames} frames");
+                }
+                FocusMsg::RecordingError(error) => {
+                    self.recording = false;
+                    self.recording_status = format!("SER recording failed: {error}");
+                }
+                FocusMsg::Frame(_) | FocusMsg::Error(_) => unreachable!(),
+            }
+        }
         if let Some(e) = err {
+            self.recording = false;
             self.status = format!("camera error: {e}");
             self.stop();
             return;
@@ -688,7 +792,76 @@ impl FocusState {
     }
 
     pub fn sun_signal_sample(&self) -> Option<(u64, f32)> {
-        self.last.as_ref().map(|frame| (self.frame_seq, frame.mean))
+        self.last.as_ref().map(|frame| (self.frame_seq, frame.peak))
+    }
+
+    /// Horizontal spectral-line candidates, expressed as sensor Y positions.
+    ///
+    /// SER acquisition uses one as the fixed centre of its vertical crop.
+    pub fn vertical_anchor_lines(&self) -> Vec<(f64, f64)> {
+        self.last
+            .as_ref()
+            .map(|frame| {
+                let mut lines: Vec<(f64, f64)> = frame
+                    .lines_y
+                    .iter()
+                    .filter(|line| line.depth > DEPTH_GATE)
+                    .map(|line| (line.center, line.depth))
+                    .collect();
+                lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                lines
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn current_frame_height(&self) -> Option<usize> {
+        self.last.as_ref().map(|frame| frame.full_h)
+    }
+
+    pub fn slit_profile_sample(&self) -> Option<(u64, Vec<f32>)> {
+        self.last
+            .as_ref()
+            .map(|frame| (self.frame_seq, frame.slit_cut.clone()))
+    }
+
+    pub fn start_ser_recording(
+        &mut self,
+        ctx: &egui::Context,
+        path: PathBuf,
+        capture_height: usize,
+        anchor_y: f64,
+    ) -> Result<(), String> {
+        if self.recording {
+            return Err("a SER recording is already active".into());
+        }
+        if !anchor_y.is_finite() {
+            return Err("select a valid spectral-line anchor".into());
+        }
+        if !self.streaming {
+            self.start(ctx);
+        }
+        let Some(cmd) = &self.cmd else {
+            return Err("start a camera before recording".into());
+        };
+        cmd.send(FocusCmd::StartSer {
+            path: path.clone(),
+            capture_height: capture_height.max(1),
+            anchor_y,
+        })
+        .map_err(|_| "camera worker is not running".to_owned())?;
+        self.recording = true;
+        self.recorded_frames = 0;
+        self.recording_path = Some(path);
+        self.recording_status = "starting SER recording...".into();
+        Ok(())
+    }
+
+    pub fn stop_ser_recording(&mut self) {
+        if !self.recording {
+            return;
+        }
+        self.recording_status = "stopping SER recording...".into();
+        self.send_cmd(FocusCmd::StopSer);
     }
 
     fn reset_holds(&mut self) {
@@ -1209,8 +1382,8 @@ impl FocusState {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(format!(
-                    "frame {}×{}  mean {:.0}  ·  {} continuum px",
-                    l.full_w, l.full_h, l.mean, l.n_continuum
+                    "frame {}×{}  mean {:.0}  ·  peak {:.0}  ·  {} continuum px",
+                    l.full_w, l.full_h, l.mean, l.peak, l.n_continuum
                 ))
                 .small()
                 .weak(),
@@ -1619,20 +1792,40 @@ impl FocusState {
         });
     }
 
-    pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    /// Draw the shared live-camera texture without opening another camera.
+    ///
+    /// The Mount tab uses this while auto-centering; Focus continues to add
+    /// its analysis plots below the same image.
+    pub fn camera_preview_ui(&self, ui: &mut egui::Ui, max_height: f32) -> bool {
         if let Some(tex) = &self.tex {
-            let avail = ui.available_width();
+            let avail = ui.available_width().max(1.0);
             let aspect = tex.aspect_ratio();
             let h = (avail / aspect).min(260.0);
-            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(avail, h)));
-        } else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("Start a camera to see the live spectrum.")
-                        .size(18.0)
-                        .weak(),
-                );
+            let h = h.min(max_height).max(1.0);
+            let w = (h * aspect).min(avail);
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, h)));
             });
+            true
+        } else {
+            let placeholder_height = max_height.min(140.0).max(60.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), placeholder_height),
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new("Start a camera to see the live spectrum.")
+                            .size(18.0)
+                            .weak(),
+                    );
+                },
+            );
+            false
+        }
+    }
+
+    pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        if !self.camera_preview_ui(ui, 260.0) {
             return;
         }
 
@@ -1913,7 +2106,7 @@ fn vcurve_plot(ui: &mut egui::Ui, id: &str, series: &[(&str, egui::Color32, &VCu
                 p.points(
                     Points::new(PlotPoints::from(pts))
                         .color(*color)
-                        .radius(3.5)
+                        .radius(3.5_f32)
                         .name(*name),
                 );
                 let Some(f) = curve.fit() else { continue };
@@ -2236,6 +2429,7 @@ fn worker(
     gain: u16,
     auto_exposure: bool,
     dispersion_horizontal: bool,
+    frame_pending: Arc<AtomicBool>,
 ) {
     let mut disp_h = dispersion_horizontal;
     let mut cam = match open(&info) {
@@ -2252,6 +2446,8 @@ fn worker(
         let _ = tx.send(FocusMsg::Error(e.to_string()));
         return;
     }
+    let mut pending_ser: Option<SerRequest> = None;
+    let mut active_ser: Option<ActiveSer> = None;
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2266,10 +2462,96 @@ fn worker(
                     cam.set_auto_exposure(on).ok();
                 }
                 FocusCmd::Dispersion(h) => disp_h = h,
+                FocusCmd::StartSer {
+                    path,
+                    capture_height,
+                    anchor_y,
+                } => {
+                    if let Some(active) = active_ser.take() {
+                        finish_ser(active, &tx);
+                    }
+                    pending_ser = Some(SerRequest {
+                        path,
+                        capture_height,
+                        anchor_y,
+                    });
+                }
+                FocusCmd::StopSer => {
+                    let pending_path = pending_ser.take().map(|request| request.path);
+                    if let Some(active) = active_ser.take() {
+                        finish_ser(active, &tx);
+                    } else if let Some(path) = pending_path {
+                        let _ = tx.send(FocusMsg::RecordingStopped { path, frames: 0 });
+                    }
+                }
             }
         }
         match cam.next_frame(1000) {
             Ok(frame) => {
+                if let Some(request) = pending_ser.take() {
+                    let (y0, height) = vertical_crop_bounds(
+                        frame.height,
+                        request.capture_height,
+                        request.anchor_y,
+                    );
+                    match SerRecorder::create(
+                        &request.path,
+                        frame.width,
+                        height,
+                        &info.name,
+                        "Spectroheliograph",
+                    ) {
+                        Ok(recorder) => {
+                            let _ = tx.send(FocusMsg::RecordingStarted {
+                                path: request.path.clone(),
+                                width: frame.width,
+                                height,
+                            });
+                            active_ser = Some(ActiveSer {
+                                path: request.path,
+                                y0,
+                                height,
+                                recorder,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(FocusMsg::RecordingError(error.to_string()));
+                        }
+                    }
+                }
+
+                let mut recording_failed = None;
+                if let Some(active) = active_ser.as_mut() {
+                    if frame.width == 0
+                        || active.y0.saturating_add(active.height) > frame.height
+                    {
+                        recording_failed =
+                            Some("camera dimensions changed during recording".to_owned());
+                    } else {
+                        let start = active.y0 * frame.width;
+                        let end = start + active.height * frame.width;
+                        match active.recorder.write_frame(&frame.data[start..end]) {
+                            Ok(()) => {
+                                let frames = active.recorder.frame_count();
+                                if frames == 1 || frames % 10 == 0 {
+                                    let _ = tx.send(FocusMsg::RecordingProgress(frames));
+                                }
+                            }
+                            Err(error) => recording_failed = Some(error.to_string()),
+                        }
+                    }
+                }
+                if let Some(error) = recording_failed {
+                    active_ser.take();
+                    let _ = tx.send(FocusMsg::RecordingError(error));
+                }
+
+                // Always acquire (and therefore drain the camera/SDK), but do
+                // not spend time processing or queueing another preview while
+                // egui still has one waiting. This bounds preview latency.
+                if frame_pending.load(Ordering::Acquire) {
+                    continue;
+                }
                 // Both axes, every frame: the two line families separate cleanly
                 // because averaging one axis cancels lines parallel to it.
                 let prof_x = frame.mean_profile(true); // dips = vertical lines
@@ -2287,6 +2569,7 @@ fn worker(
                 } else {
                     (prof_x.iter().map(|&v| v as f64).sum::<f64>() / prof_x.len() as f64) as f32
                 };
+                let peak = robust_peak_signal(&frame.data);
                 // Stage B: cut the frame along the slit using continuum
                 // dispersion positions only. The line core is low-contrast
                 // chromosphere and its focus curve is flattened by scattered
@@ -2307,7 +2590,7 @@ fn worker(
                 let (strip, sw, sh) = make_strip(&frame);
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
-                let _ = tx.send(FocusMsg::Frame(Box::new(FocusUpdate {
+                let update = Box::new(FocusUpdate {
                     slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
                     n_continuum,
                     limb_width,
@@ -2320,21 +2603,69 @@ fn worker(
                     lines_x,
                     lines_y,
                     mean,
+                    peak,
                     full_w: frame.width,
                     full_h: frame.height,
                     cur_exposure,
                     cur_gain,
-                })));
-                ctx.request_repaint();
+                });
+                if frame_pending
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    if tx.send(FocusMsg::Frame(update)).is_err() {
+                        frame_pending.store(false, Ordering::Release);
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
             }
             Err(ghostsun_camera::CameraError::Timeout) => continue,
             Err(e) => {
+                if let Some(active) = active_ser.take() {
+                    finish_ser(active, &tx);
+                }
                 let _ = tx.send(FocusMsg::Error(e.to_string()));
                 break;
             }
         }
     }
+    if let Some(active) = active_ser.take() {
+        finish_ser(active, &tx);
+    }
     cam.stop();
+}
+
+fn finish_ser(active: ActiveSer, tx: &Sender<FocusMsg>) {
+    let path = active.path;
+    match active.recorder.finish() {
+        Ok(frames) => {
+            let _ = tx.send(FocusMsg::RecordingStopped {
+                path,
+                frames,
+            });
+        }
+        Err(error) => {
+            let _ = tx.send(FocusMsg::RecordingError(error.to_string()));
+        }
+    }
+}
+
+fn vertical_crop_bounds(
+    frame_height: usize,
+    requested_height: usize,
+    anchor_y: f64,
+) -> (usize, usize) {
+    let height = requested_height.clamp(1, frame_height.max(1));
+    let anchor = if anchor_y.is_finite() {
+        anchor_y.round().clamp(0.0, frame_height.saturating_sub(1) as f64) as usize
+    } else {
+        frame_height / 2
+    };
+    let y0 = anchor
+        .saturating_sub(height / 2)
+        .min(frame_height.saturating_sub(height));
+    (y0, height)
 }
 
 fn make_strip(frame: &ghostsun_camera::Frame) -> (Vec<u8>, usize, usize) {
@@ -2365,6 +2696,41 @@ fn make_strip(frame: &ghostsun_camera::Frame) -> (Vec<u8>, usize, usize) {
     (out, sw, sh)
 }
 
+/// Mean of the brightest one percent of a 16-bit frame.
+///
+/// The 4096-bin histogram avoids sorting or cloning a multi-megapixel frame.
+/// The partially used boundary bin is represented by that bin's actual mean.
+fn robust_peak_signal(data: &[u16]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    const BINS: usize = 4096;
+    let mut counts = [0u32; BINS];
+    let mut sums = [0u64; BINS];
+    for &value in data {
+        let bin = (usize::from(value) * BINS) >> 16;
+        counts[bin] += 1;
+        sums[bin] += u64::from(value);
+    }
+
+    let target = data.len().div_ceil(SUN_PEAK_FRACTION).max(1) as u64;
+    let mut remaining = target;
+    let mut selected_sum = 0.0f64;
+    for bin in (0..BINS).rev() {
+        let count = u64::from(counts[bin]);
+        if count == 0 {
+            continue;
+        }
+        let take = remaining.min(count);
+        selected_sum += (sums[bin] as f64 / count as f64) * take as f64;
+        remaining -= take;
+        if remaining == 0 {
+            break;
+        }
+    }
+    (selected_sum / target as f64) as f32
+}
+
 impl Drop for FocusState {
     fn drop(&mut self) {
         self.stop();
@@ -2384,6 +2750,31 @@ pub fn full_roi(info: &CameraInfo) -> Roi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn robust_peak_averages_the_brightest_one_percent() {
+        let mut data = vec![100u16; 990];
+        data.extend(std::iter::repeat_n(1_000u16, 10));
+        assert!((robust_peak_signal(&data) - 1_000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn robust_peak_is_not_owned_by_one_hot_pixel() {
+        let mut data = vec![100u16; 9_900];
+        data.extend(std::iter::repeat_n(1_000u16, 99));
+        data.push(u16::MAX);
+        let peak = robust_peak_signal(&data);
+        assert!(peak > 1_000.0);
+        assert!(peak < 2_000.0, "single hot pixel produced {peak}");
+    }
+
+    #[test]
+    fn vertical_recording_crop_stays_in_sensor_bounds() {
+        assert_eq!(vertical_crop_bounds(1_000, 200, 500.0), (400, 200));
+        assert_eq!(vertical_crop_bounds(1_000, 200, 20.0), (0, 200));
+        assert_eq!(vertical_crop_bounds(1_000, 200, 990.0), (800, 200));
+        assert_eq!(vertical_crop_bounds(1_000, 2_000, 500.0), (0, 1_000));
+    }
 
     fn fit_with(fwhm: f64) -> Fit {
         Fit {
@@ -2405,6 +2796,7 @@ mod tests {
             lines_x: Vec::new(),
             lines_y: Vec::new(),
             mean: 0.0,
+            peak: 0.0,
             full_w: 0,
             full_h: 0,
             cur_exposure: None,

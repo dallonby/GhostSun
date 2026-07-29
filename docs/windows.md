@@ -52,6 +52,46 @@ offset, optional OpenStreetMap place search) and **Sync now**, or enable
 `%APPDATA%\GhostSun\mount_site.json`. Mechanical home position and
 polar/alignment setup still require ASI Mount / the hand controller.
 
+Camera-assisted centering offers two separately confirmed starts:
+**GoTo + center** first slews to the calculated Sun, while **Center from here**
+keeps the current pointing as the search origin. Both modes sample a bounded
+0.2° coarse spiral, use the mean of the brightest one percent of camera pixels
+as a hot-pixel-resistant peak signal, refine the strongest point on a 0.1°
+grid, and return to that refined maximum. Set the search radius so every
+possible nudge remains mechanically and optically safe. The Mount tab displays
+the selected camera's live spectrum and can start or stop its preview directly;
+during auto-center the Stop camera control is locked, while Cancel auto-center
+stops mount motion and restores the previous camera state.
+
+## Guided acquisition
+
+The **Acquire** tab integrates the camera, ZWO mount, SER recording, default
+high-quality reconstruction, and optional multi-scan stacking. It deliberately
+starts from a prepared observing state: the filtered solar disc must already
+be reasonably centred and the telescope and SHG focused. GhostSun displays
+this requirement and will not start a scan until it is acknowledged.
+
+Choose a detected horizontal spectral-line anchor and a vertical capture
+height. GhostSun writes the resulting fixed crop as lossless mono16 SER; the
+live preview remains bounded to the newest frame and cannot build a backlog or
+cause recording frames to be discarded. A manual N/S/E/W scan direction can be
+used, or **Auto-detect scan axis** makes small, reversible N/S and E/W probes
+and compares slit-profile motion. It recommends the more nearly
+slit-perpendicular axis and estimates sensor off-axis angle. An estimate above
+10° produces a warning that must be acknowledged before acquisition.
+
+At the default 60× sidereal rate, GhostSun pre-positions half the selected
+span from the current (assumed centred) point, records pre-roll, scans across
+the disc, and records post-roll. Multi-scan mode alternates direction without
+an unnecessary return slew. Each SER is reconstructed independently; reverse
+passes are flipped consistently, then registered and robust-stacked with
+evolution compensation. The session folder retains every SER, individual
+16-bit PNG/FITS reconstruction, and the final PNG/FITS product.
+
+All automated motion requires both the prepared-observation and safe-motion
+confirmations. **STOP**, leaving Acquire, a mount error, or a disconnect sends
+a mount stop and closes any active SER.
+
 ## ToupTek cameras
 
 The Focus view uses ToupTek's 64-bit SDK at runtime. GhostSun searches beside

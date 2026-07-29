@@ -5,6 +5,7 @@
     windows_subsystem = "windows"
 )]
 
+mod acquire;
 mod focus;
 mod focusmetrics;
 mod gong;
@@ -89,6 +90,7 @@ enum ViewMode {
     Velocity,
     Focus,
     Mount,
+    Acquire,
 }
 
 enum Job {
@@ -161,6 +163,7 @@ struct App {
     show_before_demix: bool,
     focus: focus::FocusState,
     mount: mount::MountState,
+    acquire: acquire::AcquireState,
 }
 
 impl App {
@@ -197,6 +200,7 @@ impl App {
             show_before_demix: false,
             focus: focus::FocusState::default(),
             mount: mount::MountState::default(),
+            acquire: acquire::AcquireState::default(),
         }
     }
 
@@ -572,7 +576,7 @@ impl App {
                     return;
                 }
             }
-            ViewMode::Focus | ViewMode::Mount => return, // These modes render their own views
+            ViewMode::Focus | ViewMode::Mount | ViewMode::Acquire => return,
         };
         self.texture = Some(ctx.load_texture(
             "main",
@@ -666,6 +670,23 @@ impl eframe::App for App {
         } else if self.mode == ViewMode::Mount {
             self.focus.poll(ctx);
             self.mount.poll(ctx, &mut self.focus);
+        } else if self.mode == ViewMode::Acquire {
+            self.focus.poll(ctx);
+            self.mount.poll(ctx, &mut self.focus);
+            if let Some(output) =
+                self.acquire
+                    .poll(ctx, &mut self.focus, &mut self.mount)
+            {
+                self.set_loaded(
+                    output.image,
+                    None,
+                    None,
+                    output.name,
+                    Some(output.source_ser),
+                );
+                self.log
+                    .push("guided acquisition complete; final image loaded".into());
+            }
         }
 
         // open a file passed on the command line (once)
@@ -740,14 +761,21 @@ impl eframe::App for App {
                             }
                             ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
                             ui.selectable_value(&mut mode, ViewMode::Mount, "Mount");
+                            ui.selectable_value(&mut mode, ViewMode::Acquire, "Acquire");
                             ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
                             if mode != self.mode {
                                 // leaving Focus: stop the camera stream
-                                if self.mode == ViewMode::Focus {
+                                if self.mode == ViewMode::Focus
+                                    && !matches!(mode, ViewMode::Mount | ViewMode::Acquire)
+                                {
                                     self.focus.stop();
                                 }
                                 if self.mode == ViewMode::Mount {
                                     self.mount.leave_tab(&mut self.focus);
+                                }
+                                if self.mode == ViewMode::Acquire {
+                                    self.acquire
+                                        .leave_tab(&mut self.focus, &mut self.mount);
                                 }
                                 // entering Focus: discover cameras once
                                 if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
@@ -755,6 +783,9 @@ impl eframe::App for App {
                                 }
                                 if mode == ViewMode::Mount {
                                     self.mount.enter_tab(&mut self.focus);
+                                }
+                                if mode == ViewMode::Acquire {
+                                    self.acquire.enter_tab(&mut self.focus);
                                 }
                                 self.mode = mode;
                                 self.texture = None;
@@ -772,7 +803,12 @@ impl eframe::App for App {
             .show(ctx, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             if self.mode == ViewMode::Focus {
-                self.focus.controls_ui(ui, ctx);
+                egui::ScrollArea::vertical()
+                    .id_salt("focus_side_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.focus.controls_ui(ui, ctx);
+                    });
                 return;
             }
             if self.mode == ViewMode::Mount {
@@ -782,6 +818,23 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         self.mount.controls_ui(ui, &mut self.focus);
+                    });
+                return;
+            }
+            if self.mode == ViewMode::Acquire {
+                egui::ScrollArea::vertical()
+                    .id_salt("acquire_side_scroll")
+                    .scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                    )
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.acquire.controls_ui(
+                            ui,
+                            ctx,
+                            &mut self.focus,
+                            &mut self.mount,
+                        );
                     });
                 return;
             }
@@ -1017,6 +1070,10 @@ impl eframe::App for App {
                 }
                 if self.mode == ViewMode::Mount {
                     self.mount.view_ui(ui, ctx, &mut self.focus);
+                    return;
+                }
+                if self.mode == ViewMode::Acquire {
+                    self.acquire.view_ui(ui, &self.focus);
                     return;
                 }
                 self.build_texture(ctx);
