@@ -250,6 +250,9 @@ pub struct EvalResult {
     pub band_snr: [f64; 4],
     /// max sector photometric deviation, percent
     pub flat_pct: f64,
+    /// RMS of the ROW-STRUCTURED residual, percent of peak. This is the slit
+    /// dust / transversalium signature specifically; lower is cleaner.
+    pub row_dust_pct: f64,
 }
 
 pub fn evaluate(recon: &Image, gt: &Image) -> Option<EvalResult> {
@@ -330,7 +333,57 @@ pub fn evaluate(recon: &Image, gt: &Image) -> Option<EvalResult> {
         limb_sigma: limb_sigma(&na, &gf),
         band_snr: band_snr(&na, &ng, &disk_mask),
         flat_pct: sector_flatness(&na, &ng, &gf),
+        row_dust_pct: row_pattern_residual(&na, &ng, &disk_mask),
     })
+}
+
+/// RMS of the row-structured component of the residual, as a percent of peak.
+///
+/// Slit dust is a per-row multiplicative gain, and the geometry model
+/// `x = sx*(u + k*v), y = v` leaves y untouched, so dust survives the warp as a
+/// pure per-row pattern. That makes it separable from everything else in the
+/// residual: collapse along x with a MEDIAN -- robust, because real solar
+/// structure is not row-aligned and averages out while a row-wide gain error
+/// does not -- then high-pass the resulting profile to drop smooth photometric
+/// error and keep the dust scale.
+///
+/// Reported separately from PSNR because dust is a small fraction of total
+/// error yet the thing a dithered stack is supposed to remove; a metric that
+/// buries it under photon noise cannot answer whether dithering worked.
+fn row_pattern_residual(na: &Image, ng: &Image, disk_mask: &[bool]) -> f64 {
+    let (w, h) = (na.w, na.h);
+    let mut prof = vec![0.0f64; h];
+    let mut valid = vec![false; h];
+    let mut scratch: Vec<f64> = Vec::with_capacity(w);
+    for y in 0..h {
+        scratch.clear();
+        for x in 0..w {
+            let i = y * w + x;
+            if disk_mask[i] {
+                scratch.push((na.data[i] - ng.data[i]) as f64);
+            }
+        }
+        // Too few disk pixels to trust a median -- the top and bottom rows.
+        if scratch.len() >= 16 {
+            prof[y] = crate::mathutil::median_inplace(&mut scratch);
+            valid[y] = true;
+        }
+    }
+    // High-pass at a scale well above the dust width but below the disc.
+    let smooth = crate::mathutil::gaussian_smooth(&prof, 8.0);
+    let mut ss = 0.0;
+    let mut n = 0.0;
+    for y in 0..h {
+        if valid[y] {
+            let d = prof[y] - smooth[y];
+            ss += d * d;
+            n += 1.0;
+        }
+    }
+    if n < 8.0 {
+        return 0.0;
+    }
+    100.0 * (ss / n).sqrt()
 }
 
 /// Erf-transition width of the limb: average radial derivative profile over

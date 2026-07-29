@@ -50,6 +50,10 @@ struct SynthArgs {
     /// number of sequential scans (multi-scan stacking tests)
     #[arg(long, default_value_t = 1)]
     scans: usize,
+    /// deliberate along-slit dither between scans, peak-to-peak in slit px
+    /// (0 = historical random +/-5 px pointing scatter)
+    #[arg(long, default_value_t = 0.0)]
+    dither: f64,
     /// signal level multiplier (low-SNR tests)
     #[arg(long, default_value_t = 1.0)]
     exposure: f64,
@@ -80,6 +84,7 @@ impl SynthArgs {
             flexure_px: self.flexure,
             psf_seeing_px: self.psf,
             n_scans: self.scans,
+            dither_px: self.dither,
             exposure: self.exposure,
             telluric: self.telluric,
             bursts: self.bursts,
@@ -186,7 +191,8 @@ enum Cmd {
     Gpucheck,
     /// Render a colorized PNG (black background, prominences preserved)
     Colorize {
-        /// input reconstruction (.fits from `recon`/`stack`, or 16-bit PNG)
+        /// input reconstruction (.fits from `recon`/`stack`, or 16-bit PNG);
+        /// the first input defines the reference grid and orientation
         input: PathBuf,
         #[arg(long)]
         out: Option<PathBuf>,
@@ -766,13 +772,16 @@ fn main() {
                     }
                 })
                 .collect();
-            match stack::stack(&images, !no_flow, true) {
+            match stack::stack_with_reference(&images, !no_flow, true, Some(0)) {
                 Some(rep) => {
                     let mx = rep.image.max();
                     output::write_png16(&out_dir.join(format!("{name}_linear.png")), &rep.image, Some((0.0, mx))).unwrap();
                     output::write_png16(&out_dir.join(format!("{name}_display.png")), &rep.image, None).unwrap();
                     output::write_fits_f32(&out_dir.join(format!("{name}.fits")), &rep.image).unwrap();
                     println!("stacked {} scans -> {}/{}.fits", rep.n_used, out_dir.display(), name);
+                    if rep.n_flipped > 0 {
+                        println!("note: {} scan(s) arrived x-mirrored and were auto-flipped; check --flip-x usage", rep.n_flipped);
+                    }
                 }
                 None => {
                     eprintln!("stacking failed");
@@ -939,14 +948,29 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         }
         for (label, flow) in [("Stack-no-flow", false), ("Stack-flow", true)] {
             // reference scan 0: the ground truth is the scan-0 sun
-            if let Some(srep) = stack::stack_with_reference(&recons, flow, false, Some(0)) {
+            if let Some(srep) = stack::stack_with_reference(&recons, flow, std::env::var("GS_STACK_DEBUG").is_ok(), Some(0)) {
                 let stem = label.to_lowercase();
                 let mx = srep.image.max();
                 output::write_png16(&dir.join(format!("{stem}_linear.png")), &srep.image, Some((0.0, mx))).unwrap();
+                // Report how many scans actually survived registration: a
+                // dropped scan changes the result silently otherwise.
+                let mut label = if srep.n_used == params.n_scans {
+                    label.to_string()
+                } else {
+                    format!("{label}[{}/{}]", srep.n_used, params.n_scans)
+                };
+                if srep.n_flipped > 0 {
+                    label = format!("{label}[flip {}]", srep.n_flipped);
+                }
                 match metrics::evaluate(&srep.image, &gt_blurred) {
-                    Some(m) => print_row(label, &Some(m), &None),
+                    Some(m) => print_row(&label, &Some(m), &None),
                     None => println!("{label:<18} eval failed"),
                 }
+            } else {
+                // Silence here reads as "no multi-scan row", not as a failure,
+                // which hides a real regression: the stacker returns None when
+                // the scans are offset too far to register.
+                println!("{label:<18} stacking failed (registration returned nothing)");
             }
         }
     }
@@ -973,8 +997,8 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
 
 fn print_header(vel: bool) {
     print!(
-        "{:<18} {:>9} {:>7} {:>9} {:>6} {:>6} {:>6}",
-        "variant", "PSNR", "SSIM", "PSNRlimb", "limbσ", "flat%", "band4"
+        "{:<18} {:>9} {:>7} {:>9} {:>6} {:>6} {:>6} {:>6}",
+        "variant", "PSNR", "SSIM", "PSNRlimb", "limbσ", "flat%", "band4", "dust%"
     );
     if vel {
         print!(" {:>7}", "vRMS");
@@ -986,8 +1010,9 @@ fn print_row(name: &str, m: &Option<metrics::EvalResult>, vrms: &Option<f64>) {
     match m {
         Some(m) => {
             print!(
-                "{:<18} {:>7.2}dB {:>7.4} {:>7.2}dB {:>6.2} {:>6.2} {:>6.1}",
-                name, m.psnr_disk, m.ssim_disk, m.psnr_limb, m.limb_sigma, m.flat_pct, m.band_snr[3]
+                "{:<18} {:>7.2}dB {:>7.4} {:>7.2}dB {:>6.2} {:>6.2} {:>6.1} {:>6.3}",
+                name, m.psnr_disk, m.ssim_disk, m.psnr_limb, m.limb_sigma, m.flat_pct,
+                m.band_snr[3], m.row_dust_pct
             );
             if let Some(v) = vrms {
                 print!(" {:>7.4}", v);

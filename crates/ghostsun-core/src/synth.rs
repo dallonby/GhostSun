@@ -52,6 +52,13 @@ pub struct SynthParams {
     pub telluric: bool,
     /// fraction of frames hit by seeing bursts (blur + displacement runs)
     pub bursts: f64,
+    /// Deliberate along-slit dither between scans, peak-to-peak in slit px.
+    ///
+    /// Slit dust is fixed in `row_gain[y]` while the Sun is offset per scan, so
+    /// a controlled spread here is what lets a robust stack reject dust: after
+    /// registration the dust lands at a different sky position in every scan.
+    /// 0 keeps the historical random +/-5 px pointing scatter.
+    pub dither_px: f64,
 }
 
 impl Default for SynthParams {
@@ -73,6 +80,7 @@ impl Default for SynthParams {
             flexure_px: 0.0,
             psf_seeing_px: 0.0,
             n_scans: 1,
+            dither_px: 0.0,
             exposure: 1.0,
             telluric: false,
             bursts: 0.0,
@@ -392,8 +400,24 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
         let prom_scale = 1.0 + if scan == 0 { 0.0 } else { rng.gen_range(-0.1..0.1) };
         let model = SunModel::with_evolution(p.radius, p.seed, evo_dx, prom_scale);
 
-        // per-scan pointing offset (0 for the first scan)
-        let (off_x, off_y) = if scan == 0 {
+        // Per-scan pointing offset. With an explicit dither, spread the scans
+        // evenly across the requested span and centre it on zero, so no two
+        // scans place dust at the same sky position and the disc stays centred
+        // in the slit -- random offsets can cluster and leave dust correlated.
+        let (off_x, off_y) = if p.dither_px > 0.0 {
+            // Scan 0 MUST stay at zero: the ground-truth image is rendered from
+            // it, so offsetting it displaces truth from every reconstruction
+            // and the comparison collapses. The remaining scans spread evenly
+            // across the requested span, which is all dust decorrelation needs
+            // -- what matters is that no two scans share a slit position.
+            let n = p.n_scans.max(1) as f64;
+            let off = if scan == 0 || n < 2.0 {
+                0.0
+            } else {
+                p.dither_px * (scan as f64 / (n - 1.0) - 0.5)
+            };
+            (0.0, off)
+        } else if scan == 0 {
             (0.0, 0.0)
         } else {
             (rng.gen_range(-5.0..5.0), rng.gen_range(-5.0..5.0))
