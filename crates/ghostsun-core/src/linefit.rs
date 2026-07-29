@@ -140,6 +140,42 @@ fn max_line_depth_dispersion_along_width(img: &Image) -> f64 {
         if cont < 1.0 {
             continue;
         }
+        // A real absorption line recovers on BOTH sides. An illumination STEP --
+        // the solar limb sitting near a slit end, or a vignetted margin -- only
+        // recovers on one side, yet `cont` above takes the maximum across both
+        // and so scores the bright side against the dark one as a near-total
+        // absorption. That is not hypothetical: a disc offset 15 px along the
+        // slit scored 0.984 transposed against 0.669 native, flipping the frame
+        // orientation and transposing the entire reconstruction (900x160 rather
+        // than 900x600), which collapsed limb detection and produced a radius
+        // nine times too large. Requiring two-sided recovery is what separates a
+        // line from an edge; depth alone cannot.
+        let half = sm[x] + 0.5 * (cont - sm[x]);
+        // Span sized to real spectral lines, which are NARROW: the Halpha core
+        // is ~10-30 px at working dispersions (the ~200 px figure sometimes
+        // quoted is the ROI crop height around the line, not the line). The
+        // tight window also does double duty on the transposed axis: a sunspot
+        // is a 50-200 px dip in the along-slit profile that recovers on BOTH
+        // sides -- unlike the slit-end step -- so a generous span would let it
+        // count as a "line" on the wrong axis. At 60 px its recovery lies
+        // outside the window and it is rejected along with the step.
+        let span = (img.w / 8).clamp(20, 60);
+        let recovers = |dir: isize| {
+            let mut i = x as isize;
+            for _ in 0..span {
+                i += dir;
+                if i < 0 || i as usize >= sm.len() {
+                    return false;
+                }
+                if sm[i as usize] >= half {
+                    return true;
+                }
+            }
+            false
+        };
+        if !recovers(-1) || !recovers(1) {
+            continue;
+        }
         let d = (cont - sm[x]) / cont;
         if d > best {
             best = d;
@@ -1199,6 +1235,114 @@ pub fn fit_lines_1d(profile: &[f64], min_depth: f64) -> Vec<LineFit1d> {
         merged.push(f);
     }
     merged
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+    use crate::image2d::Image;
+
+    /// 160 wide (dispersion) x 600 tall (slit): a narrow absorption line on the
+    /// dispersion axis, and a dark band at one end of the SLIT -- the solar limb
+    /// sitting near the slit end when the disc does not fill it.
+    fn line_plus_slit_edge(dark_from: usize) -> Image {
+        let (w, h) = (160usize, 600usize);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = 3000.0f32;
+                // Narrow line at x = 80, ~6 px sigma: recovers on BOTH sides.
+                let d = (x as f32 - 80.0) / 6.0;
+                v *= 1.0 - 0.6 * (-0.5 * d * d).exp();
+                // Illumination step along the slit: recovers on ONE side only.
+                if y >= dark_from {
+                    v *= 0.02;
+                }
+                img.set(x, y, v);
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn slit_end_darkness_is_not_mistaken_for_a_spectral_line() {
+        // The disc leaves the last 60 rows of the slit dark. Scoring on depth
+        // alone read that step as a 98% "absorption line" and transposed the
+        // frame, which collapsed limb detection and produced a radius nine
+        // times too large.
+        let img = line_plus_slit_edge(540);
+        let (transpose, native, transposed) = should_transpose_for_dispersion(&img);
+        assert!(!transpose, "native {native:.3} vs transposed {transposed:.3}");
+        assert!(native > 0.4, "the real line should still score: {native:.3}");
+        assert!(
+            transposed < native,
+            "a one-sided step must not outscore a real line: {transposed:.3}"
+        );
+    }
+
+    #[test]
+    fn a_fully_lit_slit_is_unaffected() {
+        // No step at all: the same frame must still choose native.
+        let img = line_plus_slit_edge(usize::MAX);
+        let (transpose, native, _) = should_transpose_for_dispersion(&img);
+        assert!(!transpose);
+        assert!(native > 0.4, "{native:.3}");
+    }
+
+    #[test]
+    fn real_frame_geometry_scores_native_despite_dust_spots_and_dark_ends() {
+        // The user's capture in pipeline orientation (dispersion along width
+        // after the SER transpose): a ~200 px crop around Halpha, slit along
+        // height. The line core is narrow; dust is a few dark ROWS (fixed slit
+        // positions, all wavelengths); a sunspot is a 150-row darker band; the
+        // slit ends are dark. Native must win, and the sunspot dip -- which
+        // recovers on both sides, unlike the step -- must be rejected by the
+        // recovery WINDOW, not by one-sidedness.
+        let (w, h) = (200usize, 600usize);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = 3000.0f32;
+                let d = (x as f32 - 100.0) / 7.0; // core FWHM ~16 px
+                v *= 1.0 - 0.65 * (-0.5 * d * d).exp();
+                if (300..450).contains(&y) {
+                    v *= 0.75; // sunspot band along the slit
+                }
+                for y0 in [120usize, 480, 520] {
+                    if y >= y0 && y < y0 + 5 {
+                        v *= 0.88; // dust rows
+                    }
+                }
+                if y < 60 || y >= 560 {
+                    v *= 0.02; // disc short of the slit ends
+                }
+                img.set(x, y, v);
+            }
+        }
+        let (transpose, native, transposed) = should_transpose_for_dispersion(&img);
+        assert!(!transpose, "native {native:.3} vs transposed {transposed:.3}");
+        assert!(native > 0.4, "narrow real line must score: {native:.3}");
+        assert!(
+            transposed < 0.3,
+            "slit-axis structure must stay below the real line: {transposed:.3}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_line_on_the_other_axis_still_transposes() {
+        // Guard against over-correcting: a real narrow line along the HEIGHT
+        // axis must still be detected and the frame transposed.
+        let (w, h) = (600usize, 160usize);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let d = (y as f32 - 80.0) / 6.0;
+                img.set(x, y, 3000.0 * (1.0 - 0.6 * (-0.5 * d * d).exp()));
+            }
+        }
+        let (transpose, native, transposed) = should_transpose_for_dispersion(&img);
+        assert!(transpose, "native {native:.3} vs transposed {transposed:.3}");
+    }
 }
 
 #[cfg(test)]

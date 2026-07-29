@@ -219,6 +219,14 @@ pub struct RansacResult {
     pub residual_rms: f64,
 }
 
+/// How much larger than the observed limb span a regularized disc may be.
+///
+/// Generous: a genuinely partial FOV shows only an arc, so the true diameter
+/// does exceed the observed span. Three times allows for seeing roughly a third
+/// of the disc while still rejecting the order-of-magnitude errors a degenerate
+/// conic produces.
+const MAX_DIAMETER_OVER_LIMB_SPAN: f64 = 3.0;
+
 /// When the fitted circle is much larger than the raw-disk FOV, the limb
 /// arcs were nearly parallel (sun fills / exceeds the slit; few scan frames).
 /// The conic is ill-conditioned and produces a giant empty canvas. Replace
@@ -267,6 +275,15 @@ pub fn regularize_partial_fov(
     } else {
         diameter
     };
+    // Plausibility gate. `extent_x / sx` above divides by a quantity that is
+    // ITSELF part of the degenerate fit, so it inherits and amplifies that
+    // fit's error -- which is how a disc reconstructed with a wrongly
+    // transposed frame produced sx 0.119 and a radius of 2243 against a true
+    // 255, "regularized" from an equally wrong 2220. Bound the result by the
+    // one measurement that does not depend on the conic at all: the span of
+    // limb points actually observed. A disc several times larger than any edge
+    // we detected is not supported by the data, whatever the fit claims.
+    let diameter = diameter.min(MAX_DIAMETER_OVER_LIMB_SPAN * extent_y.max(extent_x));
     let radius = 0.5 * diameter;
     let sx = geom.sx.clamp(0.02, 6.0);
     let shear = geom.shear.clamp(-0.5, 0.5);
@@ -381,4 +398,59 @@ pub fn fit_robust(points: &[EdgePoint], seed: u64) -> Option<RansacResult> {
         total: n,
         residual_rms: rms,
     })
+}
+
+#[cfg(test)]
+mod regularize_tests {
+    use super::*;
+    use crate::limb::EdgePoint;
+
+    fn geom(sx: f64, radius: f64) -> EllipseGeom {
+        EllipseGeom {
+            xc: 450.0,
+            yc: 300.0,
+            an: 0.0,
+            bn: 0.0,
+            cn: 0.0,
+            sx,
+            shear: 0.0,
+            radius,
+        }
+    }
+
+    fn box_points(extent_x: f64, extent_y: f64) -> Vec<EdgePoint> {
+        vec![
+            EdgePoint { x: 0.0, y: 0.0, weight: 1.0 },
+            EdgePoint { x: extent_x, y: extent_y, weight: 1.0 },
+        ]
+    }
+
+    #[test]
+    fn a_degenerate_fit_cannot_produce_a_disc_far_larger_than_the_limb_span() {
+        // The observed failure: a wrongly transposed frame gave sx 0.119 and a
+        // radius of 2243 against a true 255, and the regularizer passed it
+        // through almost unchanged because extent_x / sx inherits the same bad
+        // sx. Limb points spanned only ~267 x 160.
+        let out = regularize_partial_fov(&geom(0.119, 2220.0), &box_points(267.0, 160.0), 900, 160);
+        let bound = 0.5 * MAX_DIAMETER_OVER_LIMB_SPAN * 267.0;
+        assert!(out.radius <= bound + 1e-6, "radius {} exceeds {bound}", out.radius);
+        assert!(out.radius < 2220.0 * 0.5, "radius {} barely changed", out.radius);
+    }
+
+    #[test]
+    fn a_healthy_fit_passes_through_untouched() {
+        // Radius comparable to the limb box: the regularizer must not meddle.
+        let g = geom(1.61, 255.0);
+        let out = regularize_partial_fov(&g, &box_points(820.0, 510.0), 900, 600);
+        assert!((out.radius - g.radius).abs() < 1e-9);
+        assert!((out.sx - g.sx).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_genuinely_partial_fov_may_still_exceed_its_observed_span() {
+        // Only an arc visible: the true disc IS larger than the limb box, so the
+        // gate must be generous enough not to defeat the feature it guards.
+        let out = regularize_partial_fov(&geom(0.08, 9000.0), &box_points(300.0, 120.0), 900, 120);
+        assert!(out.radius > 150.0, "over-clamped to {}", out.radius);
+    }
 }
