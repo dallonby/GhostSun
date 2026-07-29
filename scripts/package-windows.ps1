@@ -60,8 +60,21 @@ try {
     Copy-Item -LiteralPath (Join-Path $repoRoot "docs\windows.md") `
         -Destination (Join-Path $packageDir "README-Windows.md")
 
+    # The ToupTek SDK loads at runtime from next to the executable; without it
+    # the packaged app cannot see ToupTek cameras unless the SDK happens to be
+    # installed system-wide. The 0.3.0 zip shipped without it. Fail the build
+    # if the vendored DLL is missing rather than package silently without it.
+    $toupcam = Join-Path $repoRoot "vendor\windows\camera-sdk\x64\toupcam.dll"
+    if (-not (Test-Path -LiteralPath $toupcam -PathType Leaf)) {
+        throw "Vendored camera SDK missing: $toupcam"
+    }
+    Copy-Item -LiteralPath $toupcam -Destination (Join-Path $packageDir "toupcam.dll")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "vendor\windows\camera-sdk\NOTICE-ToupTek.txt") `
+        -Destination (Join-Path $packageDir "NOTICE-ToupTek.txt")
+
     $hash = (Get-FileHash -LiteralPath (Join-Path $packageDir "GhostSun.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  GhostSun.exe" | Set-Content -LiteralPath (Join-Path $packageDir "SHA256SUMS.txt") -Encoding ascii
+    $dllHash = (Get-FileHash -LiteralPath (Join-Path $packageDir "toupcam.dll") -Algorithm SHA256).Hash.ToLowerInvariant()
+    @("$hash  GhostSun.exe", "$dllHash  toupcam.dll") | Set-Content -LiteralPath (Join-Path $packageDir "SHA256SUMS.txt") -Encoding ascii
 
     if (Test-Path -LiteralPath $archive) {
         Remove-Item -LiteralPath $archive -Force
