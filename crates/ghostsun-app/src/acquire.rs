@@ -44,6 +44,8 @@ const PREPOSITION_REQUIRED_SAMPLES: usize = 2;
 const SCAN_DISC_PRESENT_FRACTION: f32 = 0.45;
 const SCAN_SIGNAL_REQUIRED_SAMPLES: usize = 2;
 const SCAN_TAIL_CHECK: Duration = Duration::from_millis(1500);
+const RECENTER_SETTLE: Duration = Duration::from_millis(400);
+const RECENTER_CHECK_TIMEOUT: Duration = Duration::from_millis(1800);
 
 pub struct AcquireOutput {
     pub image: Image,
@@ -68,6 +70,8 @@ enum RunPhase {
     ScanTailCheck,
     PostRoll,
     WaitingForRecorder,
+    Recentering,
+    RecenterCheck,
     Processing,
 }
 
@@ -90,6 +94,10 @@ struct ScanRun {
     scan_present_samples: usize,
     scan_seen_disc: bool,
     scan_clear_samples: usize,
+    scan_entry_at: Option<Instant>,
+    scan_exit_at: Option<Instant>,
+    recenter_last_seq: u64,
+    recenter_present_samples: usize,
     settle_until: Instant,
     deadline: Instant,
 }
@@ -425,6 +433,8 @@ impl AcquireState {
                     run.scan_present_samples = 0;
                     run.scan_seen_disc = false;
                     run.scan_clear_samples = 0;
+                    run.scan_entry_at = None;
+                    run.scan_exit_at = None;
                     mount.start_acquisition_nudge(
                         direction,
                         scan_duration(run.scan_span_deg, run.rate_multiple),
@@ -524,10 +534,65 @@ impl AcquireState {
                         self.status =
                             format!("Scan {} saved; settling for reverse scan", run.scan_index);
                     } else {
-                        let files = run.files.clone();
-                        let session_dir = run.session_dir.clone();
-                        self.start_processing(files, session_dir, ctx);
-                        run.phase = RunPhase::Processing;
+                        let final_direction =
+                            scan_direction(run.direction, run.scan_index.saturating_sub(1));
+                        let (distance_deg, duration) = recenter_motion(&run)?;
+                        mount.start_acquisition_nudge(
+                            final_direction.opposite(),
+                            duration,
+                            PROBE_RATE_INDEX,
+                        )?;
+                        run.phase = RunPhase::Recentering;
+                        run.recenter_last_seq = focus
+                            .sun_signal_sample()
+                            .map(|(seq, _)| seq)
+                            .unwrap_or(run.scan_last_seq);
+                        run.recenter_present_samples = 0;
+                        self.status = format!(
+                            "Scans saved; re-centring {:.2}° toward {}",
+                            distance_deg,
+                            final_direction.opposite().label()
+                        );
+                    }
+                }
+                RunPhase::Recentering if mount.take_acquisition_nudge_done() => {
+                    run.phase = RunPhase::RecenterCheck;
+                    run.settle_until = Instant::now() + RECENTER_SETTLE;
+                    run.deadline = Instant::now() + RECENTER_CHECK_TIMEOUT;
+                    self.status = "Re-centred position reached; checking camera signal".into();
+                }
+                RunPhase::RecenterCheck if Instant::now() >= run.settle_until => {
+                    if let Some((seq, signal)) = focus
+                        .sun_signal_sample()
+                        .filter(|(seq, signal)| {
+                            *seq > run.recenter_last_seq && signal.is_finite()
+                        })
+                    {
+                        run.recenter_last_seq = seq;
+                        let fraction = signal / run.preposition_baseline;
+                        if fraction >= SCAN_DISC_PRESENT_FRACTION {
+                            run.recenter_present_samples += 1;
+                        } else {
+                            run.recenter_present_samples = 0;
+                        }
+                        self.status = format!(
+                            "Verifying re-centre: disc signal {:.0}%",
+                            (fraction * 100.0).clamp(0.0, 999.0)
+                        );
+                        if run.recenter_present_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES {
+                            self.status =
+                                "Disc re-centred and verified; starting reconstruction".into();
+                            self.begin_processing(&mut run, ctx);
+                        }
+                    }
+                    if run.phase == RunPhase::RecenterCheck && Instant::now() >= run.deadline {
+                        self.log.push(
+                            "Warning: re-centre motion completed, but camera signal was not verified"
+                                .into(),
+                        );
+                        self.status =
+                            "Re-centre could not be verified; processing the saved scans".into();
+                        self.begin_processing(&mut run, ctx);
                     }
                 }
                 _ => {}
@@ -633,6 +698,10 @@ impl AcquireState {
             scan_present_samples: 0,
             scan_seen_disc: false,
             scan_clear_samples: 0,
+            scan_entry_at: None,
+            scan_exit_at: None,
+            recenter_last_seq: preposition_last_seq,
+            recenter_present_samples: 0,
             settle_until: Instant::now(),
             deadline: Instant::now(),
         };
@@ -704,6 +773,13 @@ impl AcquireState {
             }
             repaint.request_repaint();
         });
+    }
+
+    fn begin_processing(&mut self, run: &mut ScanRun, ctx: &egui::Context) {
+        let files = run.files.clone();
+        let session_dir = run.session_dir.clone();
+        self.start_processing(files, session_dir, ctx);
+        run.phase = RunPhase::Processing;
     }
 
     fn abort(&mut self, focus: &mut focus::FocusState, mount: &mut MountState, reason: &str) {
@@ -1109,7 +1185,61 @@ impl AcquireState {
 
     pub fn view_ui(&mut self, ui: &mut egui::Ui, focus: &focus::FocusState) {
         ui.heading("Live acquisition view");
-        focus.camera_preview_ui(ui, 520.0);
+        let selectable = self.run.is_none();
+        if let Some(anchor) = focus.acquisition_preview_ui(
+            ui,
+            420.0,
+            self.anchor_y,
+            self.capture_height,
+            selectable,
+        ) {
+            self.anchor_y = Some(anchor);
+            self.status = format!("Spectral-line anchor selected at Y = {anchor:.1} px");
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(
+                    self.anchor_y
+                        .map(|y| format!("Selected spectral line: Y = {y:.1} px"))
+                        .unwrap_or_else(|| "No spectral line selected".into()),
+                )
+                .strong()
+                .color(if self.anchor_y.is_some() {
+                    egui::Color32::from_rgb(255, 205, 75)
+                } else {
+                    egui::Color32::YELLOW
+                }),
+            );
+            if !selectable {
+                ui.label(egui::RichText::new("locked during acquisition").small().weak());
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Spectral profile (sensor Y) — click a line to use it as the SER crop anchor",
+            )
+            .small()
+            .color(ACCENT),
+        );
+        let profile_pick = ui
+            .add_enabled_ui(selectable, |ui| {
+                focus.acquisition_spectral_profile_ui(ui, self.anchor_y)
+            })
+            .inner;
+        if let Some(clicked) = profile_pick {
+            let anchor = focus
+                .vertical_anchor_lines()
+                .into_iter()
+                .min_by(|a, b| {
+                    (a.0 - clicked)
+                        .abs()
+                        .total_cmp(&(b.0 - clicked).abs())
+                })
+                .map(|line| line.0)
+                .unwrap_or(clicked);
+            self.anchor_y = Some(anchor);
+            self.status = format!("Spectral-line anchor selected at Y = {anchor:.1} px");
+        }
         ui.separator();
         ui.label(
             egui::RichText::new(
@@ -1178,6 +1308,7 @@ fn observe_scan_signal(
         if run.scan_present_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES {
             run.scan_seen_disc = true;
             run.scan_clear_samples = 0;
+            run.scan_entry_at = Some(Instant::now());
         }
     } else if fraction <= PREPOSITION_CLEAR_FRACTION {
         run.scan_clear_samples += 1;
@@ -1185,10 +1316,35 @@ fn observe_scan_signal(
         run.scan_clear_samples = 0;
     }
 
-    Some((
-        fraction,
-        run.scan_seen_disc && run.scan_clear_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES,
-    ))
+    let cleared =
+        run.scan_seen_disc && run.scan_clear_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES;
+    if cleared && run.scan_exit_at.is_none() {
+        run.scan_exit_at = Some(Instant::now());
+    }
+    Some((fraction, cleared))
+}
+
+fn recenter_motion(run: &ScanRun) -> Result<(f64, Duration), String> {
+    let entry = run
+        .scan_entry_at
+        .ok_or("cannot re-centre because the near-limb time was not measured")?;
+    let exit = run
+        .scan_exit_at
+        .ok_or("cannot re-centre because the far-limb time was not measured")?;
+    let crossing_seconds = exit.saturating_duration_since(entry).as_secs_f64();
+    if !crossing_seconds.is_finite() || crossing_seconds <= 0.0 {
+        return Err("cannot re-centre because the measured disc crossing was invalid".into());
+    }
+
+    // The midpoint between camera-observed limb crossings is the disc centre.
+    // Convert half of that science-rate transit to angular distance, then
+    // return over the same distance at the fast positioning rate.
+    let distance_deg = (crossing_seconds * run.rate_multiple * SIDEREAL_DEG_PER_SEC / 2.0)
+        .clamp(0.05, run.scan_span_deg / 2.0);
+    let duration = Duration::from_secs_f64(
+        distance_deg / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+    );
+    Ok((distance_deg, duration))
 }
 
 fn scan_path(session_dir: &Path, index: usize) -> PathBuf {

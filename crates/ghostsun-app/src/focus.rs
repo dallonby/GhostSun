@@ -1824,6 +1824,140 @@ impl FocusState {
         }
     }
 
+    /// Draw the acquisition preview with sensor-Y spectral-line overlays.
+    /// Returns the nearest detected line when the user clicks the image.
+    pub fn acquisition_preview_ui(
+        &self,
+        ui: &mut egui::Ui,
+        max_height: f32,
+        selected_y: Option<f64>,
+        capture_height: usize,
+        selectable: bool,
+    ) -> Option<f64> {
+        let Some(tex) = &self.tex else {
+            self.camera_preview_ui(ui, max_height);
+            return None;
+        };
+        let Some(frame_height) = self.current_frame_height() else {
+            self.camera_preview_ui(ui, max_height);
+            return None;
+        };
+        let candidates = self.vertical_anchor_lines();
+        ui.vertical_centered(|ui| {
+            let avail = ui.available_width().max(1.0);
+            let aspect = tex.aspect_ratio();
+            let height = (avail / aspect).min(max_height).max(1.0);
+            let width = (height * aspect).min(avail);
+            let sense = if selectable {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            };
+            let response = ui
+                .add(
+                    egui::Image::new(tex)
+                        .fit_to_exact_size(egui::vec2(width, height))
+                        .sense(sense),
+                )
+                .on_hover_text(if selectable {
+                    "Click a horizontal spectral line to select the acquisition anchor"
+                } else {
+                    "The spectral-line anchor is locked during acquisition"
+                });
+            let rect = response.rect;
+            let sensor_to_screen_y = |sensor_y: f64| {
+                rect.top()
+                    + rect.height()
+                        * (sensor_y / frame_height.max(1) as f64).clamp(0.0, 1.0) as f32
+            };
+
+            for &(line_y, _) in &candidates {
+                let y = sensor_to_screen_y(line_y);
+                ui.painter().hline(
+                    rect.x_range(),
+                    y,
+                    egui::Stroke::new(1.0_f32, SPECTRAL_COLOR.gamma_multiply(0.45)),
+                );
+            }
+            if let Some(anchor) = selected_y {
+                let half_crop = capture_height as f64 / 2.0;
+                let y0 = sensor_to_screen_y(anchor - half_crop);
+                let y1 = sensor_to_screen_y(anchor + half_crop);
+                let crop_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), y0.min(y1)),
+                    egui::pos2(rect.right(), y0.max(y1)),
+                )
+                .intersect(rect);
+                ui.painter().rect_filled(
+                    crop_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 190, 70, 18),
+                );
+                let y = sensor_to_screen_y(anchor);
+                ui.painter().hline(
+                    rect.x_range(),
+                    y,
+                    egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 205, 75)),
+                );
+                ui.painter().text(
+                    egui::pos2(rect.left() + 6.0, y - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("selected Y {anchor:.1}"),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(255, 220, 110),
+                );
+            }
+
+            if selectable && response.clicked() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let sensor_y =
+                        ((pointer.y - rect.top()) / rect.height()) as f64 * frame_height as f64;
+                    return candidates
+                        .iter()
+                        .min_by(|a, b| {
+                            (a.0 - sensor_y)
+                                .abs()
+                                .total_cmp(&(b.0 - sensor_y).abs())
+                        })
+                        .map(|line| line.0);
+                }
+            }
+            None
+        })
+        .inner
+    }
+
+    /// Acquisition-specific spectral profile. The x-axis is sensor Y because
+    /// guided acquisition requires vertical dispersion.
+    pub fn acquisition_spectral_profile_ui(
+        &self,
+        ui: &mut egui::Ui,
+        selected_y: Option<f64>,
+    ) -> Option<f64> {
+        let last = self.last.as_ref()?;
+        let profile = last.prof_y.clone();
+        let candidates: Vec<f64> = last.lines_y.iter().map(|line| line.center).collect();
+        let labels: Vec<(f64, String)> = if self.spectral_is_y() {
+            self.labels
+                .iter()
+                .map(|line| (line.x, format!("{} {:.1}", line.element, line.wavelength)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        profile_plot(
+            ui,
+            "acquire_spectral",
+            &profile,
+            None,
+            &candidates,
+            selected_y,
+            &labels,
+            SPECTRAL_COLOR,
+            170.0,
+        )
+    }
+
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         if !self.camera_preview_ui(ui, 260.0) {
             return;
@@ -2496,8 +2630,8 @@ fn worker(
         }
         // Preview is latency-first: vendor SDKs may buffer several completed
         // frames while focus analysis is busy, so ask each backend for the
-        // newest available image. Once SER recording is active we switch to
-        // the lossless FIFO path and intentionally keep every delivered frame.
+        // newest available image. During SER recording we use the sequential
+        // path and intentionally write every frame delivered to the app.
         let next = if active_ser.is_some() {
             cam.next_frame(1000)
         } else {

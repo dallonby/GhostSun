@@ -312,12 +312,17 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         (api.put_option)(h, OPTION_RAW, 1);
         (api.put_option)(h, OPTION_BITDEPTH, 1);
     }
-    // Ask supported SDKs to favour the newest image during preview. The mode
-    // is switched off again by `next_frame` for lossless SER recording.
-    let real_time_enabled = api
-        .put_real_time
-        .map(|put_real_time| unsafe { put_real_time(h, 1) >= 0 })
-        .unwrap_or(false);
+    // Keep one buffering policy for the entire USB session. Repeatedly
+    // switching FIFO/real-time mode, or stopping and restarting the pull
+    // stream between SER files, can wedge some ToupTek-derived cameras after
+    // several alternating scans. At SHG acquisition frame rates GhostSun
+    // consumes each callback synchronously, so real-time mode still records
+    // every frame the application receives while bounding preview latency.
+    if let Some(put_real_time) = api.put_real_time {
+        unsafe {
+            put_real_time(h, 1);
+        }
+    }
     let (tx, rx) = channel();
     let signal = Box::into_raw(Box::new(Signal { tx }));
     Ok(Box::new(ToupcamCam {
@@ -330,7 +335,6 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         height: 0,
         pending_roi: None,
         started: false,
-        real_time_enabled,
         buf: Vec::new(),
     }))
 }
@@ -357,7 +361,6 @@ pub struct ToupcamCam {
     height: usize,
     pending_roi: Option<Roi>,
     started: bool,
-    real_time_enabled: bool,
     buf: Vec<u8>,
 }
 
@@ -504,13 +507,6 @@ impl Camera for ToupcamCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        if self.real_time_enabled {
-            if let Some(put_real_time) = self.api.put_real_time {
-                if unsafe { put_real_time(self.h, 0) } >= 0 {
-                    self.real_time_enabled = false;
-                }
-            }
-        }
         self.wait_for_image(timeout_ms)?;
         let (w, h) = self.pull_into_buffer()?;
         Ok(self.frame_from_buffer(w, h))
@@ -519,13 +515,6 @@ impl Camera for ToupcamCam {
     fn next_preview_frame(&mut self, timeout_ms: u32) -> crate::Result<Frame> {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
-        }
-        if !self.real_time_enabled {
-            if let Some(put_real_time) = self.api.put_real_time {
-                if unsafe { put_real_time(self.h, 1) } >= 0 {
-                    self.real_time_enabled = true;
-                }
-            }
         }
         // Callback notifications can accumulate independently of the SDK's
         // real-time image slot. Discard stale notifications, wait for the next
@@ -542,35 +531,12 @@ impl Camera for ToupcamCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-
-        // Changing Toupcam's real-time/FIFO policy underneath an active pull
-        // stream can leave callback delivery dormant after a long recording.
-        // Restart the pull stream at this explicit boundary. Stop guarantees
-        // no callback is still writing, so unlike Toupcam_Flush this cannot
-        // tear a partially delivered frame.
-        let stop_hr = unsafe { (self.api.stop)(self.h) };
-        self.started = false;
-        if stop_hr < 0 {
-            return Err(CameraError::Sdk(
-                "Toupcam_Stop failed while restoring preview".into(),
-            ));
-        }
+        // Recording and preview share one uninterrupted pull stream. Only
+        // discard callback notifications accumulated while the SER footer was
+        // being finalised; the next preview call waits for a newly completed
+        // whole frame.
         while self.rx.try_recv().is_ok() {}
-
-        self.real_time_enabled = self
-            .api
-            .put_real_time
-            .map(|put_real_time| unsafe { put_real_time(self.h, 1) >= 0 })
-            .unwrap_or(false);
-        let start_hr =
-            unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
-        if start_hr < 0 {
-            return Err(CameraError::Sdk(
-                "StartPullModeWithCallback failed while restoring preview".into(),
-            ));
-        }
-        self.started = true;
-        self.refresh_size()
+        Ok(())
     }
 
     fn stop(&mut self) {

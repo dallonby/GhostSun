@@ -1081,7 +1081,15 @@ impl eframe::App for App {
                     return;
                 }
                 if self.mode == ViewMode::Acquire {
-                    self.acquire.view_ui(ui, &self.focus);
+                    egui::ScrollArea::vertical()
+                        .id_salt("acquire_main_scroll")
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.acquire.view_ui(ui, &self.focus);
+                        });
                     return;
                 }
                 self.build_texture(ctx);
