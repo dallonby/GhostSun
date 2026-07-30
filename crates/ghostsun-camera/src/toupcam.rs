@@ -36,6 +36,7 @@ const TOUPCAM_MAX: usize = 128;
 const OPTION_RAW: c_uint = 0x04;
 const OPTION_BITDEPTH: c_uint = 0x06;
 const EVENT_IMAGE: c_uint = 0x0004;
+const E_PENDING: c_int = 0x8000_000a_u32 as c_int;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -97,6 +98,7 @@ type FnGetExpoTime = unsafe extern "C" fn(HToupcam, *mut c_uint) -> c_int;
 type FnGetExpoAGain = unsafe extern "C" fn(HToupcam, *mut c_ushort) -> c_int;
 type FnPutRoi = unsafe extern "C" fn(HToupcam, c_uint, c_uint, c_uint, c_uint) -> c_int;
 type FnGetFinalSize = unsafe extern "C" fn(HToupcam, *mut c_int, *mut c_int) -> c_int;
+type FnPutRealTime = unsafe extern "C" fn(HToupcam, c_int) -> c_int;
 
 #[cfg(target_os = "macos")]
 const LIBNAME: &str = "libtoupcam.dylib";
@@ -123,6 +125,7 @@ struct Api {
     get_gain: FnGetExpoAGain,
     put_roi: FnPutRoi,
     get_final_size: FnGetFinalSize,
+    put_real_time: Option<FnPutRealTime>,
 }
 
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> crate::Result<T> {
@@ -130,6 +133,10 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> crate::Result<T> {
         .get(name)
         .map_err(|e| CameraError::Sdk(format!("missing {}: {e}", String::from_utf8_lossy(name))))?;
     Ok(*s)
+}
+
+unsafe fn optional_sym<T: Copy>(lib: &Library, name: &[u8]) -> Option<T> {
+    lib.get::<T>(name).ok().map(|symbol| *symbol)
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
@@ -225,6 +232,7 @@ impl Api {
             get_gain: sym(&lib, b"Toupcam_get_ExpoAGain")?,
             put_roi: sym(&lib, b"Toupcam_put_Roi")?,
             get_final_size: sym(&lib, b"Toupcam_get_FinalSize")?,
+            put_real_time: optional_sym(&lib, b"Toupcam_put_RealTime"),
             _lib: lib,
         })
     }
@@ -304,6 +312,12 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         (api.put_option)(h, OPTION_RAW, 1);
         (api.put_option)(h, OPTION_BITDEPTH, 1);
     }
+    // Ask supported SDKs to favour the newest image during preview. The mode
+    // is switched off again by `next_frame` for lossless SER recording.
+    let real_time_enabled = api
+        .put_real_time
+        .map(|put_real_time| unsafe { put_real_time(h, 1) >= 0 })
+        .unwrap_or(false);
     let (tx, rx) = channel();
     let signal = Box::into_raw(Box::new(Signal { tx }));
     Ok(Box::new(ToupcamCam {
@@ -316,6 +330,7 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         height: 0,
         pending_roi: None,
         started: false,
+        real_time_enabled,
         buf: Vec::new(),
     }))
 }
@@ -342,6 +357,7 @@ pub struct ToupcamCam {
     height: usize,
     pending_roi: Option<Roi>,
     started: bool,
+    real_time_enabled: bool,
     buf: Vec<u8>,
 }
 
@@ -360,6 +376,59 @@ impl ToupcamCam {
         self.height = h as usize;
         self.buf.resize(self.width * self.height * 2, 0);
         Ok(())
+    }
+
+    fn pull_into_buffer(&mut self) -> crate::Result<(usize, usize)> {
+        let mut fi = FrameInfoV3::default();
+        let pitch = (self.width * 2) as c_int;
+        let hr = unsafe {
+            (self.api.pull_v3)(
+                self.h,
+                self.buf.as_mut_ptr() as *mut c_void,
+                0,
+                16,
+                pitch,
+                &mut fi,
+            )
+        };
+        if hr == E_PENDING {
+            return Err(CameraError::Timeout);
+        }
+        if hr < 0 {
+            return Err(CameraError::Sdk("PullImageV3 failed".into()));
+        }
+        let (w, h) = (fi.width as usize, fi.height as usize);
+        if w == 0 || h == 0 || w * h * 2 > self.buf.len() {
+            return Err(CameraError::Sdk(
+                "PullImageV3 returned bad dimensions".into(),
+            ));
+        }
+        Ok((w, h))
+    }
+
+    fn frame_from_buffer(&self, w: usize, h: usize) -> Frame {
+        let mut data = vec![0u16; w * h];
+        for (i, px) in data.iter_mut().enumerate() {
+            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+        }
+        Frame {
+            width: w,
+            height: h,
+            data,
+        }
+    }
+
+    fn wait_for_image(&self, timeout_ms: u32) -> crate::Result<()> {
+        match self
+            .rx
+            .recv_timeout(Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(()) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => Err(CameraError::Timeout),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(CameraError::Sdk("event channel closed".into()))
+            }
+        }
     }
 }
 
@@ -435,49 +504,73 @@ impl Camera for ToupcamCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        match self
-            .rx
-            .recv_timeout(Duration::from_millis(timeout_ms as u64))
-        {
-            Ok(()) => {}
-            Err(RecvTimeoutError::Timeout) => return Err(CameraError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(CameraError::Sdk("event channel closed".into()))
+        if self.real_time_enabled {
+            if let Some(put_real_time) = self.api.put_real_time {
+                if unsafe { put_real_time(self.h, 0) } >= 0 {
+                    self.real_time_enabled = false;
+                }
             }
         }
-        // Collapse any backlog so we always pull the freshest frame.
-        while self.rx.try_recv().is_ok() {}
+        self.wait_for_image(timeout_ms)?;
+        let (w, h) = self.pull_into_buffer()?;
+        Ok(self.frame_from_buffer(w, h))
+    }
 
-        let mut fi = FrameInfoV3::default();
-        let pitch = (self.width * 2) as c_int;
-        let hr = unsafe {
-            (self.api.pull_v3)(
-                self.h,
-                self.buf.as_mut_ptr() as *mut c_void,
-                0,
-                16,
-                pitch,
-                &mut fi,
-            )
-        };
-        if hr < 0 {
-            return Err(CameraError::Sdk("PullImageV3 failed".into()));
+    fn next_preview_frame(&mut self, timeout_ms: u32) -> crate::Result<Frame> {
+        if !self.started {
+            return Err(CameraError::Sdk("camera not started".into()));
         }
-        let (w, h) = (fi.width as usize, fi.height as usize);
-        if w == 0 || h == 0 || w * h * 2 > self.buf.len() {
+        if !self.real_time_enabled {
+            if let Some(put_real_time) = self.api.put_real_time {
+                if unsafe { put_real_time(self.h, 1) } >= 0 {
+                    self.real_time_enabled = true;
+                }
+            }
+        }
+        // Callback notifications can accumulate independently of the SDK's
+        // real-time image slot. Discard stale notifications, wait for the next
+        // completed exposure, then pull the SDK's newest whole frame. Calling
+        // Toupcam_Flush here can race USB delivery and produce horizontally
+        // torn frames on some cameras.
+        while self.rx.try_recv().is_ok() {}
+        self.wait_for_image(timeout_ms)?;
+        let (w, h) = self.pull_into_buffer()?;
+        Ok(self.frame_from_buffer(w, h))
+    }
+
+    fn resume_preview(&mut self) -> crate::Result<()> {
+        if !self.started {
+            return Err(CameraError::Sdk("camera not started".into()));
+        }
+
+        // Changing Toupcam's real-time/FIFO policy underneath an active pull
+        // stream can leave callback delivery dormant after a long recording.
+        // Restart the pull stream at this explicit boundary. Stop guarantees
+        // no callback is still writing, so unlike Toupcam_Flush this cannot
+        // tear a partially delivered frame.
+        let stop_hr = unsafe { (self.api.stop)(self.h) };
+        self.started = false;
+        if stop_hr < 0 {
             return Err(CameraError::Sdk(
-                "PullImageV3 returned bad dimensions".into(),
+                "Toupcam_Stop failed while restoring preview".into(),
             ));
         }
-        let mut data = vec![0u16; w * h];
-        for (i, px) in data.iter_mut().enumerate() {
-            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+        while self.rx.try_recv().is_ok() {}
+
+        self.real_time_enabled = self
+            .api
+            .put_real_time
+            .map(|put_real_time| unsafe { put_real_time(self.h, 1) >= 0 })
+            .unwrap_or(false);
+        let start_hr =
+            unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
+        if start_hr < 0 {
+            return Err(CameraError::Sdk(
+                "StartPullModeWithCallback failed while restoring preview".into(),
+            ));
         }
-        Ok(Frame {
-            width: w,
-            height: h,
-            data,
-        })
+        self.started = true;
+        self.refresh_size()
     }
 
     fn stop(&mut self) {

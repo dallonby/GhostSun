@@ -1065,7 +1065,15 @@ impl eframe::App for App {
             .frame(egui::Frame::default().fill(egui::Color32::from_rgb(8, 7, 6)))
             .show(ctx, |ui| {
                 if self.mode == ViewMode::Focus {
-                    self.focus.view_ui(ui, ctx);
+                    egui::ScrollArea::vertical()
+                        .id_salt("focus_main_scroll")
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.focus.view_ui(ui, ctx);
+                        });
                     return;
                 }
                 if self.mode == ViewMode::Mount {

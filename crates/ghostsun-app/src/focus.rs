@@ -2479,14 +2479,31 @@ fn worker(
                 FocusCmd::StopSer => {
                     let pending_path = pending_ser.take().map(|request| request.path);
                     if let Some(active) = active_ser.take() {
-                        finish_ser(active, &tx);
+                        let finished = finish_ser_message(active);
+                        let preview = cam.resume_preview();
+                        let _ = tx.send(finished);
+                        if let Err(error) = preview {
+                            let _ = tx.send(FocusMsg::Error(format!(
+                                "SER saved, but live preview could not resume: {error}"
+                            )));
+                            return;
+                        }
                     } else if let Some(path) = pending_path {
                         let _ = tx.send(FocusMsg::RecordingStopped { path, frames: 0 });
                     }
                 }
             }
         }
-        match cam.next_frame(1000) {
+        // Preview is latency-first: vendor SDKs may buffer several completed
+        // frames while focus analysis is busy, so ask each backend for the
+        // newest available image. Once SER recording is active we switch to
+        // the lossless FIFO path and intentionally keep every delivered frame.
+        let next = if active_ser.is_some() {
+            cam.next_frame(1000)
+        } else {
+            cam.next_preview_frame(1000)
+        };
+        match next {
             Ok(frame) => {
                 if let Some(request) = pending_ser.take() {
                     let (y0, height) = vertical_crop_bounds(
@@ -2637,17 +2654,14 @@ fn worker(
 }
 
 fn finish_ser(active: ActiveSer, tx: &Sender<FocusMsg>) {
+    let _ = tx.send(finish_ser_message(active));
+}
+
+fn finish_ser_message(active: ActiveSer) -> FocusMsg {
     let path = active.path;
     match active.recorder.finish() {
-        Ok(frames) => {
-            let _ = tx.send(FocusMsg::RecordingStopped {
-                path,
-                frames,
-            });
-        }
-        Err(error) => {
-            let _ = tx.send(FocusMsg::RecordingError(error.to_string()));
-        }
+        Ok(frames) => FocusMsg::RecordingStopped { path, frames },
+        Err(error) => FocusMsg::RecordingError(error.to_string()),
     }
 }
 

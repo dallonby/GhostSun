@@ -18,13 +18,32 @@ use super::focus::{self, DispAxis};
 use super::mount::{Direction, MountState};
 use super::{ACCENT, ACCENT_DIM};
 
-const SCAN_RATE_INDEX: u8 = 7;
-const SCAN_RATE_MULTIPLE: f64 = 60.0;
+const PROBE_RATE_INDEX: u8 = 7;
+const PROBE_RATE_MULTIPLE: f64 = 60.0;
+const ACQUISITION_RATES: [(&str, u8, f64); 8] = [
+    ("0.25×", 0, 0.25),
+    ("0.5×", 1, 0.5),
+    ("1×", 2, 1.0),
+    ("2×", 3, 2.0),
+    ("4× · recommended", 4, 4.0),
+    ("8×", 5, 8.0),
+    ("20×", 6, 20.0),
+    ("60×", 7, 60.0),
+];
+const DEFAULT_ACQUISITION_RATE: usize = 4;
 const SIDEREAL_DEG_PER_SEC: f64 = 15.0 / 3600.0;
 const SETTLE_TIME: Duration = Duration::from_millis(1200);
 const PRE_ROLL: Duration = Duration::from_millis(350);
 const POST_ROLL: Duration = Duration::from_millis(350);
 const OFF_AXIS_WARN_DEG: f64 = 10.0;
+const PREPOSITION_STEP_DEG: f64 = 0.08;
+const PREPOSITION_SETTLE: Duration = Duration::from_millis(250);
+const PREPOSITION_SAMPLE_TIMEOUT: Duration = Duration::from_millis(1500);
+const PREPOSITION_CLEAR_FRACTION: f32 = 0.25;
+const PREPOSITION_REQUIRED_SAMPLES: usize = 2;
+const SCAN_DISC_PRESENT_FRACTION: f32 = 0.45;
+const SCAN_SIGNAL_REQUIRED_SAMPLES: usize = 2;
+const SCAN_TAIL_CHECK: Duration = Duration::from_millis(1500);
 
 pub struct AcquireOutput {
     pub image: Image,
@@ -40,11 +59,13 @@ enum ProcessMessage {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunPhase {
-    Preposition,
+    PrepositionMoving,
+    PrepositionSampling,
     Settling,
     AwaitRecorder,
     PreRoll,
     Scanning,
+    ScanTailCheck,
     PostRoll,
     WaitingForRecorder,
     Processing,
@@ -56,6 +77,19 @@ struct ScanRun {
     files: Vec<(PathBuf, bool)>,
     scan_index: usize,
     direction: Direction,
+    rate_code: u8,
+    rate_multiple: f64,
+    scan_span_deg: f64,
+    preposition_baseline: f32,
+    preposition_last_seq: u64,
+    preposition_steps: usize,
+    preposition_max_steps: usize,
+    preposition_samples: usize,
+    preposition_clear_samples: usize,
+    scan_last_seq: u64,
+    scan_present_samples: usize,
+    scan_seen_disc: bool,
+    scan_clear_samples: usize,
     settle_until: Instant,
     deadline: Instant,
 }
@@ -85,10 +119,12 @@ pub struct AcquireState {
     output_dir: PathBuf,
     scan_span_deg: f64,
     scan_count: usize,
+    scan_rate_index: usize,
     direction: Direction,
     probe_deg: f64,
     prepared_confirmed: bool,
     motion_confirmed: bool,
+    meridian_ack_side: i8,
     off_axis_confirmed: bool,
     confirm_start_open: bool,
     off_axis_deg: Option<f64>,
@@ -117,10 +153,12 @@ impl Default for AcquireState {
             output_dir,
             scan_span_deg: 0.80,
             scan_count: 1,
+            scan_rate_index: DEFAULT_ACQUISITION_RATE,
             direction: Direction::East,
             probe_deg: 0.06,
             prepared_confirmed: false,
             motion_confirmed: false,
+            meridian_ack_side: 0,
             off_axis_confirmed: false,
             confirm_start_open: false,
             off_axis_deg: None,
@@ -288,10 +326,64 @@ impl AcquireState {
 
         let outcome = (|| -> Result<bool, String> {
             match run.phase {
-                RunPhase::Preposition if mount.take_acquisition_nudge_done() => {
-                    run.phase = RunPhase::Settling;
-                    run.settle_until = Instant::now() + SETTLE_TIME;
-                    self.status = "At scan edge; settling before recording".into();
+                RunPhase::PrepositionMoving if mount.take_acquisition_nudge_done() => {
+                    run.phase = RunPhase::PrepositionSampling;
+                    run.settle_until = Instant::now() + PREPOSITION_SETTLE;
+                    run.deadline = Instant::now() + PREPOSITION_SAMPLE_TIMEOUT;
+                    run.preposition_samples = 0;
+                    run.preposition_clear_samples = 0;
+                    self.status = format!(
+                        "Seeking first limb: moved {:.2}°, waiting for camera",
+                        run.preposition_steps as f64 * PREPOSITION_STEP_DEG
+                    );
+                }
+                RunPhase::PrepositionSampling if Instant::now() >= run.settle_until => {
+                    if let Some((seq, signal)) = focus
+                        .sun_signal_sample()
+                        .filter(|(seq, _)| *seq > run.preposition_last_seq)
+                    {
+                        run.preposition_last_seq = seq;
+                        run.preposition_samples += 1;
+                        let fraction = signal / run.preposition_baseline;
+                        if fraction <= PREPOSITION_CLEAR_FRACTION {
+                            run.preposition_clear_samples += 1;
+                        } else {
+                            run.preposition_clear_samples = 0;
+                        }
+                        self.status = format!(
+                            "Seeking first limb: {:.2}° moved, disc signal {:.0}%",
+                            run.preposition_steps as f64 * PREPOSITION_STEP_DEG,
+                            (fraction * 100.0).clamp(0.0, 999.0)
+                        );
+
+                        if run.preposition_clear_samples >= PREPOSITION_REQUIRED_SAMPLES {
+                            let distance =
+                                run.preposition_steps as f64 * PREPOSITION_STEP_DEG;
+                            // The configured span is a minimum. If the camera
+                            // proves that the first limb is farther away than
+                            // the centred-disc assumption, extend the recorded
+                            // sweep by the same excess distance.
+                            run.scan_span_deg +=
+                                (distance - run.scan_span_deg / 2.0).max(0.0);
+                            run.phase = RunPhase::Settling;
+                            run.settle_until = Instant::now() + SETTLE_TIME;
+                            self.status = format!(
+                                "Disc has cleared the slit; settling for a {:.2}° scan",
+                                run.scan_span_deg
+                            );
+                        } else if run.preposition_samples >= PREPOSITION_REQUIRED_SAMPLES {
+                            start_preposition_step(&mut run, mount)?;
+                            self.status = format!(
+                                "Disc still visible; extending edge search to {:.2}°",
+                                run.preposition_steps as f64 * PREPOSITION_STEP_DEG
+                            );
+                        }
+                    } else if Instant::now() >= run.deadline {
+                        return Err(
+                            "camera preview did not provide a fresh frame during edge search"
+                                .into(),
+                        );
+                    }
                 }
                 RunPhase::Settling if Instant::now() >= run.settle_until => {
                     let path = scan_path(&run.session_dir, run.scan_index);
@@ -326,27 +418,92 @@ impl AcquireState {
                 }
                 RunPhase::PreRoll if Instant::now() >= run.deadline => {
                     let direction = scan_direction(run.direction, run.scan_index);
+                    run.scan_last_seq = focus
+                        .sun_signal_sample()
+                        .map(|(seq, _)| seq)
+                        .unwrap_or(run.scan_last_seq);
+                    run.scan_present_samples = 0;
+                    run.scan_seen_disc = false;
+                    run.scan_clear_samples = 0;
                     mount.start_acquisition_nudge(
                         direction,
-                        self.scan_duration(),
-                        SCAN_RATE_INDEX,
+                        scan_duration(run.scan_span_deg, run.rate_multiple),
+                        run.rate_code,
                     )?;
                     run.phase = RunPhase::Scanning;
                     self.status = format!(
-                        "Scan {}/{}: moving {}",
+                        "Scan {}/{}: moving {} and watching for the far limb",
                         run.scan_index + 1,
                         self.scan_count,
                         direction.label()
                     );
                 }
-                RunPhase::Scanning if mount.take_acquisition_nudge_done() => {
-                    run.phase = RunPhase::PostRoll;
-                    run.deadline = Instant::now() + POST_ROLL;
-                    self.status = format!(
-                        "Scan {}/{}: recording post-roll",
-                        run.scan_index + 1,
-                        self.scan_count
-                    );
+                RunPhase::Scanning => {
+                    if let Some((fraction, cleared)) = observe_scan_signal(&mut run, focus) {
+                        self.status = if run.scan_seen_disc {
+                            format!(
+                                "Scan {}/{}: disc signal {:.0}%, seeking far limb",
+                                run.scan_index + 1,
+                                self.scan_count,
+                                (fraction * 100.0).clamp(0.0, 999.0)
+                            )
+                        } else {
+                            format!(
+                                "Scan {}/{}: waiting for disc to enter ({:.0}%)",
+                                run.scan_index + 1,
+                                self.scan_count,
+                                (fraction * 100.0).clamp(0.0, 999.0)
+                            )
+                        };
+                        if cleared {
+                            mount.stop_acquisition_motion();
+                            run.phase = RunPhase::PostRoll;
+                            run.deadline = Instant::now() + POST_ROLL;
+                            self.status = format!(
+                                "Scan {}/{}: far limb cleared; stopping and recording post-roll",
+                                run.scan_index + 1,
+                                self.scan_count
+                            );
+                        }
+                    }
+                    if run.phase == RunPhase::Scanning
+                        && mount.take_acquisition_nudge_done()
+                    {
+                        // The last camera update can arrive just after the
+                        // timed motion completion. Allow a short stationary
+                        // tail before deciding the safety span was insufficient.
+                        run.phase = RunPhase::ScanTailCheck;
+                        run.deadline = Instant::now() + SCAN_TAIL_CHECK;
+                        self.status = "Motion span complete; confirming the disc is off-sensor"
+                            .into();
+                    }
+                }
+                RunPhase::ScanTailCheck => {
+                    if let Some((fraction, cleared)) = observe_scan_signal(&mut run, focus) {
+                        self.status = format!(
+                            "Confirming far limb: disc signal {:.0}%",
+                            (fraction * 100.0).clamp(0.0, 999.0)
+                        );
+                        if cleared {
+                            run.phase = RunPhase::PostRoll;
+                            run.deadline = Instant::now() + POST_ROLL;
+                            self.status = format!(
+                                "Scan {}/{}: far limb confirmed; recording post-roll",
+                                run.scan_index + 1,
+                                self.scan_count
+                            );
+                        }
+                    }
+                    if run.phase == RunPhase::ScanTailCheck && Instant::now() >= run.deadline {
+                        return Err(if run.scan_seen_disc {
+                            format!(
+                                "the disc did not clear the sensor within the {:.2}° safety span",
+                                run.scan_span_deg
+                            )
+                        } else {
+                            "the camera never detected the solar disc during the scan".into()
+                        });
+                    }
                 }
                 RunPhase::PostRoll if Instant::now() >= run.deadline => {
                     focus.stop_ser_recording();
@@ -418,9 +575,9 @@ impl AcquireState {
 
     fn start_probe(&self, mount: &mut MountState, direction: Direction) -> Result<(), String> {
         let duration = Duration::from_secs_f64(
-            self.probe_deg.clamp(0.01, 0.15) / (SCAN_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+            self.probe_deg.clamp(0.01, 0.15) / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
         );
-        mount.start_acquisition_nudge(direction, duration, SCAN_RATE_INDEX)
+        mount.start_acquisition_nudge(direction, duration, PROBE_RATE_INDEX)
     }
 
     fn start_scan(
@@ -448,18 +605,40 @@ impl AcquireState {
         let session_dir = self.output_dir.join(format!("scan-{}", unix_timestamp()));
         std::fs::create_dir_all(&session_dir)
             .map_err(|e| format!("cannot create session folder: {e}"))?;
-        let preposition = Duration::from_secs_f64(self.scan_duration().as_secs_f64() / 2.0);
-        mount.start_acquisition_nudge(self.direction.opposite(), preposition, SCAN_RATE_INDEX)?;
-        self.run = Some(ScanRun {
-            phase: RunPhase::Preposition,
+        let rate_index = self
+            .scan_rate_index
+            .min(ACQUISITION_RATES.len().saturating_sub(1));
+        let (_, rate_code, rate_multiple) = ACQUISITION_RATES[rate_index];
+        let (preposition_last_seq, preposition_baseline) = focus
+            .sun_signal_sample()
+            .filter(|(_, signal)| signal.is_finite() && *signal > 0.0)
+            .ok_or("wait for a valid live camera signal before beginning")?;
+        let configured_span = self.scan_span_deg.clamp(0.55, 2.0);
+        let mut run = ScanRun {
+            phase: RunPhase::PrepositionMoving,
             session_dir,
             files: Vec::new(),
             scan_index: 0,
             direction: self.direction,
+            rate_code,
+            rate_multiple,
+            scan_span_deg: configured_span,
+            preposition_baseline,
+            preposition_last_seq,
+            preposition_steps: 0,
+            preposition_max_steps: (configured_span / PREPOSITION_STEP_DEG).ceil() as usize,
+            preposition_samples: 0,
+            preposition_clear_samples: 0,
+            scan_last_seq: preposition_last_seq,
+            scan_present_samples: 0,
+            scan_seen_disc: false,
+            scan_clear_samples: 0,
             settle_until: Instant::now(),
             deadline: Instant::now(),
-        });
-        self.status = "Pre-positioning from disc centre to the first scan edge".into();
+        };
+        start_preposition_step(&mut run, mount)?;
+        self.run = Some(run);
+        self.status = "Camera-guided pre-positioning: seeking the first solar limb".into();
         self.log.clear();
         self.log.push(self.status.clone());
         Ok(())
@@ -472,22 +651,35 @@ impl AcquireState {
         if !focus.streaming {
             return Err("start the camera preview".into());
         }
+        if !mount.tracking_is_on() {
+            return Err("mount tracking must show On before acquisition".into());
+        }
         if focus.dispersion != DispAxis::Vertical {
             return Err("set dispersion to Vertical on the Focus tab".into());
         }
         if self.anchor_y.is_none() {
             return Err("select a spectral-line anchor".into());
         }
+        if let Some(minutes) = mount.sun_meridian_offset_minutes() {
+            let side = if minutes < 0.0 { -1 } else { 1 };
+            if minutes.abs() <= 30.0 && self.meridian_ack_side != side {
+                return Err(if minutes < 0.0 {
+                    format!(
+                        "Sun reaches the meridian in {:.0} min; review and acknowledge the meridian warning",
+                        -minutes
+                    )
+                } else {
+                    format!(
+                        "Sun crossed the meridian {:.0} min ago; confirm the mount has flipped and is tracking",
+                        minutes
+                    )
+                });
+            }
+        }
         if self.run.is_some() || self.calibration.is_some() {
             return Err("an acquisition operation is already running".into());
         }
         Ok(())
-    }
-
-    fn scan_duration(&self) -> Duration {
-        Duration::from_secs_f64(
-            self.scan_span_deg.clamp(0.55, 2.0) / (SCAN_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
-        )
     }
 
     fn start_processing(
@@ -553,6 +745,7 @@ impl AcquireState {
                     &mut self.motion_confirmed,
                     "Mount and cables are clear; motion is safe",
                 );
+                self.meridian_ack_ui(ui, mount);
             });
 
         ui.separator();
@@ -701,11 +894,26 @@ impl AcquireState {
                 .text("scan span °")
                 .fixed_decimals(2),
         );
+        self.scan_rate_index = self
+            .scan_rate_index
+            .min(ACQUISITION_RATES.len().saturating_sub(1));
+        egui::ComboBox::from_label("science scan rate")
+            .selected_text(ACQUISITION_RATES[self.scan_rate_index].0)
+            .show_ui(ui, |ui| {
+                for (index, (label, _, _)) in ACQUISITION_RATES.iter().enumerate() {
+                    ui.selectable_value(&mut self.scan_rate_index, index, *label);
+                }
+            });
         ui.add(egui::Slider::new(&mut self.scan_count, 1..=8).text("alternating scans"));
+        let (_, _, rate_multiple) = ACQUISITION_RATES[self.scan_rate_index];
+        let duration = scan_duration(self.scan_span_deg, rate_multiple);
+        let motion_per_exposure = rate_multiple
+            * 15.0
+            * (focus.exposure_us as f64 / 1_000_000.0);
         ui.label(format!(
-            "60× sidereal · {:.1} s across {:.2}°",
-            self.scan_duration().as_secs_f64(),
-            self.scan_span_deg
+            "{rate_multiple:.2}× sidereal · {:.1} s across {:.2}° · ~{motion_per_exposure:.2}″ per exposure",
+            duration.as_secs_f64(),
+            self.scan_span_deg,
         ));
         ui.label(
             egui::RichText::new(
@@ -778,6 +986,7 @@ impl AcquireState {
                     &mut self.motion_confirmed,
                     "The mount, telescope, instrument and cables can move safely",
                 );
+                self.meridian_ack_ui(ui, mount);
                 if self
                     .off_axis_deg
                     .map(|angle| angle > OFF_AXIS_WARN_DEG)
@@ -791,13 +1000,23 @@ impl AcquireState {
                 ui.separator();
                 let camera_ready = focus.streaming;
                 let mount_ready = mount.is_connected();
+                let tracking_ready = mount.tracking_is_on();
                 let line_ready = self.anchor_y.is_some();
                 let vertical = focus.dispersion == DispAxis::Vertical;
+                let meridian_ready = mount
+                    .sun_meridian_offset_minutes()
+                    .map(|minutes| {
+                        minutes.abs() > 30.0
+                            || self.meridian_ack_side == if minutes < 0.0 { -1 } else { 1 }
+                    })
+                    .unwrap_or(true);
                 for (ready, label) in [
                     (mount_ready, "ZWO mount connected"),
+                    (tracking_ready, "Mount tracking is On"),
                     (camera_ready, "Camera streaming"),
                     (vertical, "Dispersion set to Vertical"),
                     (line_ready, "Spectral-line anchor selected"),
+                    (meridian_ready, "Meridian guard satisfied"),
                 ] {
                     ui.label(
                         egui::RichText::new(format!(
@@ -820,8 +1039,10 @@ impl AcquireState {
                     && self.motion_confirmed
                     && camera_ready
                     && mount_ready
+                    && tracking_ready
                     && line_ready
                     && vertical
+                    && meridian_ready
                     && off_axis_ready;
                 ui.horizontal(|ui| {
                     if ui
@@ -856,6 +1077,36 @@ impl AcquireState {
         self.confirm_start_open = open;
     }
 
+    fn meridian_ack_ui(&mut self, ui: &mut egui::Ui, mount: &MountState) {
+        let Some(minutes) = mount.sun_meridian_offset_minutes() else {
+            return;
+        };
+        if minutes.abs() > 30.0 {
+            return;
+        }
+        let side = if minutes < 0.0 { -1 } else { 1 };
+        let mut acknowledged = self.meridian_ack_side == side;
+        let text = if minutes < 0.0 {
+            format!(
+                "Meridian in {:.0} min: this scan is supervised and will finish safely",
+                -minutes
+            )
+        } else {
+            format!(
+                "Meridian passed {:.0} min ago: mount has flipped and tracking is verified",
+                minutes
+            )
+        };
+        ui.label(
+            egui::RichText::new("MERIDIAN GUARD")
+                .strong()
+                .color(egui::Color32::YELLOW),
+        );
+        if ui.checkbox(&mut acknowledged, text).changed() {
+            self.meridian_ack_side = if acknowledged { side } else { 0 };
+        }
+    }
+
     pub fn view_ui(&mut self, ui: &mut egui::Ui, focus: &focus::FocusState) {
         ui.heading("Live acquisition view");
         focus.camera_preview_ui(ui, 520.0);
@@ -883,6 +1134,61 @@ fn scan_direction(first: Direction, index: usize) -> Direction {
     } else {
         first.opposite()
     }
+}
+
+fn scan_duration(span_deg: f64, rate_multiple: f64) -> Duration {
+    Duration::from_secs_f64(
+        span_deg.clamp(0.55, 2.0)
+            / (rate_multiple.max(0.25) * SIDEREAL_DEG_PER_SEC),
+    )
+}
+
+fn start_preposition_step(run: &mut ScanRun, mount: &mut MountState) -> Result<(), String> {
+    if run.preposition_steps >= run.preposition_max_steps {
+        return Err(format!(
+            "the solar limb was not found after moving {:.2}°; re-centre the disc or check exposure",
+            run.preposition_steps as f64 * PREPOSITION_STEP_DEG
+        ));
+    }
+    let duration = Duration::from_secs_f64(
+        PREPOSITION_STEP_DEG / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+    );
+    mount.start_acquisition_nudge(run.direction.opposite(), duration, PROBE_RATE_INDEX)?;
+    run.preposition_steps += 1;
+    run.phase = RunPhase::PrepositionMoving;
+    Ok(())
+}
+
+fn observe_scan_signal(
+    run: &mut ScanRun,
+    focus: &focus::FocusState,
+) -> Option<(f32, bool)> {
+    let (seq, signal) = focus
+        .sun_signal_sample()
+        .filter(|(seq, signal)| *seq > run.scan_last_seq && signal.is_finite())?;
+    run.scan_last_seq = seq;
+    let fraction = signal / run.preposition_baseline;
+
+    if !run.scan_seen_disc {
+        if fraction >= SCAN_DISC_PRESENT_FRACTION {
+            run.scan_present_samples += 1;
+        } else {
+            run.scan_present_samples = 0;
+        }
+        if run.scan_present_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES {
+            run.scan_seen_disc = true;
+            run.scan_clear_samples = 0;
+        }
+    } else if fraction <= PREPOSITION_CLEAR_FRACTION {
+        run.scan_clear_samples += 1;
+    } else {
+        run.scan_clear_samples = 0;
+    }
+
+    Some((
+        fraction,
+        run.scan_seen_disc && run.scan_clear_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES,
+    ))
 }
 
 fn scan_path(session_dir: &Path, index: usize) -> PathBuf {
@@ -1076,5 +1382,13 @@ mod tests {
         assert_eq!(scan_direction(Direction::East, 0), Direction::East);
         assert_eq!(scan_direction(Direction::East, 1), Direction::West);
         assert_eq!(scan_direction(Direction::East, 2), Direction::East);
+    }
+
+    #[test]
+    fn recommended_scan_is_deliberately_slow() {
+        let (_, code, multiple) = ACQUISITION_RATES[DEFAULT_ACQUISITION_RATE];
+        assert_eq!(code, 4);
+        assert_eq!(multiple, 4.0);
+        assert!((scan_duration(0.8, multiple).as_secs_f64() - 48.0).abs() < 0.01);
     }
 }

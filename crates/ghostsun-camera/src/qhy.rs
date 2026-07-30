@@ -423,6 +423,85 @@ struct QhyCam {
 // SDK handle is only used from the capture thread (Camera: Send).
 unsafe impl Send for QhyCam {}
 
+impl QhyCam {
+    fn pull_into_buffer(&mut self) -> crate::Result<(u32, u32)> {
+        if self.buf.is_empty() {
+            let need = unsafe { (self.api.mem_len)(self.handle) } as usize;
+            self.buf
+                .resize(need.max(self.width * self.height * 2), 0);
+        }
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let mut bpp = 0u32;
+        let mut channels = 0u32;
+        let r = unsafe {
+            (self.api.live_frame)(
+                self.handle,
+                &mut w,
+                &mut h,
+                &mut bpp,
+                &mut channels,
+                self.buf.as_mut_ptr(),
+            )
+        };
+        if r != QHYCCD_SUCCESS || w == 0 || h == 0 {
+            return Err(CameraError::Timeout);
+        }
+        self.width = w as usize;
+        self.height = h as usize;
+        Ok((bpp, channels))
+    }
+
+    fn frame_from_buffer(&self, bpp: u32, channels: u32) -> crate::Result<Frame> {
+        let n = self.width * self.height;
+        let mut data = vec![0u16; n];
+        match bpp {
+            16 if channels <= 1 => {
+                let bytes = n * 2;
+                if self.buf.len() < bytes {
+                    return Err(CameraError::Sdk("live buffer shorter than frame".into()));
+                }
+                for (i, pixel) in data.iter_mut().enumerate() {
+                    let lo = self.buf[i * 2] as u16;
+                    let hi = self.buf[i * 2 + 1] as u16;
+                    *pixel = lo | (hi << 8);
+                }
+            }
+            8 if channels <= 1 => {
+                if self.buf.len() < n {
+                    return Err(CameraError::Sdk("live buffer shorter than frame".into()));
+                }
+                for (pixel, &byte) in data.iter_mut().zip(&self.buf[..n]) {
+                    *pixel = (byte as u16) * 257;
+                }
+            }
+            _ => {
+                let stride = ((bpp / 8).max(1) as usize) * channels.max(1) as usize;
+                if self.buf.len() < n * stride {
+                    return Err(CameraError::Sdk(format!(
+                        "unsupported live frame bpp={bpp} ch={channels}"
+                    )));
+                }
+                for (i, pixel) in data.iter_mut().enumerate() {
+                    let byte = self.buf[i * stride];
+                    *pixel = if bpp >= 16 {
+                        let lo = self.buf[i * stride] as u16;
+                        let hi = self.buf[i * stride + 1] as u16;
+                        lo | (hi << 8)
+                    } else {
+                        (byte as u16) * 257
+                    };
+                }
+            }
+        }
+        Ok(Frame {
+            width: self.width,
+            height: self.height,
+            data,
+        })
+    }
+}
+
 impl Camera for QhyCam {
     fn info(&self) -> &CameraInfo {
         &self.info
@@ -527,80 +606,27 @@ impl Camera for QhyCam {
         if !self.streaming {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        if self.buf.is_empty() {
-            let need = unsafe { (self.api.mem_len)(self.handle) } as usize;
-            self.buf.resize(need.max(self.width * self.height * 2), 0);
+        let (bpp, channels) = self.pull_into_buffer()?;
+        self.frame_from_buffer(bpp, channels)
+    }
+
+    fn next_preview_frame(&mut self, _timeout_ms: u32) -> crate::Result<Frame> {
+        if !self.streaming {
+            return Err(CameraError::Sdk("camera not started".into()));
         }
-        let mut w = 0u32;
-        let mut h = 0u32;
-        let mut bpp = 0u32;
-        let mut channels = 0u32;
-        let r = unsafe {
-            (self.api.live_frame)(
-                self.handle,
-                &mut w,
-                &mut h,
-                &mut bpp,
-                &mut channels,
-                self.buf.as_mut_ptr(),
-            )
-        };
-        if r != QHYCCD_SUCCESS {
-            // No frame ready yet — treat as timeout for the focus poll loop.
-            return Err(CameraError::Timeout);
-        }
-        if w == 0 || h == 0 {
-            return Err(CameraError::Timeout);
-        }
-        self.width = w as usize;
-        self.height = h as usize;
-        let n = self.width * self.height;
-        let mut data = vec![0u16; n];
-        match bpp {
-            16 if channels <= 1 => {
-                let bytes = n * 2;
-                if self.buf.len() < bytes {
-                    return Err(CameraError::Sdk("live buffer shorter than frame".into()));
+        let (mut bpp, mut channels) = self.pull_into_buffer()?;
+        // GetQHYCCDLiveFrame is non-blocking. Overwrite old SDK frames and
+        // convert only the newest one, keeping the lossless path unchanged.
+        for _ in 0..64 {
+            match self.pull_into_buffer() {
+                Ok(format) => {
+                    (bpp, channels) = format;
                 }
-                for i in 0..n {
-                    let lo = self.buf[i * 2] as u16;
-                    let hi = self.buf[i * 2 + 1] as u16;
-                    data[i] = lo | (hi << 8);
-                }
-            }
-            8 if channels <= 1 => {
-                if self.buf.len() < n {
-                    return Err(CameraError::Sdk("live buffer shorter than frame".into()));
-                }
-                for i in 0..n {
-                    data[i] = (self.buf[i] as u16) * 257;
-                }
-            }
-            _ => {
-                // Colour or unexpected layout: average first channel bytes.
-                let stride = ((bpp / 8).max(1) as usize) * channels.max(1) as usize;
-                if self.buf.len() < n * stride {
-                    return Err(CameraError::Sdk(format!(
-                        "unsupported live frame bpp={bpp} ch={channels}"
-                    )));
-                }
-                for i in 0..n {
-                    let b = self.buf[i * stride];
-                    data[i] = if bpp >= 16 {
-                        let lo = self.buf[i * stride] as u16;
-                        let hi = self.buf[i * stride + 1] as u16;
-                        lo | (hi << 8)
-                    } else {
-                        (b as u16) * 257
-                    };
-                }
+                Err(CameraError::Timeout) => break,
+                Err(error) => return Err(error),
             }
         }
-        Ok(Frame {
-            width: self.width,
-            height: self.height,
-            data,
-        })
+        self.frame_from_buffer(bpp, channels)
     }
 
     fn stop(&mut self) {

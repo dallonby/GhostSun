@@ -193,6 +193,21 @@ pub trait Camera: Send {
     fn start(&mut self) -> Result<()>;
     /// Block up to `timeout_ms` for the next frame.
     fn next_frame(&mut self, timeout_ms: u32) -> Result<Frame>;
+    /// Return the newest frame available, discarding older frames buffered by
+    /// the vendor SDK when the backend can do so.
+    ///
+    /// Live preview uses this latency-first path. Lossless SER acquisition
+    /// continues to call [`Camera::next_frame`] so no delivered scan frames
+    /// are intentionally discarded.
+    fn next_preview_frame(&mut self, timeout_ms: u32) -> Result<Frame> {
+        self.next_frame(timeout_ms)
+    }
+    /// Re-establish latency-first preview after a lossless recording session.
+    /// Most SDKs need no explicit transition; backends with distinct buffering
+    /// modes can restart or clear their stream here.
+    fn resume_preview(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn stop(&mut self);
 }
 

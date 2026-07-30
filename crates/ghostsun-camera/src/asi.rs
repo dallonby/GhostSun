@@ -218,6 +218,39 @@ pub struct AsiCam {
     last_gain: c_long,
 }
 
+impl AsiCam {
+    fn pull_into_buffer(&mut self, timeout_ms: u32) -> crate::Result<()> {
+        let r = unsafe {
+            (self.api.get_video)(
+                self.id,
+                self.buf.as_mut_ptr(),
+                self.buf.len() as c_long,
+                timeout_ms as c_int,
+            )
+        };
+        if r == ASI_ERROR_TIMEOUT {
+            return Err(CameraError::Timeout);
+        }
+        if r != ASI_SUCCESS {
+            return Err(CameraError::Sdk(format!("ASIGetVideoData error {r}")));
+        }
+        Ok(())
+    }
+
+    fn frame_from_buffer(&self) -> Frame {
+        let (w, h) = (self.width, self.height);
+        let mut data = vec![0u16; w * h];
+        for (i, px) in data.iter_mut().enumerate() {
+            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+        }
+        Frame {
+            width: w,
+            height: h,
+            data,
+        }
+    }
+}
+
 impl Camera for AsiCam {
     fn info(&self) -> &CameraInfo {
         &self.info
@@ -309,30 +342,25 @@ impl Camera for AsiCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        let r = unsafe {
-            (self.api.get_video)(
-                self.id,
-                self.buf.as_mut_ptr(),
-                self.buf.len() as c_long,
-                timeout_ms as c_int,
-            )
-        };
-        if r == ASI_ERROR_TIMEOUT {
-            return Err(CameraError::Timeout);
+        self.pull_into_buffer(timeout_ms)?;
+        Ok(self.frame_from_buffer())
+    }
+
+    fn next_preview_frame(&mut self, timeout_ms: u32) -> crate::Result<Frame> {
+        if !self.started {
+            return Err(CameraError::Sdk("camera not started".into()));
         }
-        if r != ASI_SUCCESS {
-            return Err(CameraError::Sdk(format!("ASIGetVideoData error {r}")));
+        self.pull_into_buffer(timeout_ms)?;
+        // ASIGetVideoData is FIFO. Drain already-completed frames with a
+        // non-blocking timeout and decode only the final buffer.
+        for _ in 0..64 {
+            match self.pull_into_buffer(0) {
+                Ok(()) => {}
+                Err(CameraError::Timeout) => break,
+                Err(error) => return Err(error),
+            }
         }
-        let (w, h) = (self.width, self.height);
-        let mut data = vec![0u16; w * h];
-        for (i, px) in data.iter_mut().enumerate() {
-            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
-        }
-        Ok(Frame {
-            width: w,
-            height: h,
-            data,
-        })
+        Ok(self.frame_from_buffer())
     }
 
     fn stop(&mut self) {

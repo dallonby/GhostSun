@@ -149,6 +149,15 @@ impl Direction {
             Direction::West => ":Mw#",
         }
     }
+
+    fn stop_command(self) -> &'static str {
+        match self {
+            Direction::North => ":Qn#",
+            Direction::South => ":Qs#",
+            Direction::East => ":Qe#",
+            Direction::West => ":Qw#",
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -171,6 +180,8 @@ enum WorkerCommand {
     SetRate(u8),
     Jog(Direction),
     Stop,
+    /// Stop acquisition-owned motion without disabling RA tracking.
+    StopAcquisition,
     GoHome,
     Park,
     Unpark,
@@ -188,6 +199,9 @@ enum WorkerCommand {
         /// ZWO rate index (`:R<n>#`). The auto-center spiral always uses 7
         /// (60×); a user timed jog uses whatever the panel has selected.
         rate: u8,
+        /// Re-enable tracking after the axis-specific stop. Acquisition sets
+        /// this because a stopped RA drive lets the Sun drift out of the slit.
+        ensure_tracking: bool,
     },
     SlewSun {
         ra_hours: f64,
@@ -469,6 +483,26 @@ impl Default for MountState {
 }
 
 impl MountState {
+    pub fn tracking_is_on(&self) -> bool {
+        self.snapshot.tracking.as_deref() == Some("On")
+    }
+
+    /// Minutes from the Sun crossing the local meridian: negative before
+    /// transit, positive after. Requires a configured observing longitude.
+    pub fn sun_meridian_offset_minutes(&self) -> Option<f64> {
+        if !self.site_is_configured() {
+            return None;
+        }
+        let unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs_f64();
+        Some(sun_hour_angle_hours_at_unix(
+            unix_seconds,
+            self.site_longitude_deg,
+        ) * 60.0)
+    }
+
     pub fn refresh_ports(&mut self) {
         self.last_scan = Instant::now();
         match discover_ports() {
@@ -1308,6 +1342,31 @@ impl MountState {
             status_card(ui, "Home", self.snapshot.home.as_deref().unwrap_or("--"));
             status_card(ui, "Park", self.snapshot.park.as_deref().unwrap_or("--"));
         });
+        if let Some(minutes) = self.sun_meridian_offset_minutes() {
+            if minutes.abs() <= 30.0 {
+                let message = if minutes < 0.0 {
+                    format!(
+                        "MERIDIAN WARNING · Sun transits in {:.0} min. Finish or defer automated scans and supervise the flip.",
+                        -minutes
+                    )
+                } else {
+                    format!(
+                        "MERIDIAN WARNING · Sun transited {:.0} min ago. Confirm the mount has flipped and tracking is On before scanning.",
+                        minutes
+                    )
+                };
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(92, 52, 8))
+                    .stroke(egui::Stroke::new(2.0_f32, egui::Color32::YELLOW))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(message)
+                                .strong()
+                                .color(egui::Color32::YELLOW),
+                        );
+                    });
+            }
+        }
 
         ui.add_space(10.0);
         let enabled = self.connected;
@@ -1860,6 +1919,7 @@ impl MountState {
                 direction,
                 duration_ms,
                 rate: rate.min(9),
+                ensure_tracking: true,
             })
             .map_err(|_| "mount worker is not running".to_owned())?;
         self.acquisition_nudge_inflight = true;
@@ -1880,7 +1940,11 @@ impl MountState {
     }
 
     pub fn stop_acquisition_motion(&mut self) {
-        self.stop_motion();
+        let _ = self.tx.send(WorkerCommand::StopAcquisition);
+        self.active_direction = None;
+        self.jog_latch = None;
+        self.timed_jog = None;
+        self.acquisition_nudge_inflight = false;
         self.acquisition_nudge_done = false;
     }
 
@@ -1913,6 +1977,7 @@ impl MountState {
             direction: self.jog_direction,
             duration_ms: duration.as_millis() as u64,
             rate: RATES[self.jog_rate_index].1,
+            ensure_tracking: false,
         });
         self.timed_jog = Some(TimedJog {
             direction: self.jog_direction,
@@ -2581,6 +2646,7 @@ impl MountState {
                 direction,
                 duration_ms,
                 rate: AUTO_CENTER_RATE,
+                ensure_tracking: true,
             });
         } else {
             state.phase = AutoCenterPhase::Moving {
@@ -2795,6 +2861,7 @@ impl MountState {
                             direction,
                             duration_ms,
                             rate: AUTO_CENTER_RATE,
+                            ensure_tracking: true,
                         });
                     } else {
                         let seq = focus.sun_signal_sample().map(|(s, _)| s).unwrap_or(0);
@@ -3006,26 +3073,29 @@ fn status_card(ui: &mut egui::Ui, title: &str, value: &str) {
 
 fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
     let mut port: Option<Box<dyn SerialPort>> = None;
-    let mut timed_move_deadline: Option<Instant> = None;
+    let mut timed_move: Option<(Instant, Direction, bool)> = None;
 
     loop {
-        if timed_move_deadline
-            .map(|deadline| Instant::now() >= deadline)
+        if timed_move
+            .map(|(deadline, _, _)| Instant::now() >= deadline)
             .unwrap_or(false)
         {
+            let (_, direction, ensure_tracking) = timed_move.take().unwrap();
             if let Some(opened) = port.as_deref_mut() {
-                let _ = blind(opened, ":Q#");
+                let _ = blind(opened, direction.stop_command());
+                if ensure_tracking {
+                    let _ = blind(opened, ":Te#");
+                }
             }
-            timed_move_deadline = None;
             let _ = tx.send(WorkerMessage::NudgeDone);
         }
-        let wait = timed_move_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        let wait = timed_move
+            .map(|(deadline, _, _)| deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::from_millis(100))
             .min(Duration::from_millis(100));
         match rx.recv_timeout(wait) {
             Ok(WorkerCommand::Connect(name)) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 if let Some(mut old) = port.take() {
                     let _ = blind(&mut *old, ":Q#");
                 }
@@ -3040,7 +3110,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::Disconnect) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 if let Some(mut opened) = port.take() {
                     let _ = blind(&mut *opened, ":Q#");
                 }
@@ -3102,15 +3172,29 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::Stop) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 if let Some(opened) = port.as_deref_mut() {
                     if let Err(error) = blind(opened, ":Q#") {
                         let _ = tx.send(WorkerMessage::Error(error));
                     }
                 }
             }
+            Ok(WorkerCommand::StopAcquisition) => {
+                let direction = timed_move.take().map(|(_, direction, _)| direction);
+                if let Some(opened) = port.as_deref_mut() {
+                    let result = if let Some(direction) = direction {
+                        blind(opened, direction.stop_command())
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|_| blind(opened, ":Te#"));
+                    if let Err(error) = result {
+                        let _ = tx.send(WorkerMessage::Error(error));
+                    }
+                }
+            }
             Ok(WorkerCommand::GoHome) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 if let Some(opened) = port.as_deref_mut() {
                     let result = blind(opened, ":Q#").and_then(|_| blind(opened, ":hC#"));
                     match result {
@@ -3126,7 +3210,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::Park) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 if let Some(opened) = port.as_deref_mut() {
                     let result = blind(opened, ":Q#").and_then(|_| blind(opened, ":hP#"));
                     match result {
@@ -3211,7 +3295,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::SlewTo { ra_hours, dec_deg }) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 let result = match port.as_deref_mut() {
                     Some(opened) => slew_to_coords(opened, ra_hours, dec_deg, false),
                     None => Err("mount is not connected".into()),
@@ -3231,16 +3315,31 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 direction,
                 duration_ms,
                 rate,
+                ensure_tracking,
             }) => {
-                timed_move_deadline = None;
+                let previous = timed_move.take().map(|(_, direction, _)| direction);
                 if let Some(opened) = port.as_deref_mut() {
-                    let result = blind(opened, ":Q#")
+                    let result = if let Some(previous) = previous {
+                        blind(opened, previous.stop_command())
+                    } else {
+                        Ok(())
+                    }
+                    .and_then(|_| {
+                        if ensure_tracking {
+                            blind(opened, ":Te#")
+                        } else {
+                            Ok(())
+                        }
+                    })
                         .and_then(|_| blind(opened, &format!(":R{}#", rate.min(9))))
                         .and_then(|_| blind(opened, direction.move_command()));
                     match result {
                         Ok(()) => {
-                            timed_move_deadline =
-                                Some(Instant::now() + Duration::from_millis(duration_ms));
+                            timed_move = Some((
+                                Instant::now() + Duration::from_millis(duration_ms),
+                                direction,
+                                ensure_tracking,
+                            ));
                         }
                         Err(error) => {
                             let _ = tx.send(WorkerMessage::Error(error));
@@ -3249,7 +3348,7 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                 }
             }
             Ok(WorkerCommand::SlewSun { ra_hours, dec_deg }) => {
-                timed_move_deadline = None;
+                timed_move = None;
                 let result = match port.as_deref_mut() {
                     Some(opened) => slew_to_sun(opened, ra_hours, dec_deg),
                     None => Err("mount is not connected".into()),
@@ -3782,6 +3881,23 @@ fn sun_equatorial_at_unix(unix_seconds: f64) -> SunPosition {
     }
 }
 
+fn local_sidereal_hours_at_unix(unix_seconds: f64, longitude_deg: f64) -> f64 {
+    let julian_date = unix_seconds / 86_400.0 + 2_440_587.5;
+    let days_since_j2000 = julian_date - 2_451_545.0;
+    let centuries = days_since_j2000 / 36_525.0;
+    let gmst_deg = 280.460_618_37
+        + 360.985_647_366_29 * days_since_j2000
+        + 0.000_387_933 * centuries * centuries
+        - centuries * centuries * centuries / 38_710_000.0;
+    ((gmst_deg + longitude_deg) / 15.0).rem_euclid(24.0)
+}
+
+fn sun_hour_angle_hours_at_unix(unix_seconds: f64, longitude_deg: f64) -> f64 {
+    let sun = sun_equatorial_at_unix(unix_seconds);
+    let lst = local_sidereal_hours_at_unix(unix_seconds, longitude_deg);
+    (lst - sun.ra_hours + 12.0).rem_euclid(24.0) - 12.0
+}
+
 fn format_ra(hours: f64) -> String {
     let total = (hours.rem_euclid(24.0) * 3600.0).round() as i64 % 86_400;
     format!(
@@ -3989,6 +4105,25 @@ mod tests {
         assert_eq!(dir, Direction::South);
         assert_eq!(next, (1, -1));
         assert!(grid_step_direction((1, 1), (1, 1)).is_none());
+    }
+
+    #[test]
+    fn timed_motion_stops_only_its_requested_direction() {
+        assert_eq!(Direction::North.stop_command(), ":Qn#");
+        assert_eq!(Direction::South.stop_command(), ":Qs#");
+        assert_eq!(Direction::East.stop_command(), ":Qe#");
+        assert_eq!(Direction::West.stop_command(), ":Qw#");
+    }
+
+    #[test]
+    fn meridian_estimate_matches_blackpool_solar_noon() {
+        // 2026-07-30 13:18 BST, independently published as local solar noon.
+        let unix_seconds = 1_785_413_880.0;
+        let hour_angle = sun_hour_angle_hours_at_unix(unix_seconds, -2.989_722);
+        assert!(
+            hour_angle.abs() < 2.0 / 60.0,
+            "solar hour angle was {hour_angle:.4} h"
+        );
     }
 
     #[test]
