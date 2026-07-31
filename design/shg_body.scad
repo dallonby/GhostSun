@@ -42,6 +42,11 @@ snoutExt = 70;       // external snout extension: moves the OTA's fat parts
 
 /* [Camera port] */
 camBoreD = 34; camTubeD = 56;
+// measured camera: cooled IMX571, Ø80 body, Ø100 x 10 tilt-adjuster
+// flange at the opening, 108 mm total; helical focuser ~Ø58 x 20 assumed
+camFocD = 58; camFocL = 20;
+camTiltD = 100; camTiltT = 10;
+camBodyD = 80; camBodyL = 98;
 camThreadD = 42; camThreadP = 0.75;  // M42x0.75 (T2) female, printed
 camThreadL = 9; camThreadClr = 0.35; // radial print clearance
 
@@ -230,7 +235,19 @@ module shelyak_adapter() {
     }
 }
 
+// ghost camera envelope (reference only, renders transparent)
+module camera_ghost() {
+    camLenG = (sensP[0] - minX) / -u(dfAng)[0];
+    %along(sensP, dfAng) translate([0, 0, camLenG + 10]) {
+        cylinder(h = camFocL, d = camFocD, $fn = 64);
+        translate([0, 0, camFocL]) cylinder(h = camTiltT, d = camTiltD, $fn = 64);
+        translate([0, 0, camFocL + camTiltT])
+            cylinder(h = camBodyL, d = camBodyD, $fn = 64);
+    }
+}
+
 if (part == "body" || part == "preview") body();
+if (part == "preview") camera_ghost();
 if (part == "rotor") rotor();
 if (part == "preview")
     translate([gratP[0], gratP[1], 6.2]) rotate([0, 0, armAng - 180]) rotor();

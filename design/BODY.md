@@ -30,12 +30,14 @@ raytrace.
   interface: PRINTED M42 x 0.75 (T2) female thread, 9 mm deep, at the
   exterior end. Sensor plane sits at the interior end of the tunnel —
   set back-focus with the helical focuser.
-- Camera clearance: camera axis sits 102 mm from the telescope axis
-  (set by Lc = 230 in CHOSEN). An Ø80 cooled IMX571 body (ToupTek ATR
-  class) clears the Ø64 snout extension by ~20 mm over a 110 mm stack;
-  Ø90 bodies clear by ~15 mm. If the camera were truly Ø160, Lc must
-  rise to ~270 and the body would need split-printing — confirm the
-  real body diameter before printing.
+- Camera clearance (measured camera: cooled IMX571, Ø80 body, Ø100 x 10
+  tilt-adjuster flange at the opening, 108 mm long; ~Ø58 x 20 helical
+  assumed): camera axis 109.8 mm from the telescope axis (Lc = 240).
+  Margins along the stack: tilt plate vs snout tube +25 mm; body vs
+  snout end +32 mm; body vs drawtube +25 mm; body tail vs Ø95 OTA
+  +10 mm (chain-dependent worst case). Ghost camera envelope renders in
+  part="preview" — update camFocD/L, camTiltD/T, camBodyD/L if the
+  focuser choice changes.
 - Printed-thread rules (both ports): 0.10-0.15 mm layers over the thread
   region, slow perimeters, no supports in the bore; chase gently with the
   mating metal part; if a print tears, bump camThreadClr by +0.1. The
