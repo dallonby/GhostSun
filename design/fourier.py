@@ -29,7 +29,8 @@ import math
 import numpy as np
 from raytrace import Design, CONFIGS, dot
 
-CFG = CONFIGS["A_edmund_30-45"]
+from raytrace import CHOSEN
+CFG = CONFIGS[CHOSEN["config"]]
 F1, F2 = CFG["rfl1"], CFG["rfl2"]
 FNUM = 6.9
 D_COL_CA = 0.9 * 50.8       # collimator clear aperture (mm)
@@ -46,7 +47,7 @@ GRATING_W = [50.0, 25.0]    # mm (candidate purchase vs existing 25 mm)
 
 
 def geometry(lam_nm, lpmm):
-    d = Design(lines_per_mm=lpmm, order=1, dev=20.0, s2=-1.0, **CFG)
+    d = Design(lines_per_mm=lpmm, order=1, dev=CHOSEN["dev"], s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **CFG)
     d.build(lam_nm)
     n = d.gr.n
     ca = abs(dot(d.c1, n))

@@ -167,8 +167,13 @@ class Design:
         G = add(C1, mul(c1, self.Lg))
         gvec = (1.0, 0.0, 0.0)
 
-        # find grating rotation gamma (about x) so diffracted chief makes
-        # angle dev with c1
+        # Find grating rotation gamma (about x) so the diffracted chief
+        # departs from RETRO (Littrow) by exactly `dev` degrees, on the side
+        # given by dev's sign. Signed off-retro angle:
+        #   psi = sign(cross(c1,c2).x) * (180 - ang(c1, c2))
+        # psi = 0 at exact Littrow; we solve psi = dev. (A previous version
+        # bisected on atan2 of the raw angle and converged to a spurious
+        # root at exact retro -> OAP2 coincided with OAP1. See RESULTS.md.)
         target = self.dev
 
         def diff_dir(gamma):
@@ -177,42 +182,42 @@ class Design:
             r = gr.intersect_diffract(C1, c1, lam)
             return (gr, r[1]) if r else (gr, None)
 
+        def psi_of(d2):
+            s = dot(cross(c1, d2), (1.0, 0.0, 0.0))
+            return math.copysign(180.0 - ang(c1, d2), s if s != 0 else 1.0)
+
         best = None
-        g_lo, g_hi = -80.0, 80.0
-        # coarse scan then bisect on signed fold-plane angle
         prev = None
-        for i in range(801):
-            g = g_lo + (g_hi - g_lo) * i / 800.0
+        for i in range(1601):
+            g = -80.0 + 160.0 * i / 1600.0
             gr, d2 = diff_dir(g)
             if d2 is None:
                 prev = None
                 continue
-            # signed deviation in fold plane
-            sd = math.degrees(math.atan2(
-                dot(cross(c1, d2), (1.0, 0.0, 0.0)), dot(c1, d2)))
-            f = sd - target
-            if prev is not None and prev[1] * f < 0:
+            f = psi_of(d2) - target
+            if prev is not None and prev[1] * f < 0 and abs(f) < 30:
                 a, fa = prev
                 b, fb = g, f
                 for _ in range(80):
-                    mmid = 0.5*(a+b)
-                    _, dm = diff_dir(mmid)
+                    mid = 0.5 * (a + b)
+                    _, dm = diff_dir(mid)
                     if dm is None:
                         break
-                    sdm = math.degrees(math.atan2(
-                        dot(cross(c1, dm), (1.0, 0.0, 0.0)), dot(c1, dm)))
-                    fm = sdm - target
-                    if fa*fm <= 0:
-                        b, fb = mmid, fm
+                    fm = psi_of(dm) - target
+                    if fa * fm <= 0:
+                        b, fb = mid, fm
                     else:
-                        a, fa = mmid, fm
-                best = 0.5*(a+b)
+                        a, fa = mid, fm
+                best = 0.5 * (a + b)
                 break
             prev = (g, f)
         if best is None:
             raise RuntimeError("grating tune failed (no solution for dev)")
         self.gr, c2 = diff_dir(best)
         self.gamma = best
+        got = psi_of(c2)
+        if abs(got - target) > 0.01:
+            raise RuntimeError(f"tune landed at psi={got:.2f}, want {target}")
 
         th2 = self.th2
         C2 = add(G, mul(c2, self.Lc))
@@ -284,6 +289,11 @@ CONFIGS = {
     "E_edmund_30-30": dict(rfl1=108.89, th1=30.0, rfl2=272.23, th2=30.0),
 }
 
+# Chosen buildable geometry (see RESULTS.md): config B, off-Littrow 20 deg,
+# opposite folds, grating arm sized for 40 mm return-beam clearance.
+CHOSEN = dict(config="B_edmund_30s-45", dev=20.0, s2=-1.0,
+              Lg=117.0, Lc=200.0)
+
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),
     ("Ha 656", 656.28, 2400.0, 1),
@@ -292,7 +302,7 @@ LINES = [  # (label, lambda nm, lines/mm, order)
 
 FIELDS = [0.0, 2.1, 3.5]         # mm along slit (disk edge, slit end)
 DLAM = [0.0, 0.5, 10.0]          # nm offsets: line, fast-mode edge, rich-mode edge
-DEVS = [20.0, 25.0, 30.0, 35.0, 40.0, 45.0]
+DEVS = [10.0, 15.0, 20.0, 25.0, 30.0]   # off-Littrow angles (deg)
 
 
 def run():
@@ -343,7 +353,17 @@ def run():
                 print(f"  {label}: NO GEOMETRY (evanescent or tune fail)")
                 continue
             (worst, dev, s2), rows, rx0, ry0 = best
+            # mechanical clearance: perpendicular distance from OAP1 center
+            # to the diffracted chief line (must exceed OAP1 half-size +
+            # beam half-width, ~40 mm, for the return beam to miss OAP1)
+            dchk = Design(lines_per_mm=lpmm, order=order, dev=dev, s2=s2,
+                          **cfg)
+            dchk.build(lam0)
+            off = sub(dchk.C1, dchk.G)
+            clr = math.sqrt(max(dot(off, off) -
+                                dot(off, dchk.c2) ** 2, 0.0))
             print(f"  {label}: dev={dev:+.0f} s2={s2:+.0f}  "
+                  f"OAP1-to-return-beam clearance {clr:.0f} mm  "
                   f"on-axis sanity rms=({rx0:.2e},{ry0:.2e}) um")
             for (xf, dl, rx, ry) in rows:
                 flag = " <-- worst" if max(rx, ry) == worst else ""

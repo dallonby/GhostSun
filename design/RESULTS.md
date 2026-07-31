@@ -1,108 +1,105 @@
-# All-reflective SHG — raytrace results (2026-07-31)
+# All-reflective SHG — design results (2026-07-31, rev 2)
 
-Tracer: `raytrace.py` (exact vector trace, stdlib; run under `design/.venv`).
-Validation: on-axis field at tuned wavelength focuses to machine precision
-(~1e-12 um RMS) through the full slit -> OAP1 -> grating -> OAP2 -> sensor
-chain; catalog RFL/PFL ratios reproduced for both vendors' angle conventions.
+Tools (run under `design/.venv`): `raytrace.py` (exact vector trace),
+`tolerance.py` (perturbation sweep), `fourier.py` (slit-diffraction wave
+optics), `plots.py` (layout.png, spots.png).
 
-Feed: f/6.9 (FSQ-85 @ 65 mm stop, 450 mm FL). Slit 7 um x 7 mm along x.
-Fields: 0 / 2.1 (disk edge) / 3.5 mm (slit end). Gratings: 2400 l/mm
-(CaK, Ha), 1200 l/mm (He 1083). Sensor budget: slit image ~11.5 um,
-pixel 3.76 um -> blur RMS <3 um negligible, <8 um usable.
+**REVISION NOTE:** rev 1 of this file reported config A at "20 deg
+deviation" with 3-6 um field blur. That geometry was the product of a
+solver bug: the deviation tuner converged to a spurious root at exact
+Littrow retro-reflection, placing OAP2 coincident with OAP1 — optically
+flattering, mechanically impossible (caught by the layout chart; the
+telltale was anamorphism = exactly 1.000). The tuner now solves the signed
+off-Littrow angle directly, and all results below are for buildable
+geometry. Casefile ids: bug d64467a2/753eea86/abfd14b4 superseded via
+correction entries.
 
-## Winner: config A — Edmund protected aluminum
+## Chosen design: config B, 20 deg off-Littrow
 
 | part | role | spec | price |
 |---|---|---|---|
-| #35-494 | collimator | Ø50.8, 30°, RFL 108.9 | $499 |
-| #35-588 | camera | Ø76.2, 45°, RFL 178.5 | $649 |
+| Edmund #35-607 | collimator | Ø50.8 mm, 30 deg, RFL 81.79 | $599 |
+| Edmund #35-588 | camera | Ø76.2 mm, 45 deg, RFL 178.53 | $649 |
 
-Geometry: grating deviation ~20°, camera fold sense OPPOSITE to collimator
-(s2=-1) — this asymmetric pairing near-cancels field coma (verified: matched
-30/30 config E is 10x worse at field). Magnification 1.64x.
+Geometry (`CHOSEN` in raytrace.py): dev = +20 deg off-Littrow, camera fold
+OPPOSITE the collimator fold (s2 = -1), Lg = 117 mm (slit-side clearance:
+return beam passes ~38 mm from OAP1), Lc = 200 mm (sensor lands at
+z = -69, y = +79 mm — clear of the FSQ-85 drawtube). Magnification 2.18x:
+7 um slit -> 15.3 um spatial image (4.1 px on IMX571); disk image 9.2 mm
+(needs the IMX571-class sensor; IMX678 too small at this mag).
 
-Fast mode (±0.5 nm window), worst RMS radii:
-- CaK 393: 4.9 um (slit end), 3.4 um (disk edge)
-- Ha 656: 5.8 um (slit end), 4.2 um (disk edge)
-- He 1083: 4.8 um (slit end), 3.0 um (disk edge)
-All usable; disk-edge performance near-negligible vs 11.5 um slit image.
+Why B over A (108.9 mm collimator): with ONE deviation angle shared by all
+lines (the arms are a housing constant), A only beats B at dev <= 10 deg,
+which needs a 230 mm grating arm for mechanical clearance. B peaks at
+dev = 20 (coma balance), which is buildable at Lg = 117. B's shorter
+collimator also throws a tighter diffraction fan -> less clipping on small
+gratings.
 
-Rich mode: blur grows ~linearly with window offset; ~6 um at ±1 nm,
-~12 um at ±2 nm, 40-60 um at ±10 nm. Usable co-registered window is
-therefore ±1.5-2 nm (line core + wings + local continuum — covers the
-velocity-min composite use case), NOT ±15 nm panoramas.
+## Performance (RMS spot radii, um; slit image is 15.3 um)
 
-## Eliminated
+field 0 = disk center, 2.1 mm = disk edge, 3.5 mm = slit end; at line
+center / +0.5 nm the numbers are essentially identical:
 
-- B (#35-607 81.8 mm collimator): 20 um field blur — collimator field angle
-  too large at short RFL.
-- C (Thorlabs silver 45/45, MPD364+MPD3124): 48 um at slit end even on-line.
-  45° collimator is the killer, not the camera.
-- D (Thorlabs aluminum 90/90, MPD249+MPD269): 57-70 um at slit end.
-  Confirms 90° OAPs unusable for slit-field imaging.
-- E (#35-494 + #35-580 30/30): 47 um at slit end — breaking the 30/45
-  asymmetry un-cancels coma. Angle asymmetry is load-bearing.
+| line | center | disk edge | slit end |
+|---|---|---|---|
+| Ca K 393 | 0 | 7.2 / 4.8 | 12.9 / 7.9 |
+| Ha 656 | 0 | 7.1 / 4.5 | 12.2 / 9.7 |
+| He 1083 | 0 | 4.4 / 1.9 | 8.5 / 4.3 |
 
-## Tolerance sweep (tolerance.py, Ha, worst of field 0/3.5 mm, sensor
-refocus allowed as sole compensator)
+(spatial / dispersion). Verdict: excellent over the disk (blur < half the
+slit image), marginal at the extreme slit ends — which only matters if the
+full 7 mm slit length is used; the 4.2 mm solar disk lives inside the
+good field. Rich-mode window: ~40-60 um at +/-10 nm (unchanged story);
+usable co-registered window remains ~+/-1.5-2 nm.
 
-Nominal at best focus: 4.7 um RMS. Tolerances quoted = magnitude of that
-single DoF adding +3 um RMS blur:
+Anamorphism is now real: cos(a)/cos(b) = 0.82 (CaK) / 0.62 (Ha) / 0.73
+(He). The spectral image of the slit is compressed vs the spatial axis —
+higher spectral resolution than the geometric slit suggests; recon must
+not assume square pixels across axes.
+
+## Tolerances (Ha, sensor refocus as sole compensator, +3 um budget)
 
 | DoF | tolerance | note |
 |---|---|---|
-| grating clocking (about normal) | 0.047 deg (~3 arcmin) | TIGHTEST; visible as line tilt (3-5 px over slit) -> align live on spectrum |
-| OAP2 pitch (fold plane) | 0.064 deg (~4 arcmin) | kinematic mount territory |
-| OAP1 pitch (fold plane) | 0.075 deg (~4.5 arcmin) | kinematic mount territory |
-| OAP1 clocking (about chief) | 0.13 deg (~8 arcmin) | mount alignment pin + registration |
-| slit/OAP1 despace | 0.21 mm | set by zero-order autocollimation (resolves ~10s of um) |
-| OAP yaw, decenters, OAP2 clock/despace, grating in-plane yaw | insensitive | image shifts only (100-500 um) -> absorbed by tuning/pointing |
+| OAP1 / OAP2 yaw | 0.025-0.026 deg (~1.5 arcmin) | TIGHTEST; adjust while watching live spot |
+| grating in-plane yaw | 0.033 deg (~2 arcmin) | shows as focus/tilt on live spectrum |
+| OAP2 pitch | 0.055 deg | kinematic mount |
+| OAP1 pitch | 0.088 deg | kinematic mount |
+| OAP2 decenter | 0.45 mm | easy |
+| slit despace, OAP clocking, grating clocking, OAP2 despace | insensitive at tested magnitudes | shifts only |
 
-Verdict: amateur-buildable. All sensitive DoFs are arcminute-class, each
-observable on the live spectrum itself (line tilt, spot focus) — an
-in-GhostSun live alignment readout would make assembly procedural.
+Tighter than rev 1 (yaws now matter at ~1.5 arcmin) but still
+kinematic-mount + live-spectrum territory. A GhostSun live alignment
+readout (spot FWHM + line tilt) remains the enabling build tool.
 
-## Fourier pass (fourier.py — slit sinc^2 fan conv geometric cone,
-propagated through the raytraced aperture stack)
-
-Better than the back-of-envelope estimates. With the 50 mm grating,
-delivered energy and line-spread broadening:
+## Fourier pass (throughput / delivered line spread, 50 mm grating)
 
 | line / slit | delivered | LSF broadening |
 |---|---|---|
-| CaK, 5 um | 97% | +2% |
-| Ha, 7 um | 94% | +6% |
-| He 1083, 10 um | 95% | +5% |
-| He 1083, 7 um | 93% | +10% |
+| CaK / 5 um | 98% | +1% |
+| Ha / 7 um | 94% | +6% |
+| He / 10 um | 95% | +4% |
 
-The short 108.9 mm collimator keeps the whole fan compact — the earlier
-"15-25% He clipping" fear was pessimistic. Bonus: at 20 deg deviation the
-geometry is symmetric (alpha = beta, anamorphism 1.000) at all three lines —
-no anamorphic distortion, square pixels preserved.
+Existing Shelyak 25 mm grating: 74-78% delivered at Ha/He, 22-30% LSF
+broadening — usable (comparable clipping already exists in the lens
+Sol'Ex), staged-build plan stands: first light on the Shelyak grating,
+upgrade to Thorlabs GH50-24V (£313, in stock) when wanted. Baffle sites:
+1-4% in a ring around OAP1 (dispersion plane) and up to 4% past the
+grating edges.
 
-The existing Shelyak ~25 mm grating delivers ~75% at Ha / 74% at He with
-21-35% bandpass broadening. IMPORTANT NUANCE: the current lens Sol'Ex has
-the same clipping physics (80 mm collimator, same fan vs same grating), so
-the mirror build with the existing grating is roughly AT PARITY with the
-instrument in use today — fully usable, just not the upgrade's full value.
-Staged plan: build with the Shelyak grating (free), drop in a 50 mm later.
-Grating cartridge must accept both form factors from day one
-(Shelyak 25x25x6 mm vs Thorlabs 50x50x9.5 mm).
+## Thermal / mechanical notes
 
-Verified source (2026-07-31): Thorlabs GH50-24V, visible reflective
-holographic, 2400/mm, 50x50x9.5 mm, £313.18, in stock (ships Bergkirchen).
-Companion GH50-12V (1200/mm, same price/size) exists for the He I cartridge,
-but it is VISIBLE-optimized — check its efficiency at 1083 nm vs a ruled
-blazed 1200/mm (Richardson/Newport, Edmund, Optometrics) before buying the
-IR grating. Holographic = low ghosting/stray light, 45-65% peak efficiency.
-
-Baffle sites (small but worth catching in a dark-line-core instrument):
-2-6% of the light lands in a ring around the collimator aperture in the
-dispersion plane (|y| = 23-54 mm at OAP1) -> matte baffle ring there;
-0.1-2.6% overshoots the grating edges -> trap behind/beside the grating.
+- Mirrors see ~7 mW total: no cooling. Slit absorbs ~1 W: tilt it; ERF
+  optional. Aluminum mirrors + aluminum housing = athermal.
+- Envelope roughly 300 x 200 mm in the fold plane (slit at origin, OAP1 at
+  z=+82, grating at (-20, -58), OAP2 at (+109, +95), sensor at (-69, +79)).
+- Grating cartridge must accept 25x25x6 (Shelyak) and 50x50x9.5 (Thorlabs).
 
 ## Open items
-- Mechanical: 20° grating deviation needs clearance check; all-aluminum
-  housing makes instrument athermal (mirrors are Al substrate).
-- Thermal: mirrors see ~7 mW total — no cooling; slit absorbs ~1 W
-  (tilt + optional ERF).
+
+- Mechanical CAD: housing, cartridge mounts (slit + grating), baffle ring,
+  camera mount clearance vs telescope drawtube (verified in layout.png at
+  chief-ray level; needs solid-model check with real camera body).
+- He I 1083 grating choice: GH50-12V is visible-optimized; compare 1083 nm
+  efficiency vs ruled blazed 1200/mm before purchase.
+- Optiland cross-check of the OAP relay (optional second opinion).

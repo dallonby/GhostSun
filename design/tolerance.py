@@ -121,8 +121,9 @@ def centroid_shift(d, d0, lam0):
 
 
 def build_nominal():
-    cfg = CONFIGS["A_edmund_30-45"]
-    d = Design(lines_per_mm=2400.0, order=1, dev=20.0, s2=-1.0, **cfg)
+    from raytrace import CHOSEN
+    cfg = CONFIGS[CHOSEN["config"]]
+    d = Design(lines_per_mm=2400.0, order=1, dev=CHOSEN["dev"], s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **cfg)
     d.build(656.28)
     return d
 
