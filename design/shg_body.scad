@@ -57,6 +57,38 @@ gratMax = 51; gratWinD = 40;
 
 function u(a) = [cos(a), sin(a)];
 eps = 0.01;
+showBeams = true;    // draw the light path in part="preview"
+
+// beam segment: frustum from p1 to p2 at beam height
+module beam(p1, p2, d1, d2, col) {
+    L = norm([p2[0] - p1[0], p2[1] - p1[1]]);
+    a = atan2(p2[1] - p1[1], p2[0] - p1[0]);
+    color(col, 0.45)
+        translate([p1[0], p1[1], beamH]) rotate([0, 0, a]) rotate([0, 90, 0])
+            cylinder(h = L, d1 = d1, d2 = d2, $fn = 48);
+}
+
+module light_path() {
+    // telescope cone: front wall -> slit (converges to the slit)
+    beam([minX - snoutExt, 0], slitP, 26, 0.8, "gold");
+    // slit -> OAP1: diverging f/6.9 cone (+ field)
+    beam(slitP, oap1P, 0.8, 16, "gold");
+    // OAP1 -> grating: collimated, ~13 mm
+    beam(oap1P, gratP, 13, 13, "orange");
+    // grating -> OAP2: anamorphically widened (cos b / cos a ~ 1.6 at Ha)
+    beam(gratP, oap2P, 19, 19, "red");
+    // OAP2 -> sensor: converging to the spectrum image
+    beam(oap2P, sensP, 19, 3, "crimson");
+}
+
+module deck_labels() {
+    for (lp = [[slitP, "SLIT", 8], [oap1P, "OAP1", 10],
+               [gratP, "GRATING", 10], [oap2P, "OAP2", 10],
+               [sensP, "SENSOR", 8]])
+        color("white") translate([lp[0][0], lp[0][1] - 14, 0.2])
+            linear_extrude(0.8) text(lp[1], size = lp[2],
+                                     halign = "center", font = "Liberation Sans:style=Bold");
+}
 
 // deck extents: optical features plus the mirror-slab corner points
 slab1F = [oap1P[0] - mirrorStack * cos(c1Ang), oap1P[1] - mirrorStack * sin(c1Ang)];
@@ -247,7 +279,11 @@ module camera_ghost() {
 }
 
 if (part == "body" || part == "preview") body();
-if (part == "preview") camera_ghost();
+if (part == "preview") {
+    camera_ghost();
+    deck_labels();
+    if (showBeams) light_path();
+}
 if (part == "rotor") rotor();
 if (part == "preview")
     translate([gratP[0], gratP[1], 6.2]) rotate([0, 0, armAng - 180]) rotor();
