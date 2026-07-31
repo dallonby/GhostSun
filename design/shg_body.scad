@@ -25,7 +25,12 @@ margin = 38;
 /* [Mirror mounts] */
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
-slabW = 158;
+slabW = 150;         // = KM plate width
+slab1Shift = 34;     // OAP1 slab+KM shifted along its face so the
+                     // diffracted beam (crosses the face plane 59 mm
+                     // off-center) clears the plate edge by ~8.5 mm.
+                     // Mirror stays at the optical point -> print the
+                     // OAP1 KM platform with mirrorOffX = -34.
 kmHole = 64;         // KM base bolt triangle half-pitch (see mounts/)
 m5insD = 6.4; m5insL = 12;
 
@@ -93,11 +98,12 @@ module deck_labels() {
 // deck extents: optical features plus the mirror-slab corner points
 slab1F = [oap1P[0] - mirrorStack * cos(c1Ang), oap1P[1] - mirrorStack * sin(c1Ang)];
 slab2F = [oap2P[0] + mirrorStack * cos(c2Ang), oap2P[1] + mirrorStack * sin(c2Ang)];
-function slabPts(f, a) = [for (s = [-1, 1], b = [0, 1])
-    [f[0] + s * (slabW / 2) * cos(a + 90) - b * slabT * cos(a),
-     f[1] + s * (slabW / 2) * sin(a + 90) - b * slabT * sin(a)]];
+function slabPts(f, a, sh) = [for (s = [-1, 1], b = [0, 1])
+    [f[0] + (sh + s * slabW / 2) * cos(a + 90) - b * slabT * cos(a),
+     f[1] + (sh + s * slabW / 2) * sin(a + 90) - b * slabT * sin(a)]];
 allPts = concat([slitP, gratP, sensP, [0, 0]],
-                slabPts(slab1F, c1Ang), slabPts(slab2F, c2Ang + 180),
+                slabPts(slab1F, c1Ang, slab1Shift),
+                slabPts(slab2F, c2Ang + 180, 0),
                 [[gratP[0], gratP[1] - rotD - 20]]);
 minX = min([for (p = allPts) p[0]]) - margin;
 maxX = max([for (p = allPts) p[0]]) + 8;
@@ -122,15 +128,17 @@ module thread_male(d, pitch, len) {
     cylinder(h = len, d = 2 * rmin + 0.2, $fn = 96);
 }
 
-module mirror_slab(faceP, normAng) {
+module mirror_slab(faceP, normAng, shift = 0) {
+    // shift: slab + KM bolt pattern move along the face tangent; the
+    // mirror stays at faceP (mount the mirror off-center on the platform)
     difference() {
         linear_extrude(wallH)
             translate(faceP) rotate([0, 0, normAng])
-                translate([-slabT / 2, 0]) square([slabT, slabW], center = true);
+                translate([-slabT / 2, shift]) square([slabT, slabW], center = true);
         for (hv = [[kmHole, kmHole], [kmHole, -kmHole], [-kmHole, kmHole]])
             translate([faceP[0], faceP[1], beamH + hv[1]])
                 rotate([0, 0, normAng]) rotate([0, 90, 0])
-                    translate([0, hv[0], -m5insL])
+                    translate([0, hv[0] + shift, -m5insL])
                         cylinder(h = m5insL + eps, d = m5insD, $fn = 32);
     }
 }
@@ -152,7 +160,7 @@ module body() {
                 translate([minX + wallT, minY + wallT])
                     square([maxX - minX - 2 * wallT, maxY - minY - 2 * wallT]);
             }
-            mirror_slab(slab1F, c1Ang);
+            mirror_slab(slab1F, c1Ang, slab1Shift);
             mirror_slab(slab2F, c2Ang + 180);
             // slit tower
             linear_extrude(beamH + slitSlideH)

@@ -52,6 +52,13 @@ A controlled 1/20 turn ≈ 1.0 / 0.36 arcmin — inside budget either way;
 - The cone and vee print facing up on the base plate — no supports needed
   at these shallow depths. Ream the pivot pocket to a snug ball fit.
 
+## Per-mirror print settings
+
+- OAP2: defaults (mirrorOffX = 0).
+- OAP1: platform printed with **mirrorOffX = -34** — the body's OAP1 slab
+  is shifted +34 mm along its face so the diffracted beam clears the
+  plate edge; the offset keeps the mirror at the optical position.
+
 ## Before printing: measure two things
 
 1. The actual bolt pattern on your Edmund mirror backs (set `mirrorBCD`,

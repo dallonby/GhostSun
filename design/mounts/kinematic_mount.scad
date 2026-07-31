@@ -29,6 +29,10 @@ insertD = 5.6;       // M4 heat-set insert hole
 insertL = 8;
 springHoleD = 3.2;
 mirrorBCD = 40;      // backing-plate bolt circle (measure your mirror!)
+mirrorOffX = 0;      // mirror center offset along X on the platform.
+                     // OAP1 platform: print with mirrorOffX = -34 (the
+                     // slab+mount are shifted +34 so the diffracted beam
+                     // clears the plate edge; mirror stays on-axis).
 mirrorBoltD = 4.4;
 mirrorBoltN = 3;
 baseBoltD = 5.4;     // M5 to housing
@@ -44,7 +48,7 @@ adjA  = [m, m + leverArm];   // vee -> pitch
 adjB  = [m + leverArm, m];   // flat -> yaw
 springs = [[m + 0.35*leverArm, m + 0.35*leverArm],
            [m + 0.60*leverArm, m + 0.60*leverArm]];
-centroid = [(pivot[0]+adjA[0]+adjB[0])/3, (pivot[1]+adjA[1]+adjB[1])/3];
+centroid = [(pivot[0]+adjA[0]+adjB[0])/3 + mirrorOffX, (pivot[1]+adjA[1]+adjB[1])/3];
 
 module plate() { cube([plateW, plateH, plateT]); }
 
