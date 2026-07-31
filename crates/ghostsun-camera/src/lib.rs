@@ -189,6 +189,12 @@ pub trait Camera: Send {
         None
     }
     fn set_roi(&mut self, roi: Roi) -> Result<()>;
+    /// Request 8- or 16-bit mono readout. Default is 16-bit. Must be set while
+    /// stopped; backends that only support 16-bit return an error for 8.
+    /// Frames are still delivered as [`Frame`] `u16` (8-bit samples scaled ×257).
+    fn set_bit_depth(&mut self, _bits: u8) -> Result<()> {
+        Ok(())
+    }
     /// Begin streaming. Must be called before [`Camera::next_frame`].
     fn start(&mut self) -> Result<()>;
     /// Block up to `timeout_ms` for the next frame.

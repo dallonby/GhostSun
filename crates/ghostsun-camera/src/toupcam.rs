@@ -306,8 +306,9 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
     // Disable auto-exposure — it is ON by default and overrides BOTH manual
     // exposure and gain, making the sliders appear to do nothing.
     unsafe { (api.put_auto_expo)(h, 0) };
-    // Best-effort: raw, linear, 16-bit output. Ignore failures on models that
-    // don't support an option — pulling 16 bits still works via upconversion.
+    // Best-effort: raw, linear output. Default 16-bit; `set_bit_depth(8)`
+    // switches OPTION_BITDEPTH to 0. Ignore failures on models that don't
+    // support an option — pulling still works via upconversion.
     unsafe {
         (api.put_option)(h, OPTION_RAW, 1);
         (api.put_option)(h, OPTION_BITDEPTH, 1);
@@ -333,6 +334,7 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         signal,
         width: 0,
         height: 0,
+        bit_depth: 16,
         pending_roi: None,
         started: false,
         buf: Vec::new(),
@@ -359,6 +361,8 @@ pub struct ToupcamCam {
     signal: *mut Signal,
     width: usize,
     height: usize,
+    /// 8 or 16; controls OPTION_BITDEPTH and PullImageV3 bits/pitch.
+    bit_depth: u8,
     pending_roi: Option<Roi>,
     started: bool,
     buf: Vec<u8>,
@@ -369,6 +373,14 @@ pub struct ToupcamCam {
 unsafe impl Send for ToupcamCam {}
 
 impl ToupcamCam {
+    fn bytes_per_pixel(&self) -> usize {
+        if self.bit_depth <= 8 {
+            1
+        } else {
+            2
+        }
+    }
+
     fn refresh_size(&mut self) -> crate::Result<()> {
         let (mut w, mut h) = (0i32, 0i32);
         let hr = unsafe { (self.api.get_final_size)(self.h, &mut w, &mut h) };
@@ -377,19 +389,22 @@ impl ToupcamCam {
         }
         self.width = w as usize;
         self.height = h as usize;
-        self.buf.resize(self.width * self.height * 2, 0);
+        self.buf
+            .resize(self.width * self.height * self.bytes_per_pixel(), 0);
         Ok(())
     }
 
     fn pull_into_buffer(&mut self) -> crate::Result<(usize, usize)> {
         let mut fi = FrameInfoV3::default();
-        let pitch = (self.width * 2) as c_int;
+        let bpp = self.bytes_per_pixel();
+        let bits = if bpp == 1 { 8 } else { 16 };
+        let pitch = (self.width * bpp) as c_int;
         let hr = unsafe {
             (self.api.pull_v3)(
                 self.h,
                 self.buf.as_mut_ptr() as *mut c_void,
                 0,
-                16,
+                bits,
                 pitch,
                 &mut fi,
             )
@@ -401,7 +416,7 @@ impl ToupcamCam {
             return Err(CameraError::Sdk("PullImageV3 failed".into()));
         }
         let (w, h) = (fi.width as usize, fi.height as usize);
-        if w == 0 || h == 0 || w * h * 2 > self.buf.len() {
+        if w == 0 || h == 0 || w * h * bpp > self.buf.len() {
             return Err(CameraError::Sdk(
                 "PullImageV3 returned bad dimensions".into(),
             ));
@@ -411,8 +426,15 @@ impl ToupcamCam {
 
     fn frame_from_buffer(&self, w: usize, h: usize) -> Frame {
         let mut data = vec![0u16; w * h];
-        for (i, px) in data.iter_mut().enumerate() {
-            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+        if self.bytes_per_pixel() == 1 {
+            for (i, px) in data.iter_mut().enumerate() {
+                // Stretch 8-bit samples into the u16 range the fitter expects.
+                *px = u16::from(self.buf[i]) * 257;
+            }
+        } else {
+            for (i, px) in data.iter_mut().enumerate() {
+                *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+            }
         }
         Frame {
             width: w,
@@ -488,11 +510,39 @@ impl Camera for ToupcamCam {
         Ok(())
     }
 
+    fn set_bit_depth(&mut self, bits: u8) -> crate::Result<()> {
+        if bits != 8 && bits != 16 {
+            return Err(CameraError::Sdk(format!(
+                "unsupported bit depth {bits} (want 8 or 16)"
+            )));
+        }
+        if self.started {
+            return Err(CameraError::Sdk(
+                "set_bit_depth must be called while stopped".into(),
+            ));
+        }
+        // ToupTek: OPTION_BITDEPTH 0 = 8-bit, 1 = 16-bit.
+        let opt = if bits == 8 { 0 } else { 1 };
+        let hr = unsafe { (self.api.put_option)(self.h, OPTION_BITDEPTH, opt) };
+        if hr < 0 {
+            return Err(CameraError::Sdk(format!(
+                "put_Option(BITDEPTH,{opt}) failed for {bits}-bit"
+            )));
+        }
+        self.bit_depth = bits;
+        Ok(())
+    }
+
     fn start(&mut self) -> crate::Result<()> {
         if let Some(r) = self.pending_roi.take() {
             // Offsets/sizes align to 2 px; 0×0 means full frame.
             let a = |v: usize| (v & !1) as c_uint;
             unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) };
+        }
+        // Re-assert bit depth in case an earlier start left the SDK elsewhere.
+        let opt = if self.bit_depth == 8 { 0 } else { 1 };
+        unsafe {
+            (self.api.put_option)(self.h, OPTION_BITDEPTH, opt);
         }
         let hr =
             unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };

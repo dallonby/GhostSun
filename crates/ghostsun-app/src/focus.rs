@@ -57,6 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use eframe::egui;
 use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
@@ -189,6 +190,9 @@ pub struct FocusUpdate {
     pub limb_width: Option<f64>,
     /// High-passed along-slit contrast, whole span and outer thirds.
     pub structure: StructureSplit,
+    /// A hardware-ROI recording is active: frames are the capture band, so
+    /// sensor-coordinate overlays do not apply.
+    pub hw_roi_active: bool,
 }
 
 enum FocusMsg {
@@ -197,11 +201,15 @@ enum FocusMsg {
         path: PathBuf,
         width: usize,
         height: usize,
+        hw_roi: bool,
     },
     RecordingProgress(usize),
     RecordingStopped {
         path: PathBuf,
         frames: usize,
+        /// Achieved capture rate; 0 when unknown (fewer than two frames).
+        fps: f64,
+        hw_roi: bool,
     },
     RecordingError(String),
     Error(String),
@@ -218,6 +226,9 @@ enum FocusCmd {
         path: PathBuf,
         capture_height: usize,
         anchor_y: f64,
+        /// Ask the sensor to read only the capture band for the duration of
+        /// the recording (falls back to the software crop if refused).
+        hw_roi: bool,
     },
     StopSer,
 }
@@ -226,6 +237,8 @@ struct SerRequest {
     path: PathBuf,
     capture_height: usize,
     anchor_y: f64,
+    /// Some(sensor row of the band top) when a hardware ROI is active.
+    hw_roi_y0: Option<usize>,
 }
 
 struct ActiveSer {
@@ -233,6 +246,9 @@ struct ActiveSer {
     y0: usize,
     height: usize,
     recorder: SerRecorder,
+    hw_roi_y0: Option<usize>,
+    /// First-frame time, for the achieved-fps report.
+    started: Instant,
 }
 
 /// Which stage of the procedure the panel is driving.
@@ -602,20 +618,27 @@ impl FocusState {
                     path,
                     width,
                     height,
+                    hw_roi,
                 } => {
                     self.recording = true;
                     self.recording_path = Some(path);
-                    self.recording_status = format!("recording {width}×{height} mono16");
+                    let mode = if hw_roi { " · hardware ROI" } else { "" };
+                    self.recording_status = format!("recording {width}×{height} mono16{mode}");
                 }
                 FocusMsg::RecordingProgress(frames) => {
                     self.recorded_frames = frames;
                     self.recording_status = format!("recording · {frames} frames");
                 }
-                FocusMsg::RecordingStopped { path, frames } => {
+                FocusMsg::RecordingStopped { path, frames, fps, hw_roi } => {
                     self.recording = false;
                     self.recorded_frames = frames;
                     self.recording_path = Some(path);
-                    self.recording_status = format!("saved {frames} frames");
+                    let mode = if hw_roi { " · hardware ROI" } else { "" };
+                    self.recording_status = if fps > 0.0 {
+                        format!("saved {frames} frames · {fps:.1} fps{mode}")
+                    } else {
+                        format!("saved {frames} frames{mode}")
+                    };
                 }
                 FocusMsg::RecordingError(error) => {
                     self.recording = false;
@@ -830,6 +853,7 @@ impl FocusState {
         path: PathBuf,
         capture_height: usize,
         anchor_y: f64,
+        hw_roi: bool,
     ) -> Result<(), String> {
         if self.recording {
             return Err("a SER recording is already active".into());
@@ -847,6 +871,7 @@ impl FocusState {
             path: path.clone(),
             capture_height: capture_height.max(1),
             anchor_y,
+            hw_roi,
         })
         .map_err(|_| "camera worker is not running".to_owned())?;
         self.recording = true;
@@ -1843,6 +1868,11 @@ impl FocusState {
             return None;
         };
         let candidates = self.vertical_anchor_lines();
+        let hw_roi_active = self
+            .last
+            .as_ref()
+            .map(|update| update.hw_roi_active)
+            .unwrap_or(false);
         ui.vertical_centered(|ui| {
             let avail = ui.available_width().max(1.0);
             let aspect = tex.aspect_ratio();
@@ -1871,7 +1901,16 @@ impl FocusState {
                         * (sensor_y / frame_height.max(1) as f64).clamp(0.0, 1.0) as f32
             };
 
-            for &(line_y, _) in &candidates {
+            if hw_roi_active {
+                ui.painter().text(
+                    egui::pos2(rect.left() + 8.0, rect.top() + 6.0),
+                    egui::Align2::LEFT_TOP,
+                    "hardware ROI — the view is the capture band",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(255, 205, 75),
+                );
+            }
+            for &(line_y, _) in candidates.iter().filter(|_| !hw_roi_active) {
                 let y = sensor_to_screen_y(line_y);
                 ui.painter().hline(
                     rect.x_range(),
@@ -1879,7 +1918,7 @@ impl FocusState {
                     egui::Stroke::new(1.0_f32, SPECTRAL_COLOR.gamma_multiply(0.45)),
                 );
             }
-            if let Some(anchor) = selected_y {
+            if let Some(anchor) = selected_y.filter(|_| !hw_roi_active) {
                 let half_crop = capture_height as f64 / 2.0;
                 let y0 = sensor_to_screen_y(anchor - half_crop);
                 let y1 = sensor_to_screen_y(anchor + half_crop);
@@ -2600,20 +2639,72 @@ fn worker(
                     path,
                     capture_height,
                     anchor_y,
+                    hw_roi,
                 } => {
                     if let Some(active) = active_ser.take() {
+                        let had_hw = active.hw_roi_y0.is_some();
                         finish_ser(active, &tx);
+                        if had_hw {
+                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                let _ = tx.send(FocusMsg::Error(format!(
+                                    "the full sensor could not be restored: {error}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    // Hardware ROI: have the sensor read only the capture band,
+                    // so frame rate is exposure-limited rather than full-frame
+                    // readout-limited (measured on a G3M678M: 23 → 176 fps at
+                    // 256 rows). Frame rate is scan-axis sampling density, so
+                    // this is a direct resolution win. Scoped strictly to the
+                    // recording; a refusal falls back to the software crop --
+                    // a cropped recording beats no recording.
+                    let mut hw_roi_y0 = None;
+                    if hw_roi {
+                        let (y0, height) =
+                            vertical_crop_bounds(info.max_height, capture_height, anchor_y);
+                        let band = Roi {
+                            x: 0,
+                            y: y0 & !1,
+                            w: info.max_width,
+                            h: (height & !1).max(2),
+                        };
+                        match apply_roi(&mut *cam, band) {
+                            Ok(()) => hw_roi_y0 = Some(band.y),
+                            Err(roi_error) => {
+                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                    let _ = tx.send(FocusMsg::Error(format!(
+                                        "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
+                                    )));
+                                    return;
+                                }
+                            }
+                        }
                     }
                     pending_ser = Some(SerRequest {
                         path,
                         capture_height,
                         anchor_y,
+                        hw_roi_y0,
                     });
                 }
                 FocusCmd::StopSer => {
-                    let pending_path = pending_ser.take().map(|request| request.path);
+                    let pending = pending_ser.take();
                     if let Some(active) = active_ser.take() {
+                        let had_hw = active.hw_roi_y0.is_some();
                         let finished = finish_ser_message(active);
+                        // Restore the full sensor BEFORE resuming preview: the
+                        // ROI is scoped strictly to the recording.
+                        if had_hw {
+                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                let _ = tx.send(finished);
+                                let _ = tx.send(FocusMsg::Error(format!(
+                                    "SER saved, but the full sensor could not be restored: {error}"
+                                )));
+                                return;
+                            }
+                        }
                         let preview = cam.resume_preview();
                         let _ = tx.send(finished);
                         if let Err(error) = preview {
@@ -2622,8 +2713,23 @@ fn worker(
                             )));
                             return;
                         }
-                    } else if let Some(path) = pending_path {
-                        let _ = tx.send(FocusMsg::RecordingStopped { path, frames: 0 });
+                    } else if let Some(request) = pending {
+                        // No frame ever arrived. If the ROI was already
+                        // applied it must still be unwound.
+                        if request.hw_roi_y0.is_some() {
+                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                let _ = tx.send(FocusMsg::Error(format!(
+                                    "the full sensor could not be restored: {error}"
+                                )));
+                                return;
+                            }
+                        }
+                        let _ = tx.send(FocusMsg::RecordingStopped {
+                            path: request.path,
+                            frames: 0,
+                            fps: 0.0,
+                            hw_roi: false,
+                        });
                     }
                 }
             }
@@ -2640,11 +2746,15 @@ fn worker(
         match next {
             Ok(frame) => {
                 if let Some(request) = pending_ser.take() {
-                    let (y0, height) = vertical_crop_bounds(
-                        frame.height,
-                        request.capture_height,
-                        request.anchor_y,
-                    );
+                    let (y0, height) = match request.hw_roi_y0 {
+                        // The camera already delivers only the band.
+                        Some(_) => (0, frame.height),
+                        None => vertical_crop_bounds(
+                            frame.height,
+                            request.capture_height,
+                            request.anchor_y,
+                        ),
+                    };
                     match SerRecorder::create(
                         &request.path,
                         frame.width,
@@ -2657,12 +2767,15 @@ fn worker(
                                 path: request.path.clone(),
                                 width: frame.width,
                                 height,
+                                hw_roi: request.hw_roi_y0.is_some(),
                             });
                             active_ser = Some(ActiveSer {
                                 path: request.path,
                                 y0,
                                 height,
                                 recorder,
+                                hw_roi_y0: request.hw_roi_y0,
+                                started: Instant::now(),
                             });
                         }
                         Err(error) => {
@@ -2693,8 +2806,19 @@ fn worker(
                     }
                 }
                 if let Some(error) = recording_failed {
-                    active_ser.take();
+                    let had_hw = active_ser
+                        .take()
+                        .map(|active| active.hw_roi_y0.is_some())
+                        .unwrap_or(false);
                     let _ = tx.send(FocusMsg::RecordingError(error));
+                    if had_hw {
+                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                            let _ = tx.send(FocusMsg::Error(format!(
+                                "the full sensor could not be restored: {error}"
+                            )));
+                            return;
+                        }
+                    }
                 }
 
                 // Always acquire (and therefore drain the camera/SDK), but do
@@ -2742,6 +2866,10 @@ fn worker(
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
                 let update = Box::new(FocusUpdate {
+                    hw_roi_active: active_ser
+                        .as_ref()
+                        .map(|active| active.hw_roi_y0.is_some())
+                        .unwrap_or(false),
                     slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
                     n_continuum,
                     limb_width,
@@ -2793,10 +2921,38 @@ fn finish_ser(active: ActiveSer, tx: &Sender<FocusMsg>) {
 
 fn finish_ser_message(active: ActiveSer) -> FocusMsg {
     let path = active.path;
+    let elapsed = active.started.elapsed().as_secs_f64();
+    let hw_roi = active.hw_roi_y0.is_some();
     match active.recorder.finish() {
-        Ok(frames) => FocusMsg::RecordingStopped { path, frames },
+        Ok(frames) => {
+            // (frames - 1) intervals, since `started` is stamped at frame 1.
+            let fps = if frames > 1 && elapsed > 0.0 {
+                (frames as f64 - 1.0) / elapsed
+            } else {
+                0.0
+            };
+            FocusMsg::RecordingStopped { path, frames, fps, hw_roi }
+        }
         Err(error) => FocusMsg::RecordingError(error.to_string()),
     }
+}
+
+fn full_frame_roi(info: &CameraInfo) -> Roi {
+    Roi {
+        x: 0,
+        y: 0,
+        w: info.max_width,
+        h: info.max_height,
+    }
+}
+
+/// Stop → apply ROI → restart. Every backend applies ROI at stream start, so
+/// the cycle is mandatory. A failure leaves the camera stopped; callers must
+/// treat it as fatal for the session unless a full-frame restore succeeds.
+fn apply_roi(cam: &mut dyn ghostsun_camera::Camera, roi: Roi) -> Result<(), String> {
+    cam.stop();
+    cam.set_roi(roi).map_err(|error| error.to_string())?;
+    cam.start().map_err(|error| error.to_string())
 }
 
 fn vertical_crop_bounds(
@@ -2953,6 +3109,7 @@ mod tests {
             n_continuum: 0,
             limb_width: None,
             structure: StructureSplit::default(),
+            hw_roi_active: false,
         }
     }
 
@@ -3045,6 +3202,20 @@ mod tests {
         let lines = vec![noise, real];
         let pick = choose(&lines, LineMode::Manual, Some(240.0)).unwrap();
         assert!((pick.center - 244.0).abs() < 1e-9, "picked {}", pick.center);
+    }
+
+    #[test]
+    fn crop_bounds_centre_clamp_and_oversize() {
+        // Centred anchor: band centred on the line.
+        assert_eq!(vertical_crop_bounds(2160, 256, 1100.0), (972, 256));
+        // Anchor near the top: clamped to the sensor edge, full height kept.
+        assert_eq!(vertical_crop_bounds(2160, 256, 10.0), (0, 256));
+        // Anchor near the bottom: clamped so the band stays on-sensor.
+        assert_eq!(vertical_crop_bounds(2160, 256, 2155.0), (1904, 256));
+        // Oversize request: the whole frame.
+        assert_eq!(vertical_crop_bounds(2160, 9999, 1000.0), (0, 2160));
+        // These bounds feed the hardware ROI directly, so clamping is what
+        // keeps a near-edge line from producing an off-sensor ROI request.
     }
 
     #[test]

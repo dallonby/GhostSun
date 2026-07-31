@@ -16,6 +16,7 @@ use crate::{Backend, Camera, CameraError, CameraInfo, Frame, Roi};
 
 // --- ABI (ASICamera2.h) ---------------------------------------------------
 
+const ASI_IMG_RAW8: c_int = 0;
 const ASI_IMG_RAW16: c_int = 2;
 const ASI_GAIN: c_int = 0;
 const ASI_EXPOSURE: c_int = 1;
@@ -195,6 +196,7 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
         info: info.clone(),
         width: 0,
         height: 0,
+        bit_depth: 16,
         pending_roi: None,
         started: false,
         buf: Vec::new(),
@@ -209,6 +211,8 @@ pub struct AsiCam {
     info: CameraInfo,
     width: usize,
     height: usize,
+    /// 8 or 16; selects ASI_IMG_RAW8 vs RAW16.
+    bit_depth: u8,
     pending_roi: Option<Roi>,
     started: bool,
     buf: Vec<u8>,
@@ -240,8 +244,14 @@ impl AsiCam {
     fn frame_from_buffer(&self) -> Frame {
         let (w, h) = (self.width, self.height);
         let mut data = vec![0u16; w * h];
-        for (i, px) in data.iter_mut().enumerate() {
-            *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+        if self.bit_depth <= 8 {
+            for (i, px) in data.iter_mut().enumerate() {
+                *px = u16::from(self.buf[i]) * 257;
+            }
+        } else {
+            for (i, px) in data.iter_mut().enumerate() {
+                *px = u16::from_le_bytes([self.buf[2 * i], self.buf[2 * i + 1]]);
+            }
         }
         Frame {
             width: w,
@@ -310,6 +320,21 @@ impl Camera for AsiCam {
         Ok(())
     }
 
+    fn set_bit_depth(&mut self, bits: u8) -> crate::Result<()> {
+        if bits != 8 && bits != 16 {
+            return Err(CameraError::Sdk(format!(
+                "unsupported bit depth {bits} (want 8 or 16)"
+            )));
+        }
+        if self.started {
+            return Err(CameraError::Sdk(
+                "set_bit_depth must be called while stopped".into(),
+            ));
+        }
+        self.bit_depth = bits;
+        Ok(())
+    }
+
     fn start(&mut self) -> crate::Result<()> {
         // ASI constraint: width % 8 == 0, height % 2 == 0.
         let roi = self.pending_roi.take().unwrap_or(Roi {
@@ -320,10 +345,16 @@ impl Camera for AsiCam {
         });
         let w = (roi.w & !7).max(8);
         let h = (roi.h & !1).max(2);
-        if unsafe { (self.api.set_roi)(self.id, w as c_int, h as c_int, 1, ASI_IMG_RAW16) }
-            != ASI_SUCCESS
-        {
-            return Err(CameraError::Sdk("ASISetROIFormat failed".into()));
+        let img = if self.bit_depth <= 8 {
+            ASI_IMG_RAW8
+        } else {
+            ASI_IMG_RAW16
+        };
+        if unsafe { (self.api.set_roi)(self.id, w as c_int, h as c_int, 1, img) } != ASI_SUCCESS {
+            return Err(CameraError::Sdk(format!(
+                "ASISetROIFormat failed ({}-bit)",
+                self.bit_depth
+            )));
         }
         if let Some(set_pos) = self.api.set_start_pos {
             unsafe { set_pos(self.id, (roi.x & !7) as c_int, (roi.y & !1) as c_int) };
@@ -333,7 +364,8 @@ impl Camera for AsiCam {
         }
         self.width = w;
         self.height = h;
-        self.buf.resize(w * h * 2, 0);
+        let bpp = if self.bit_depth <= 8 { 1 } else { 2 };
+        self.buf.resize(w * h * bpp, 0);
         self.started = true;
         Ok(())
     }
