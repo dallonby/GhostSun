@@ -22,17 +22,16 @@ ITEM 1 — collimator OAP, qty 1 (price breaks at 2 and 5 pcs)
 
 - Off-axis angle: 25° to 35° (angle between focused and collimated beams)
 - Reflected focal length (RFL): 70 to 100 mm
-- Diameter: your choice, provided clear aperture ≥ 0.36 × RFL
-  (e.g. RFL 80 mm -> CA ≥ 29 mm; anything from ~Ø35 mm up qualifies;
-  Ø50 mm class preferred if cost is similar)
+- Diameter: at least 35 mm (at least 40 mm if you propose an RFL above
+  85 mm). Ø50 mm class preferred if the cost is similar.
 
 ITEM 2 — camera OAP, qty 1 (price breaks at 2 and 5 pcs)
 
 - Off-axis angle: 40° to 55°, and at least 10° larger than the Item 1
   angle you propose (the pair works as an asymmetric aberration-
   compensating set)
-- RFL: 1.9x to 2.4x the Item 1 RFL you propose (e.g. Item 1 = 80 mm ->
-  Item 2 = 152 to 192 mm)
+- RFL: approximately 2x the Item 1 RFL you propose (anywhere from
+  1.9x to 2.4x works; e.g. Item 1 = 80 mm -> Item 2 ≈ 160 mm)
 - Diameter: clear aperture ≥ 45 mm (Ø50 to Ø80 mm class)
 
 COMMON SPECIFICATIONS (both items — these are the firm requirements):
