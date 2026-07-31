@@ -23,8 +23,9 @@ correction entries.
 
 Geometry (`CHOSEN` in raytrace.py): dev = +20 deg off-Littrow, camera fold
 OPPOSITE the collimator fold (s2 = -1), Lg = 117 mm (slit-side clearance:
-return beam passes ~38 mm from OAP1), Lc = 200 mm (sensor lands at
-z = -69, y = +79 mm — clear of the FSQ-85 drawtube). Magnification 2.18x:
+return beam passes ~38 mm from OAP1), Lc = 230 mm (sensor at z = -50,
+y = +102 mm: camera axis 102 mm from the telescope axis, clearing an
+Ø80 cooled IMX571 body beside the snout extension by ~20 mm). Magnification 2.18x:
 7 um slit -> 15.3 um spatial image (4.1 px on IMX571); disk image 9.2 mm
 (needs the IMX571-class sensor; IMX678 too small at this mag).
 

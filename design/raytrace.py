@@ -292,7 +292,7 @@ CONFIGS = {
 # Chosen buildable geometry (see RESULTS.md): config B, off-Littrow 20 deg,
 # opposite folds, grating arm sized for 40 mm return-beam clearance.
 CHOSEN = dict(config="B_edmund_30s-45", dev=20.0, s2=-1.0,
-              Lg=117.0, Lc=200.0)
+              Lg=117.0, Lc=230.0)
 
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),
