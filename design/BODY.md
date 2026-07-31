@@ -16,12 +16,13 @@ raytrace.
 - Two angled wall slabs carry the printed kinematic bases; face normals
   are the mirror substrate axes; M5 heat-set pilot holes match the KM
   base bolt triangle (kmHole = 64 mm half-pitch).
-- OAP1 slab + KM mount are SHIFTED +34 mm along the face tangent: the
-  diffracted beam crosses the OAP1 face plane 59 mm off-center and would
-  otherwise pass through the plate (user-caught). The mirror stays at
-  the optical point -> print the OAP1 KM platform with mirrorOffX = -34.
-  body_export.py guards this clearance on every run (currently +8.5 mm)
-  and fails fatally if a geometry change re-introduces the collision.
+- KM plates are MIRROR-SIZED (OAP1: 80 mm, OAP2: 105 mm; fine resolution
+  comes from 100 TPI adjusters, not lever length — M4x0.7 is no longer
+  sufficient). The small OAP1 slab clears the diffracted beam naturally
+  (crossing at s=-59 vs slab half-width 43: +6.5 mm), so no shifted
+  mounts or off-center mirrors. body_export.py guards this clearance on
+  every run and fails fatally on regression. Beam height dropped 75->60,
+  walls 155->125: smaller, stiffer, faster prints.
 - `mirrorStack` (45 mm default) = optical face -> wall face. MEASURE the
   real stack (substrate + backing plate + KM mount + gap) before printing.
 - Slit: cartridge pocket in the tower at the origin, tilted `slitTilt`

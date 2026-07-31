@@ -14,25 +14,28 @@
 // Print ASA/PC/annealed PETG, 6+ perimeters, plates flat on the bed.
 
 /* [Kinematics] */
-leverArm = 120;      // pivot-to-adjuster distance
+// Plates are MIRROR-SIZED; fine resolution comes from 100 TPI adjusters,
+// not lever length. deg/turn = atan(pitch / leverArm):
+//   OAP1 plate 80 (lever 48):  100TPI 0.30 deg/turn (18'/turn)
+//   OAP2 plate 105 (lever 73): 100TPI 0.20 deg/turn (12'/turn)
+// vs 1.5 arcmin yaw tolerance: 1/12 - 1/8 turn per tolerance step; use
+// lock nuts. M4x0.7 is NOT sufficient at these levers.
+leverArm = 73;       // pivot-to-adjuster distance (= plateW - 2*bossMargin)
 gap = 10;            // assembled plate separation
 ballD = 6;           // steel balls (pivot + screw tips)
 
 /* [Plates] */
-plateW = 150;
-plateH = 150;
+plateW = 105;        // print OAP1 pair at 80, OAP2 pair at 105
+plateH = 105;
 plateT = 8;
-bossMargin = 22;     // corner margin / boss diameter
+bossMargin = 16;     // corner margin / boss diameter
 
 /* [Hardware] */
 insertD = 5.6;       // M4 heat-set insert hole
 insertL = 8;
 springHoleD = 3.2;
 mirrorBCD = 40;      // backing-plate bolt circle (measure your mirror!)
-mirrorOffX = 0;      // mirror center offset along X on the platform.
-                     // OAP1 platform: print with mirrorOffX = -34 (the
-                     // slab+mount are shifted +34 so the diffracted beam
-                     // clears the plate edge; mirror stays on-axis).
+mirrorOffX = 0;      // mirror center offset along X (normally 0)
 mirrorBoltD = 4.4;
 mirrorBoltN = 3;
 baseBoltD = 5.4;     // M5 to housing

@@ -30,11 +30,11 @@ deg per turn = atan(screw pitch / leverArm):
 
 | leverArm | M4 x 0.7 | 100 TPI (0.254 mm) |
 |---|---|---|
-| 120 mm | 20 arcmin/turn | 7.3 arcmin/turn |
-| 150 mm | 16 arcmin/turn | 5.8 arcmin/turn |
+| 48 mm (OAP1) | 50 arcmin/turn (too coarse) | 18 arcmin/turn |
+| 73 mm (OAP2) | 33 arcmin/turn (too coarse) | 12 arcmin/turn |
 
-A controlled 1/20 turn ≈ 1.0 / 0.36 arcmin — inside budget either way;
-100 TPI adjusters make it comfortable.
+With 100 TPI, a controlled 1/12 turn = the full 1.5 arcmin tolerance —
+workable with lock nuts; the plates stay mirror-sized.
 
 ## Hardware per mount
 
@@ -52,12 +52,13 @@ A controlled 1/20 turn ≈ 1.0 / 0.36 arcmin — inside budget either way;
 - The cone and vee print facing up on the base plate — no supports needed
   at these shallow depths. Ream the pivot pocket to a snug ball fit.
 
-## Per-mirror print settings
+## Per-mirror print settings (mirror-sized plates, 100 TPI adjusters)
 
-- OAP2: defaults (mirrorOffX = 0).
-- OAP1: platform printed with **mirrorOffX = -34** — the body's OAP1 slab
-  is shifted +34 mm along its face so the diffracted beam clears the
-  plate edge; the offset keeps the mirror at the optical position.
+- OAP1 pair: plateW = plateH = 80, leverArm = 48 -> 18 arcmin/turn.
+- OAP2 pair: plateW = plateH = 105, leverArm = 73 -> 12 arcmin/turn.
+- 100 TPI adjusters are REQUIRED at these levers (M4x0.7 gives ~1 deg/turn
+  at 48 mm — too coarse vs the 1.5 arcmin yaw tolerance). Lock after
+  alignment as before.
 
 ## Before printing: measure two things
 

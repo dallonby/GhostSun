@@ -66,7 +66,7 @@ lines.append("// tuning detents: " +
 
 # ---- clearance guard: diffracted beam vs OAP1 mount slab ----
 import sys
-SLABW, SLAB1SHIFT, BEAM_D = 150.0, 34.0, 19.0
+SLABW, SLAB1SHIFT, BEAM_D = 86.0, 0.0, 19.0
 f1 = (b(d.C1)[0] - 45.0 * math.cos(math.radians(ang(d.c1))),
       b(d.C1)[1] - 45.0 * math.sin(math.radians(ang(d.c1))))
 ta = math.radians(ang(d.c1) + 90)
