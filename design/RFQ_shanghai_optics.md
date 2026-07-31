@@ -1,76 +1,79 @@
-Subject: RFQ — matched pair of off-axis parabolic mirrors (protected aluminum; flexible geometry within stated windows)
+Subject: RFQ for a matched pair of off-axis parabolic mirrors (protected aluminum, flexible geometry)
 
-To: Shanghai Optics — Sales / Technical Sales
+To: Sales / Technical Sales
 From: David Allonby ([your postal address], United Kingdom)
 Email: da@byeq.com
 Date: 31 July 2026
 RFQ reference: GHOSTSUN-OAP-2026-01
 
-Dear Shanghai Optics team,
+Dear sales team,
 
-I am building a solar spectroheliograph and request a quotation for a
-MATCHED PAIR of off-axis parabolic mirrors. The optical design is
-parametric, so I do not require exact focal lengths or diameters —
-any geometry inside the windows below works. **Please propose the
-lowest-cost option you can manufacture within these windows — ideally
-geometries matching parent paraboloids or recipes you already tool for.**
-I will verify your proposed pair in our design model and confirm within
-two business days.
+I am building a solar spectroheliograph and would like a quotation for a
+matched pair of off-axis parabolic mirrors. My optical design is
+parametric, so I do not need exact focal lengths or diameters. Any
+geometry inside the windows below will work. Please propose the lowest
+cost option you can manufacture within these windows, ideally a geometry
+that matches parent paraboloids or recipes you already tool for. I will
+check your proposed pair in our design model and confirm within two
+business days.
 
 --------------------------------------------------------------------
-ITEM 1 — collimator OAP, qty 1 (price breaks at 2 and 5 pcs)
+ITEM 1: collimator OAP, qty 1 (please give price breaks at 2 and 5 pcs)
 
-- Off-axis angle: 25° to 35° (angle between focused and collimated beams)
+- Off-axis angle: 25 to 35 degrees (angle between the focused and
+  collimated beams)
 - Reflected focal length (RFL): 70 to 100 mm
 - Diameter: at least 35 mm (at least 40 mm if you propose an RFL above
-  85 mm). Ø50 mm class preferred if the cost is similar.
+  85 mm). Around 50 mm is preferred if the cost is similar.
 
-ITEM 2 — camera OAP, qty 1 (price breaks at 2 and 5 pcs)
+ITEM 2: camera OAP, qty 1 (please give price breaks at 2 and 5 pcs)
 
-- Off-axis angle: 40° to 55°, and at least 10° larger than the Item 1
-  angle you propose (the pair works as an asymmetric aberration-
-  compensating set)
-- RFL: approximately 2x the Item 1 RFL you propose (anywhere from
-  1.9x to 2.4x works; e.g. Item 1 = 80 mm -> Item 2 ≈ 160 mm)
-- Diameter: clear aperture ≥ 45 mm (Ø50 to Ø80 mm class)
+- Off-axis angle: 40 to 55 degrees, and at least 10 degrees larger than
+  the Item 1 angle you propose (the pair works as an asymmetric
+  aberration-compensating set)
+- RFL: approximately 2x the Item 1 RFL you propose (anywhere from 1.9x
+  to 2.4x works; for example Item 1 = 80 mm gives Item 2 of about 160 mm)
+- Diameter: clear aperture of at least 45 mm (50 to 80 mm class)
 
-COMMON SPECIFICATIONS (both items — these are the firm requirements):
+COMMON SPECIFICATIONS for both items (these are the firm requirements):
 
 - Substrate: aluminum alloy (6061-T6 or equivalent; please state)
-- Coating: protected aluminum, Ravg ≥ 87% over 400–1100 nm
-- Reflected wavefront error: ≤ λ/4 RMS at 632.8 nm over the clear aperture
-- Surface roughness: ≤ 10 nm (100 Å) RMS
+- Coating: protected aluminum, average reflectance 87% or better over
+  400 to 1100 nm
+- Reflected wavefront error: lambda/4 RMS or better at 632.8 nm over the
+  clear aperture
+- Surface roughness: 10 nm RMS or better
 - Surface quality: 60-40 scratch-dig or better
-- Mounting: ANY standard provision is acceptable (tapped back holes,
-  plain back for clamping, or cylindrical body) — we adapt our mount to
-  your drawing. Any simple indication of the off-axis direction (a pen
-  mark on the back is fine) is appreciated but not required.
+- Mounting: any standard provision is acceptable (tapped back holes,
+  plain back for clamping, or a cylindrical body). We will adapt our
+  mount to your drawing.
 
-ITEM 3 (OPTIONAL — quote separately; do not let it delay Items 1–2)
+ITEM 3 (optional; please quote separately and do not let it delay
+Items 1 and 2)
 
-- As Item 1 but with clear aperture ≥ 0.5 × RFL (Ø60–76 mm class):
-  an aperture-margin upgrade variant.
+- As Item 1 but with a clear aperture of at least half the RFL
+  (60 to 76 mm class): an aperture-margin upgrade variant.
 --------------------------------------------------------------------
 
 Acceptance and documentation (required):
 
-1. Per-unit interferometric test report (reflected wavefront RMS and PV
-   at 632.8 nm over the clear aperture) delivered with each mirror.
+1. A per-unit interferometric test report (reflected wavefront RMS and
+   PV at 632.8 nm over the clear aperture) delivered with each mirror.
    Please include a sample report from a comparable past part with your
    quotation.
 2. Coating reflectance curve or witness-sample data.
 3. Units outside the wavefront or roughness specification are returnable
-   for replacement or refund; please confirm.
+   for replacement or refund. Please confirm.
 
 Please state in your quotation:
 
-- The exact geometry you propose (off-axis angle, RFL or parent focal
-  length + off-axis distance, diameter) for each item
-- Unit price at 1 / 2 / 5 pieces, and any NRE or tooling charge
-- Lead time (working days) from PO to ex-works
+- The exact geometry you propose for each item (off-axis angle, RFL or
+  parent focal length plus off-axis distance, and diameter)
+- Unit price at 1, 2 and 5 pieces, and any NRE or tooling charge
+- Lead time in working days from PO to ex-works
 - Shipping terms and cost to the United Kingdom (DAP or DDP preferred),
-  packaging, HS code
-- Payment terms and currency; warranty period; your standard OAP
+  packaging, and HS code
+- Payment terms and currency, warranty period, and your standard OAP
   tolerance sheet
 
 This is a prototype purchase with a probable follow-on order of the same
