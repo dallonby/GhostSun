@@ -32,11 +32,15 @@ m5insD = 6.4; m5insL = 12;
 /* [Slit + snout] */
 slitTilt = 10;
 slitSlideW = 12; slitSlideH = 22; slitSlideT = 3.2;
-snoutID = 24;
-scopeBoreD = 38; scopeFlangeD = 62;
+snoutID = 30;  // entry bore snoutID-4 = 26 vs ~20 mm beam at the flange
+scopeBoreD = 44; scopeFlangeD = 64;
+scopeThreadD = 48; scopeThreadP = 0.75;  // M48x0.75 female (telescope side)
+scopeThreadL = 9;
 
 /* [Camera port] */
-camBoreD = 34; camTubeD = 48;
+camBoreD = 34; camTubeD = 56;
+camThreadD = 42; camThreadP = 0.75;  // M42x0.75 (T2) female, printed
+camThreadL = 9; camThreadClr = 0.35; // radial print clearance
 
 /* [Grating rotator] */
 rotD = 56; pivotD = 8.05; tuneRange = 12;
@@ -62,6 +66,21 @@ maxY = max([for (p = allPts) p[1]]) + 8;
 armAng = gratNormAng + 270;          // rotor arm at Ha tuning
 armAngs = [for (a = gratNormAngs) a + 270];   // per-line detents
 armLo = min(armAngs) - 3; armHi = max(armAngs) + 3;
+
+// Male thread form, used directly or as a cutter for female threads.
+// Twisted-lobe method: 240-deg lobe -> ~55-60 deg included flank angle.
+module thread_male(d, pitch, len) {
+    hth = 0.6495 * pitch;
+    rmin = d / 2 - hth;
+    pts = [for (a = [0:6:359])
+        let (t = abs(((a + 180) % 360) - 180),
+             f = min(0.92, max(0, 1 - t / 120)))
+        [(rmin + f * hth) * cos(a), (rmin + f * hth) * sin(a)]];
+    linear_extrude(len, twist = -360 * len / pitch,
+                   slices = ceil(len / pitch) * 24, convexity = 10)
+        polygon(pts);
+    cylinder(h = len, d = 2 * rmin + 0.2, $fn = 96);
+}
 
 module mirror_slab(faceP, normAng) {
     difference() {
@@ -113,10 +132,13 @@ module body() {
                 translate([gratP[0] + (armR + 14) * u(a)[0],
                            gratP[1] + (armR + 14) * u(a)[1], 0])
                     cylinder(h = 22, d = 16, $fn = 48);
-            // stray-light vane at by = +25
+            // stray-light vane at by = +25: separates the slit/snout
+            // region from the camera corridor. Ends at bx=68 — beyond
+            // that the OAP1 mount slab is the separator, and the mirror
+            // substrate envelope must stay clear.
             linear_extrude(wallH)
                 translate([minX + wallT - eps, 25])
-                    square([maxX - minX - 2 * wallT + 2 * eps, 3]);
+                    square([68 - minX - wallT + eps, 3]);
         }
         // slit cartridge pocket + optical opening (tilted about vertical)
         translate([0, 0, beamH]) rotate([0, 0, slitTilt]) {
@@ -128,12 +150,29 @@ module body() {
         // snout bore (stops at slit tower wall)
         translate([minX - 20, 0, beamH]) rotate([0, 90, 90]) rotate([0, 90, 0])
             cylinder(h = -minX + 20 - 6, d = snoutID - 4, $fn = 64);
-        // telescope bore through flange + front wall
+        // telescope bore through flange + front wall, stepped behind
+        // the M48x0.75 female thread at the exterior face
         along([minX + 16, 0], 180)
             cylinder(h = 40, d = scopeBoreD, $fn = 96);
+        along([minX, 0], 180) translate([0, 0, 12 - scopeThreadL]) {
+            thread_male(scopeThreadD + 2 * camThreadClr, scopeThreadP,
+                        scopeThreadL + 1);
+            translate([0, 0, scopeThreadL - 0.8])
+                cylinder(h = 2, d1 = scopeThreadD - 1,
+                         d2 = scopeThreadD + 1.6, $fn = 96);
+        }
         // camera bore along df through tunnel, wall, flange
         along(sensP, dfAng)
-            translate([0, 0, -6]) cylinder(h = camLen + 30, d = camBoreD, $fn = 96);
+            translate([0, 0, -6]) cylinder(h = camLen + 30 - camThreadL, d = camBoreD, $fn = 96);
+        // M42x0.75 female thread at the exterior end (focuser interface):
+        // cut with an oversized male form + entry chamfer
+        along(sensP, dfAng) translate([0, 0, camLen + 10 - camThreadL]) {
+            thread_male(camThreadD + 2 * camThreadClr, camThreadP,
+                        camThreadL + 1);
+            translate([0, 0, camThreadL - 0.8])
+                cylinder(h = 2, d1 = camThreadD - 1, d2 = camThreadD + 1.6,
+                         $fn = 96);
+        }
         // grating pivot + clamp arc slot (centered on the arm direction)
         translate([gratP[0], gratP[1], -deckT - 1])
             cylinder(h = 40, d = pivotD, $fn = 48);

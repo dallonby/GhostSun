@@ -22,13 +22,19 @@ raytrace.
   (10 deg) about vertical so the jaw reflection dumps onto the interior
   wall, not back up the snout. Pocket sized for a 12 x 22 x 3.2 slide —
   measure the actual Shelyak slit holder and adjust.
-- Enclosed snout from the telescope flange (front wall) to the slit; the
-  flange bore is 38 mm, adapt to T2/2" with a threaded insert or bonded
-  adapter.
+- Enclosed snout from the telescope flange (front wall) to the slit.
+  Telescope interface: PRINTED M48 x 0.75 female thread, 9 mm deep, in
+  the flange face (0.35 mm radial print clearance; entry chamfer).
 - Camera tunnel from the sensor plane through the front wall along the
-  focused chief (5 deg off the deck axis); bore 34 mm; bolt a helical
-  focuser + ToupTek adapter to the exterior face. Sensor plane sits at
-  the interior end of the tunnel — set back-focus with the focuser.
+  focused chief (5 deg off the deck axis); bore 34 mm. Camera/focuser
+  interface: PRINTED M42 x 0.75 (T2) female thread, 9 mm deep, at the
+  exterior end. Sensor plane sits at the interior end of the tunnel —
+  set back-focus with the helical focuser.
+- Printed-thread rules (both ports): 0.10-0.15 mm layers over the thread
+  region, slow perimeters, no supports in the bore; chase gently with the
+  mating metal part; if a print tears, bump camThreadClr by +0.1. The
+  thread form is a twisted-lobe ~55-60 deg flank approximation — mates
+  fine with metal T2/M48 rings in practice.
 - Grating rotator: deck turntable, vertical steel dowel pivot (8 mm), the
   rotor registers the grating FRONT face on the pivot-axis plane
   (thickness-agnostic: 50x50x9.5 direct, Shelyak 25x25x6 via
