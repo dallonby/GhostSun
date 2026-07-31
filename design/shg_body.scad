@@ -26,29 +26,29 @@ margin = 38;
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
 slab1W = 86;         // OAP1 slab (KM plate 80 + 6): mirror-sized plates
-slab2W = 112;        // OAP2 slab (KM plate 105 + 7)
+slab2W = 86;         // OAP2 slab (Ø50.8 mirror, KM plate 80)
 km1Hole = 32;        // KM base bolt triangle half-pitch = plateW/2 - m/2
-km2Hole = 44.5;      // (bossMargin m = 16 in mounts/)
+km2Hole = 32;        // (bossMargin m = 16 in mounts/)
 m5insD = 6.4; m5insL = 12;
 
 /* [Slit + snout] */
 slitTilt = 10;
 slitSlideW = 12; slitSlideH = 22; slitSlideT = 3.2;
 snoutID = 30;  // entry bore snoutID-4 = 26 vs ~20 mm beam at the flange
-scopeBoreD = 44; scopeFlangeD = 64;
+scopeBoreD = 44; scopeFlangeD = 56;
 scopeThreadD = 48; scopeThreadP = 0.75;  // M48x0.75 female (telescope side)
 scopeThreadL = 9;
-snoutExt = 70;       // external snout extension: moves the OTA's fat parts
+snoutExt = 50;       // external snout extension: moves the OTA's fat parts
                      // forward so the camera sits beside a Ø64 tube, not
                      // the Ø95 FSQ body. Beam at the far end ~30 mm.
 
 /* [Camera port] */
 camBoreD = 34; camTubeD = 56;
-// measured camera: cooled IMX571, Ø80 body, Ø100 x 10 tilt-adjuster
-// flange at the opening, 108 mm total; helical focuser ~Ø58 x 20 assumed
+// prototype camera: ToupTek G3M678M — MEASURE and update (placeholder
+// Ø40 x 70 body). Production IMX571: Ø80 body, Ø100x10 tilt flange, 108mm.
 camFocD = 58; camFocL = 20;
-camTiltD = 100; camTiltT = 10;
-camBodyD = 80; camBodyL = 98;
+camTiltD = 44; camTiltT = 4;
+camBodyD = 40; camBodyL = 70;
 camThreadD = 42; camThreadP = 0.75;  // M42x0.75 (T2) female, printed
 camThreadL = 9; camThreadClr = 0.35; // radial print clearance
 

@@ -287,12 +287,16 @@ CONFIGS = {
     "C_thor_ag_45-45": dict(rfl1=152.4, th1=45.0, rfl2=304.8, th2=45.0),
     "D_thor_al_90-90": dict(rfl1=101.6, th1=90.0, rfl2=152.4, th2=90.0),
     "E_edmund_30-30": dict(rfl1=108.89, th1=30.0, rfl2=272.23, th2=30.0),
+    # Ha-only budget prototype: Thorlabs protected silver, in stock, £394/pair
+    "T_budget_ha": dict(rfl1=50.8, th1=45.0, rfl2=101.6, th2=45.0),
 }
 
-# Chosen buildable geometry (see RESULTS.md): config B, off-Littrow 20 deg,
-# opposite folds, grating arm sized for 40 mm return-beam clearance.
-CHOSEN = dict(config="B_edmund_30s-45", dev=20.0, s2=-1.0,
-              Lg=117.0, Lc=240.0)
+# Chosen geometry for the CURRENT BUILD. Production broadband design:
+#   config="B_edmund_30s-45", dev=20, s2=-1, Lg=117, Lc=240 (RESULTS.md)
+# Active: Ha-only budget prototype on Thorlabs silver (MPD124+MPD144),
+# 7um slit, Shelyak 25mm grating, IMX678 camera.
+CHOSEN = dict(config="T_budget_ha", dev=25.0, s2=-1.0,
+              Lg=85.0, Lc=175.0, colD=25.4, camD=25.4)
 
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),

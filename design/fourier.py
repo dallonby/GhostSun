@@ -33,8 +33,8 @@ from raytrace import CHOSEN
 CFG = CONFIGS[CHOSEN["config"]]
 F1, F2 = CFG["rfl1"], CFG["rfl2"]
 FNUM = 6.9
-D_COL_CA = 0.9 * 50.8       # collimator clear aperture (mm)
-D_CAM_CA = 0.9 * 76.2       # camera clear aperture (mm)
+D_COL_CA = 0.9 * CHOSEN.get("colD", 50.8)  # collimator CA (mm)
+D_CAM_CA = 0.9 * CHOSEN.get("camD", 76.2)  # camera mirror CA (mm)
 PIX = 3.76e-3               # mm
 
 LINES = [
