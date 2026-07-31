@@ -3,7 +3,7 @@ Subject: RFQ for a matched pair of off-axis parabolic mirrors and a plane diffra
 To: Sales / Technical Sales
 From: David Allonby ([your postal address], United Kingdom)
 Email: da@byeq.com
-Date: 31 July 2026
+Date: 1 August 2026
 RFQ reference: GHOSTSUN-OAP-2026-01
 
 Dear sales team,
