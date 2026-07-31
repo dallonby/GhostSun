@@ -36,6 +36,9 @@ snoutID = 30;  // entry bore snoutID-4 = 26 vs ~20 mm beam at the flange
 scopeBoreD = 44; scopeFlangeD = 64;
 scopeThreadD = 48; scopeThreadP = 0.75;  // M48x0.75 female (telescope side)
 scopeThreadL = 9;
+snoutExt = 70;       // external snout extension: moves the OTA's fat parts
+                     // forward so the camera sits beside a Ø64 tube, not
+                     // the Ø95 FSQ body. Beam at the far end ~30 mm.
 
 /* [Camera port] */
 camBoreD = 34; camTubeD = 56;
@@ -120,8 +123,9 @@ module body() {
             // snout: front wall -> slit tower (enclosed square tunnel)
             translate([minX, -snoutID / 2 - wallT, beamH - snoutID / 2 - wallT])
                 cube([-minX - 8, snoutID + 2 * wallT, snoutID + 2 * wallT]);
-            // telescope flange (exterior of front wall)
-            along([minX, 0], 180) cylinder(h = 12, d = scopeFlangeD, $fn = 96);
+            // telescope snout extension + flange (exterior)
+            along([minX, 0], 180)
+                cylinder(h = snoutExt, d = scopeFlangeD, $fn = 96);
             // camera tunnel: sensor plane -> through front wall + flange
             along(sensP, dfAng) cylinder(h = camLen + 10, d = camTubeD, $fn = 96);
             // grating turntable seat
@@ -150,11 +154,11 @@ module body() {
         // snout bore (stops at slit tower wall)
         translate([minX - 20, 0, beamH]) rotate([0, 90, 90]) rotate([0, 90, 0])
             cylinder(h = -minX + 20 - 6, d = snoutID - 4, $fn = 64);
-        // telescope bore through flange + front wall, stepped behind
-        // the M48x0.75 female thread at the exterior face
+        // telescope bore through extension + front wall, stepped behind
+        // the M48x0.75 female thread at the far face
         along([minX + 16, 0], 180)
-            cylinder(h = 40, d = scopeBoreD, $fn = 96);
-        along([minX, 0], 180) translate([0, 0, 12 - scopeThreadL]) {
+            cylinder(h = snoutExt + 40, d = scopeBoreD, $fn = 96);
+        along([minX, 0], 180) translate([0, 0, snoutExt - scopeThreadL]) {
             thread_male(scopeThreadD + 2 * camThreadClr, scopeThreadP,
                         scopeThreadL + 1);
             translate([0, 0, scopeThreadL - 0.8])
