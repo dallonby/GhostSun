@@ -61,23 +61,41 @@ def layout():
         pts = [yz(p) for p in trace_path(d, ay, lam0)]
         ax.plot([p[0] for p in pts], [p[1] for p in pts],
                 color=col, lw=1.2 if ay == 0 else 0.8, zorder=2)
-    # element footprints (fold-plane tangents)
+    # element footprints along the TRUE surface tangent: mirrors at the
+    # bisector of incoming/outgoing chiefs, grating in its tuned plane
     x = (1.0, 0.0, 0.0)
-    for center, chief, half, name, col in [
-        (d.C1, d.c0, 0.9 * 50.8 / 2, "OAP1 collimator\n#35-607 Ø50.8 30°", "#d62728"),
-        (d.G, d.c1, 25.0, "grating 50 mm\n(Shelyak 25 fits)", "#2ca02c"),
-        (d.C2, d.c2, 0.9 * 76.2 / 2, "OAP2 camera\n#35-588 Ø76.2 45°", "#d62728"),
-    ]:
-        tang = norm(cross(x, chief))
+    def mirror_tangent(d_in, d_out):
+        n = norm(sub(d_out, d_in))          # surface normal (bisector)
+        return norm(cross(x, n))
+    elements = [
+        (d.C1, mirror_tangent(d.c0, d.c1), 0.9 * 50.8 / 2,
+         "OAP1 collimator\n#35-607 Ø50.8 30°", "#d62728"),
+        (d.G, d.gr.t, 25.0, "grating 50 mm\n(Shelyak 25 fits)", "#2ca02c"),
+        (d.C2, mirror_tangent(d.c2, d.df), 0.9 * 76.2 / 2,
+         "OAP2 camera\n#35-588 Ø76.2 45°", "#d62728"),
+    ]
+    for center, tang, half, name, col in elements:
         seg = element_span(center, tang, half)
         ax.plot([s[0] for s in seg], [s[1] for s in seg],
                 color=col, lw=4, solid_capstyle="butt", zorder=3)
         ax.annotate(name, yz(center), textcoords="offset points",
                     xytext=(8, 8), fontsize=8, color=col)
-    # slit + sensor
+    # slit + sensor. In this fold-plane view the slit really is a point:
+    # its 7 mm length runs along x (out of the page); its 7 um width is
+    # invisible at this scale.
     ax.plot(*yz((0.0, 0.0, 0.0)), "ks", ms=6, zorder=4)
-    ax.annotate("slit", (0, 0), textcoords="offset points", xytext=(-24, -4),
-                fontsize=9)
+    ax.annotate("slit (7 mm ⊥ page,\n7 µm wide)", (0, 0),
+                textcoords="offset points", xytext=(-70, -22), fontsize=8)
+    # slit diffraction fan to first null (geometric cone + lambda/w), dashed
+    th_fan = NA + 656.3e-6 / 7e-3
+    for s in (+1, -1):
+        dfan = norm((0.0, s * math.tan(th_fan), 1.0))
+        end = mul(dfan, CFG["rfl1"] / dfan[2] * 1.02)
+        ax.plot([0, yz(end)[0]], [0, yz(end)[1]], color="#1f77b4",
+                lw=0.7, ls="--", zorder=1)
+    ax.annotate("slit diffraction fan (1st null, Hα/7 µm)",
+                (CFG["rfl1"] * 0.45, CFG["rfl1"] * 0.45 * math.tan(th_fan)),
+                fontsize=7, color="#1f77b4")
     tang = norm(cross(x, d.df))
     seg = element_span(d.F2, tang, 8.0)
     ax.plot([s[0] for s in seg], [s[1] for s in seg], color="k", lw=4,
