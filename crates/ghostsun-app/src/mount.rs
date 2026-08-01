@@ -2303,9 +2303,10 @@ impl MountState {
                                         path,
                                         self.capture_height,
                                         anchor_y,
-                                        // Manual captures benefit identically, and
-                                        // the worker restores the full sensor on stop.
-                                        true,
+                                        // Use an ROI only when acquisition setup
+                                        // has already applied it; recording never
+                                        // changes live camera geometry.
+                                        focus.hardware_roi.is_some(),
                                     ) {
                                         focus.recording_status = error;
                                     }

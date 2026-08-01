@@ -135,7 +135,7 @@ pub struct CameraInfo {
 }
 
 /// Region of interest, in full-sensor pixels.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Roi {
     pub x: usize,
     pub y: usize,
@@ -189,6 +189,14 @@ pub trait Camera: Send {
         None
     }
     fn set_roi(&mut self, roi: Roi) -> Result<()>;
+    /// Change the sensor ROI and resume streaming. Acquisition setup uses this
+    /// before any mount motion or SER recording begins; recording itself never
+    /// changes camera geometry.
+    fn reconfigure_roi(&mut self, roi: Roi) -> Result<()> {
+        self.stop();
+        self.set_roi(roi)?;
+        self.start()
+    }
     /// Request 8- or 16-bit mono readout. Default is 16-bit. Must be set while
     /// stopped; backends that only support 16-bit return an error for 8.
     /// Frames are still delivered as [`Frame`] `u16` (8-bit samples scaled ×257).

@@ -187,6 +187,313 @@ pub fn structure_split(profile: &[f64]) -> StructureSplit {
     }
 }
 
+/// Sub-pixel H-alpha half-depth edge measurement along the slit.
+///
+/// `center_rms_px` is coherent displacement of the whole absorption line
+/// (Doppler/filament structure); `width_rms_px` is modulation of its half-width
+/// (opacity/shape structure). Both are band-limited after removing smile and
+/// pixel-scale fitting noise. `focus_score` is deliberately unitless and is
+/// maximised: resolved edge structure × edge-gradient SNR.
+#[derive(Clone, Debug, Default)]
+pub struct HaEdgeMetrics {
+    pub focus_score: f64,
+    pub jaggedness_rms_px: f64,
+    pub center_rms_px: f64,
+    pub width_rms_px: f64,
+    pub edge_snr: f64,
+    pub dance_rms_px: Option<f64>,
+    /// Local frame-to-frame edge displacement after removing rigid line motion,
+    /// one value per slit pixel. This highlights solar structure moving through
+    /// the slit while rejecting fixed smile and detector artefacts.
+    pub motion: Vec<f32>,
+    pub valid_fraction: f64,
+    /// Edge coordinates on the frame's dispersion axis, one per slit pixel.
+    pub edge_lo: Vec<f32>,
+    pub edge_hi: Vec<f32>,
+}
+
+fn median_finite(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+    let mut v: Vec<f64> = values.into_iter().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(v[v.len() / 2])
+}
+
+fn fill_missing(trace: &mut [f64]) -> bool {
+    let valid: Vec<usize> = trace
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.is_finite().then_some(i))
+        .collect();
+    if valid.len() < 8 {
+        return false;
+    }
+    let first = valid[0];
+    let last = *valid.last().unwrap();
+    let first_value = trace[first];
+    let last_value = trace[last];
+    trace[..first].fill(first_value);
+    trace[last + 1..].fill(last_value);
+    for pair in valid.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b == a + 1 {
+            continue;
+        }
+        let (va, vb) = (trace[a], trace[b]);
+        for (i, value) in trace.iter_mut().enumerate().take(b).skip(a + 1) {
+            let f = (i - a) as f64 / (b - a) as f64;
+            *value = va + f * (vb - va);
+        }
+    }
+    true
+}
+
+fn trace_detail(trace: &[f64], valid: &[bool]) -> (Vec<f64>, f64, f64) {
+    let light = gaussian_smooth(trace, 1.2);
+    let broad_sigma = ((trace.len() as f64) / 40.0).clamp(12.0, 64.0);
+    let broad = gaussian_smooth(&light, broad_sigma);
+    let detail: Vec<f64> = light.iter().zip(&broad).map(|(&a, &b)| a - b).collect();
+    let mut detail_ss = 0.0;
+    let mut noise_ss = 0.0;
+    let mut n = 0usize;
+    for i in 0..trace.len() {
+        if valid.get(i).copied().unwrap_or(false) {
+            detail_ss += detail[i] * detail[i];
+            let noise = trace[i] - light[i];
+            noise_ss += noise * noise;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return (detail, 0.0, 0.0);
+    }
+    (
+        detail,
+        (detail_ss / n as f64).sqrt(),
+        (noise_ss / n as f64).sqrt(),
+    )
+}
+
+/// Track both half-depth edges of the selected absorption line along the slit.
+pub fn ha_line_edges(
+    data: &[u16],
+    w: usize,
+    h: usize,
+    dispersion_horizontal: bool,
+    line_center: f64,
+) -> Option<HaEdgeMetrics> {
+    if w == 0 || h == 0 || data.len() < w * h {
+        return None;
+    }
+    let (spec_len, slit_len) = if dispersion_horizontal { (w, h) } else { (h, w) };
+    if spec_len < 24 || slit_len < 32 || !line_center.is_finite() {
+        return None;
+    }
+    let center = line_center.round().clamp(2.0, (spec_len - 3) as f64) as usize;
+    let lo = center.saturating_sub(50);
+    let hi = (center + 50).min(spec_len - 1);
+    if hi - lo < 20 {
+        return None;
+    }
+    let sample = |slit: usize, spec: usize| -> f64 {
+        if dispersion_horizontal {
+            data[slit * w + spec] as f64
+        } else {
+            data[spec * w + slit] as f64
+        }
+    };
+
+    let mut edge_lo = vec![f64::NAN; slit_len];
+    let mut edge_hi = vec![f64::NAN; slit_len];
+    let mut continua = vec![0.0; slit_len];
+    let mut slopes = vec![f64::NAN; slit_len];
+    let mut intensity_noise = vec![f64::NAN; slit_len];
+    let mut depths = vec![0.0; slit_len];
+    let weights = [1.0, 4.0, 6.0, 4.0, 1.0];
+
+    for slit in 0..slit_len {
+        let mut profile = vec![0.0; hi - lo + 1];
+        for (i, value) in profile.iter_mut().enumerate() {
+            let spec = lo + i;
+            let mut sum = 0.0;
+            for (k, weight) in weights.iter().enumerate() {
+                let p = (spec as isize + k as isize - 2).clamp(0, spec_len as isize - 1) as usize;
+                sum += weight * sample(slit, p);
+            }
+            *value = sum / 16.0;
+        }
+        let wing_n = 8.min(profile.len() / 4).max(2);
+        let left = profile[..wing_n].iter().sum::<f64>() / wing_n as f64;
+        let right = profile[profile.len() - wing_n..].iter().sum::<f64>() / wing_n as f64;
+        let continuum = 0.5 * (left + right);
+        continua[slit] = continuum;
+
+        let local_center = center - lo;
+        let core_lo = local_center.saturating_sub(14);
+        let core_hi = (local_center + 14).min(profile.len() - 1);
+        let (core_i, &core) = profile[core_lo..=core_hi]
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+        let core_i = core_lo + core_i;
+        if continuum <= 1.0 || core >= continuum {
+            continue;
+        }
+        depths[slit] = (continuum - core) / continuum;
+        let half = 0.5 * (continuum + core);
+        let mut lower = None;
+        for i in (1..=core_i).rev() {
+            if profile[i - 1] >= half && profile[i] < half {
+                let denom = profile[i] - profile[i - 1];
+                if denom.abs() > 1e-9 {
+                    lower = Some(lo as f64 + i as f64 - 1.0 + (half - profile[i - 1]) / denom);
+                }
+                break;
+            }
+        }
+        let mut upper = None;
+        for i in core_i..profile.len() - 1 {
+            if profile[i] < half && profile[i + 1] >= half {
+                let denom = profile[i + 1] - profile[i];
+                if denom.abs() > 1e-9 {
+                    upper = Some(lo as f64 + i as f64 + (half - profile[i]) / denom);
+                }
+                break;
+            }
+        }
+        let (Some(lower), Some(upper)) = (lower, upper) else { continue };
+        let width = upper - lower;
+        if !(3.0..=70.0).contains(&width) {
+            continue;
+        }
+        edge_lo[slit] = lower;
+        edge_hi[slit] = upper;
+
+        let li = (lower - lo as f64).round().clamp(1.0, (profile.len() - 2) as f64) as usize;
+        let ui = (upper - lo as f64).round().clamp(1.0, (profile.len() - 2) as f64) as usize;
+        slopes[slit] = 0.25
+            * ((profile[li + 1] - profile[li - 1]).abs()
+                + (profile[ui + 1] - profile[ui - 1]).abs())
+            / continuum;
+        let mut diff_ss = 0.0;
+        let mut diff_n = 0usize;
+        for wing in [&profile[..wing_n], &profile[profile.len() - wing_n..]] {
+            for pair in wing.windows(2) {
+                let d = (pair[1] - pair[0]) / continuum;
+                diff_ss += d * d;
+                diff_n += 1;
+            }
+        }
+        intensity_noise[slit] = (diff_ss / (2.0 * diff_n.max(1) as f64)).sqrt();
+    }
+
+    let continuum_gate = 0.25 * median_finite(continua.iter().copied())?;
+    let valid: Vec<bool> = (0..slit_len)
+        .map(|i| {
+            edge_lo[i].is_finite()
+                && edge_hi[i].is_finite()
+                && continua[i] >= continuum_gate
+                && depths[i] >= 0.05
+        })
+        .collect();
+    let valid_count = valid.iter().filter(|&&v| v).count();
+    if valid_count < slit_len / 3 || valid_count < 32 {
+        return None;
+    }
+    for i in 0..slit_len {
+        if !valid[i] {
+            edge_lo[i] = f64::NAN;
+            edge_hi[i] = f64::NAN;
+        }
+    }
+    if !fill_missing(&mut edge_lo) || !fill_missing(&mut edge_hi) {
+        return None;
+    }
+
+    let center_trace: Vec<f64> = edge_lo
+        .iter()
+        .zip(&edge_hi)
+        .map(|(&a, &b)| 0.5 * (a + b))
+        .collect();
+    let half_width: Vec<f64> = edge_lo
+        .iter()
+        .zip(&edge_hi)
+        .map(|(&a, &b)| 0.5 * (b - a))
+        .collect();
+    let (_, center_band, center_noise) = trace_detail(&center_trace, &valid);
+    let (_, width_band, width_noise) = trace_detail(&half_width, &valid);
+    let center_rms = (center_band * center_band - center_noise * center_noise)
+        .max(0.0)
+        .sqrt();
+    let width_rms = (width_band * width_band - width_noise * width_noise)
+        .max(0.0)
+        .sqrt();
+    let jaggedness = (center_rms * center_rms + width_rms * width_rms).sqrt();
+    let slope = median_finite(slopes)?;
+    let noise = median_finite(intensity_noise)?.max(1e-6);
+    let edge_snr = slope / noise;
+    let valid_fraction = valid_count as f64 / slit_len as f64;
+    let focus_score = jaggedness * edge_snr.min(25.0) * valid_fraction.sqrt();
+
+    Some(HaEdgeMetrics {
+        focus_score,
+        jaggedness_rms_px: jaggedness,
+        center_rms_px: center_rms,
+        width_rms_px: width_rms,
+        edge_snr,
+        dance_rms_px: None,
+        motion: Vec::new(),
+        valid_fraction,
+        edge_lo: edge_lo.into_iter().map(|v| v as f32).collect(),
+        edge_hi: edge_hi.into_iter().map(|v| v as f32).collect(),
+    })
+}
+
+/// Frame-to-frame change in the edge shapes after removing whole-line motion.
+/// Returns both a scalar RMS measurement and a local motion map along the slit.
+pub fn ha_edge_motion(
+    current: &HaEdgeMetrics,
+    previous: &HaEdgeMetrics,
+) -> Option<(f64, Vec<f32>)> {
+    if current.edge_lo.len() != previous.edge_lo.len() || current.edge_lo.len() < 32 {
+        return None;
+    }
+    let dlo: Vec<f64> = current
+        .edge_lo
+        .iter()
+        .zip(&previous.edge_lo)
+        .map(|(&a, &b)| (a - b) as f64)
+        .collect();
+    let dhi: Vec<f64> = current
+        .edge_hi
+        .iter()
+        .zip(&previous.edge_hi)
+        .map(|(&a, &b)| (a - b) as f64)
+        .collect();
+    let med_lo = median_finite(dlo.iter().copied())?;
+    let med_hi = median_finite(dhi.iter().copied())?;
+    let motion: Vec<f32> = dlo
+        .iter()
+        .zip(&dhi)
+        .map(|(&a, &b)| {
+            let a = a - med_lo;
+            let b = b - med_hi;
+            (0.5 * (a * a + b * b)).sqrt() as f32
+        })
+        .collect();
+    let ss: f64 = motion.iter().map(|&v| (v as f64).powi(2)).sum();
+    Some(((ss / motion.len() as f64).sqrt(), motion))
+}
+
+/// Scalar compatibility helper used by focus-metric tests and callers that do
+/// not need the local motion map.
+#[cfg(test)]
+pub fn ha_edge_dance(current: &HaEdgeMetrics, previous: &HaEdgeMetrics) -> Option<f64> {
+    ha_edge_motion(current, previous).map(|(rms, _)| rms)
+}
+
 /// FWHM, in pixels along the slit, of the sharpest intensity step in the
 /// profile — the solar limb used as a knife edge. Minimised at best focus.
 ///
@@ -337,6 +644,31 @@ pub fn lucky_mean(values: &[f64], want_min: bool, frac: f64) -> Option<f64> {
 mod tests {
     use super::*;
 
+    fn synthetic_ha_edges(w: usize, h: usize, phase: f64, wavy: bool) -> Vec<u16> {
+        let mut data = vec![0u16; w * h];
+        for x in 0..w {
+            let xf = x as f64;
+            let center = h as f64 / 2.0
+                + if wavy {
+                    2.0 * (0.12 * xf + phase).sin()
+                } else {
+                    0.0
+                };
+            let sigma = 7.0
+                + if wavy {
+                    0.8 * (0.19 * xf + 0.7 * phase).sin()
+                } else {
+                    0.0
+                };
+            for y in 0..h {
+                let d = (y as f64 - center) / sigma;
+                let value = 50_000.0 - 30_000.0 * (-0.5 * d * d).exp();
+                data[y * w + x] = value.round() as u16;
+            }
+        }
+        data
+    }
+
     fn erf_edge(n: usize, center: f64, width: f64) -> Vec<f64> {
         (0..n)
             .map(|i| {
@@ -438,6 +770,29 @@ mod tests {
         let ca = structure_contrast(&a, 0, 120).unwrap();
         let cb = structure_contrast(&b, 0, 120).unwrap();
         assert!((ca - cb).abs() < 1e-9, "{ca} vs {cb}");
+    }
+
+    #[test]
+    fn ha_edge_metric_detects_resolved_waves_and_temporal_dance() {
+        let (w, h) = (640, 120);
+        let straight_data = synthetic_ha_edges(w, h, 0.0, false);
+        let first_data = synthetic_ha_edges(w, h, 0.0, true);
+        let next_data = synthetic_ha_edges(w, h, 0.7, true);
+        let straight = ha_line_edges(&straight_data, w, h, false, 60.0).unwrap();
+        let first = ha_line_edges(&first_data, w, h, false, 60.0).unwrap();
+        let next = ha_line_edges(&next_data, w, h, false, 60.0).unwrap();
+        assert!(first.valid_fraction > 0.95, "lock {}", first.valid_fraction);
+        assert!(
+            first.jaggedness_rms_px > straight.jaggedness_rms_px + 0.25,
+            "wavy {} straight {}",
+            first.jaggedness_rms_px,
+            straight.jaggedness_rms_px
+        );
+        let (dance, motion) = ha_edge_motion(&next, &first).unwrap();
+        assert!(dance > 0.25, "dance {dance}");
+        assert_eq!(motion.len(), w);
+        assert!(motion.iter().any(|&v| v > 0.25));
+        assert!((ha_edge_dance(&next, &first).unwrap() - dance).abs() < 1e-9);
     }
 
     #[test]

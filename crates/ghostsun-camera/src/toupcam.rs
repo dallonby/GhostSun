@@ -36,6 +36,10 @@ const TOUPCAM_MAX: usize = 128;
 const OPTION_RAW: c_uint = 0x04;
 const OPTION_BITDEPTH: c_uint = 0x06;
 const EVENT_IMAGE: c_uint = 0x0004;
+const EVENT_ERROR: c_uint = 0x0080;
+const EVENT_DISCONNECTED: c_uint = 0x0081;
+const EVENT_NOFRAMETIMEOUT: c_uint = 0x0082;
+const EVENT_NOPACKETTIMEOUT: c_uint = 0x0085;
 const E_PENDING: c_int = 0x8000_000a_u32 as c_int;
 
 #[repr(C)]
@@ -343,13 +347,13 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
 
 /// Passed to the SDK as the callback context; the callback only sends on `tx`.
 struct Signal {
-    tx: Sender<()>,
+    tx: Sender<c_uint>,
 }
 
 unsafe extern "C" fn on_event(n_event: c_uint, ctx: *mut c_void) {
-    if n_event == EVENT_IMAGE && !ctx.is_null() {
+    if !ctx.is_null() {
         let sig = &*(ctx as *const Signal);
-        let _ = sig.tx.send(());
+        let _ = sig.tx.send(n_event);
     }
 }
 
@@ -357,7 +361,7 @@ pub struct ToupcamCam {
     api: Api,
     h: HToupcam,
     info: CameraInfo,
-    rx: Receiver<()>,
+    rx: Receiver<c_uint>,
     signal: *mut Signal,
     width: usize,
     height: usize,
@@ -373,6 +377,23 @@ pub struct ToupcamCam {
 unsafe impl Send for ToupcamCam {}
 
 impl ToupcamCam {
+    fn sdk_failure(call: &str, hr: c_int) -> CameraError {
+        CameraError::Sdk(format!("{call} failed (HRESULT 0x{:08x})", hr as u32))
+    }
+
+    fn stop_checked(&mut self) -> crate::Result<()> {
+        if !self.started {
+            return Ok(());
+        }
+        let hr = unsafe { (self.api.stop)(self.h) };
+        if hr < 0 {
+            return Err(Self::sdk_failure("Toupcam_Stop", hr));
+        }
+        self.started = false;
+        while self.rx.try_recv().is_ok() {}
+        Ok(())
+    }
+
     fn bytes_per_pixel(&self) -> usize {
         if self.bit_depth <= 8 {
             1
@@ -444,14 +465,28 @@ impl ToupcamCam {
     }
 
     fn wait_for_image(&self, timeout_ms: u32) -> crate::Result<()> {
-        match self
-            .rx
-            .recv_timeout(Duration::from_millis(timeout_ms as u64))
-        {
-            Ok(()) => Ok(()),
-            Err(RecvTimeoutError::Timeout) => Err(CameraError::Timeout),
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(CameraError::Sdk("event channel closed".into()))
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.rx.recv_timeout(remaining) {
+                Ok(EVENT_IMAGE) => return Ok(()),
+                Ok(EVENT_ERROR) => {
+                    return Err(CameraError::Sdk("camera reported EVENT_ERROR".into()))
+                }
+                Ok(EVENT_DISCONNECTED) => {
+                    return Err(CameraError::Sdk("camera disconnected".into()))
+                }
+                Ok(EVENT_NOFRAMETIMEOUT) => {
+                    return Err(CameraError::Sdk("camera reported no-frame timeout".into()))
+                }
+                Ok(EVENT_NOPACKETTIMEOUT) => {
+                    return Err(CameraError::Sdk("camera reported no-packet timeout".into()))
+                }
+                Ok(_) => continue,
+                Err(RecvTimeoutError::Timeout) => return Err(CameraError::Timeout),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(CameraError::Sdk("event channel closed".into()))
+                }
             }
         }
     }
@@ -537,20 +572,50 @@ impl Camera for ToupcamCam {
         if let Some(r) = self.pending_roi.take() {
             // Offsets/sizes align to 2 px; 0×0 means full frame.
             let a = |v: usize| (v & !1) as c_uint;
-            unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) };
+            let hr = unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) };
+            if hr < 0 {
+                return Err(Self::sdk_failure("Toupcam_put_Roi", hr));
+            }
         }
         // Re-assert bit depth in case an earlier start left the SDK elsewhere.
         let opt = if self.bit_depth == 8 { 0 } else { 1 };
-        unsafe {
-            (self.api.put_option)(self.h, OPTION_BITDEPTH, opt);
+        let hr = unsafe { (self.api.put_option)(self.h, OPTION_BITDEPTH, opt) };
+        if hr < 0 {
+            return Err(Self::sdk_failure("Toupcam_put_Option(BITDEPTH)", hr));
         }
         let hr =
             unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
         if hr < 0 {
-            return Err(CameraError::Sdk("StartPullModeWithCallback failed".into()));
+            return Err(Self::sdk_failure("Toupcam_StartPullModeWithCallback", hr));
         }
         self.started = true;
-        self.refresh_size()
+        if let Err(error) = self.refresh_size() {
+            self.stop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn reconfigure_roi(&mut self, roi: Roi) -> crate::Result<()> {
+        self.stop_checked()?;
+        // Stop is synchronous, but several ToupTek-derived USB cameras need a
+        // short quiet interval before their next geometry/start transaction.
+        std::thread::sleep(Duration::from_millis(75));
+        self.pending_roi = Some(roi);
+        self.start()?;
+
+        let exposure_ms = self.current_exposure_us().unwrap_or(250_000) / 1000;
+        let first_frame_timeout = exposure_ms
+            .saturating_mul(3)
+            .saturating_add(1500)
+            .clamp(2000, 10_000);
+        if let Err(error) = self.wait_for_image(first_frame_timeout) {
+            let _ = self.stop_checked();
+            return Err(CameraError::Sdk(format!(
+                "hardware ROI stream did not deliver a frame after restart: {error}"
+            )));
+        }
+        Ok(())
     }
 
     fn next_frame(&mut self, timeout_ms: u32) -> crate::Result<Frame> {
@@ -590,10 +655,7 @@ impl Camera for ToupcamCam {
     }
 
     fn stop(&mut self) {
-        if self.started {
-            unsafe { (self.api.stop)(self.h) };
-            self.started = false;
-        }
+        let _ = self.stop_checked();
     }
 }
 

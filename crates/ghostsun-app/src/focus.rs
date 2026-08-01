@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
@@ -67,7 +67,7 @@ use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
 use ghostsun_core::ser::SerRecorder;
 
-use crate::focusmetrics::{self, LuckyBuf, StructureSplit};
+use crate::focusmetrics::{self, HaEdgeMetrics, LuckyBuf, StructureSplit};
 use crate::vcurve::{self, NullPoint, ParabolaFit, VCurve};
 
 const STRIP_W: usize = 1200;
@@ -80,6 +80,10 @@ const DEPTH_GATE: f64 = 0.03;
 const DEFAULT_CAPTURE_FRAMES: usize = 40;
 /// Rolling window for the live "lucky" Stage B readout.
 const LUCKY_WINDOW: usize = 90;
+/// Time constant for the H-alpha focus score. At 25 fps this gives an EMA
+/// coefficient of about 0.02, strongly rejecting seeing/fitting chatter while
+/// still converging to a new focus setting over a few seconds.
+const HA_DETAIL_LPF_TAU: Duration = Duration::from_secs(2);
 /// Fraction of the brightest pixels averaged for the Sun-search signal.
 ///
 /// A literal maximum is too easy for one hot pixel or cosmic ray to win.
@@ -190,9 +194,12 @@ pub struct FocusUpdate {
     pub limb_width: Option<f64>,
     /// High-passed along-slit contrast, whole span and outer thirds.
     pub structure: StructureSplit,
-    /// A hardware-ROI recording is active: frames are the capture band, so
-    /// sensor-coordinate overlays do not apply.
-    pub hw_roi_active: bool,
+    /// H-alpha line-edge structure used as a telescope-focus signal.
+    pub ha_edges: Option<HaEdgeMetrics>,
+    /// Full-sensor Y coordinate of this frame's first row when a sensor ROI is
+    /// active. Profiles remain frame-local; acquisition overlays add this
+    /// origin to keep their coordinates stable as geometry changes.
+    pub hw_roi_y0: Option<usize>,
 }
 
 enum FocusMsg {
@@ -212,6 +219,8 @@ enum FocusMsg {
         hw_roi: bool,
     },
     RecordingError(String),
+    HardwareRoiChanged(Option<Roi>),
+    HardwareRoiError(String),
     Error(String),
 }
 
@@ -222,12 +231,15 @@ enum FocusCmd {
     /// The worker needs the dispersion axis to know which way to cut the frame
     /// for the Stage B profile; the Stage A readouts only need it for labels.
     Dispersion(bool),
+    /// Configure camera geometry during acquisition setup. This is rejected
+    /// while a SER recording is pending or active.
+    SetHardwareRoi(Option<Roi>),
     StartSer {
         path: PathBuf,
         capture_height: usize,
         anchor_y: f64,
-        /// Ask the sensor to read only the capture band for the duration of
-        /// the recording (falls back to the software crop if refused).
+        /// Require the already-configured sensor ROI. StartSer verifies it but
+        /// never changes camera geometry.
         hw_roi: bool,
     },
     StopSer,
@@ -269,6 +281,8 @@ pub enum TeleMetric {
     /// High-passed along-slit contrast. Always available; dust adds a constant
     /// pedestal, and it is the only one that supports the top/bottom split.
     Structure,
+    /// Band-limited sub-pixel structure in both H-alpha half-depth edges.
+    HaEdges,
 }
 
 impl TeleMetric {
@@ -280,6 +294,7 @@ impl TeleMetric {
         match self {
             TeleMetric::LimbEdge => "limb edge FWHM (px)",
             TeleMetric::Structure => "along-slit contrast",
+            TeleMetric::HaEdges => "Hα edge-detail score (2 s LPF)",
         }
     }
 }
@@ -355,6 +370,10 @@ pub struct FocusState {
     pub recorded_frames: usize,
     pub recording_path: Option<PathBuf>,
     pub recording_status: String,
+    /// Sensor ROI currently applied to the live stream. `None` is full frame.
+    pub hardware_roi: Option<Roi>,
+    pub hardware_roi_changing: bool,
+    pub hardware_roi_status: String,
     pub dispersion: DispAxis,
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
@@ -397,6 +416,7 @@ pub struct FocusState {
     capture: Option<Capture>,
     lucky_limb: LuckyBuf,
     lucky_struct: LuckyBuf,
+    lucky_ha_edges: LuckyBuf,
     pub stage_status: String,
     saved: Option<SavedFocus>,
     sel_spectral: Option<Fit>,
@@ -431,6 +451,9 @@ impl Default for FocusState {
             recorded_frames: 0,
             recording_path: None,
             recording_status: "not recording".into(),
+            hardware_roi: None,
+            hardware_roi_changing: false,
+            hardware_roi_status: "full sensor".into(),
             dispersion: DispAxis::Vertical,
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
@@ -461,6 +484,7 @@ impl Default for FocusState {
             capture: None,
             lucky_limb: LuckyBuf::new(LUCKY_WINDOW),
             lucky_struct: LuckyBuf::new(LUCKY_WINDOW),
+            lucky_ha_edges: LuckyBuf::new(LUCKY_WINDOW),
             stage_status: String::new(),
             saved: SavedFocus::load(),
             sel_spectral: None,
@@ -554,6 +578,9 @@ impl FocusState {
         self.frame_pending = Some(frame_pending);
         self.handle = Some(handle);
         self.streaming = true;
+        self.hardware_roi = None;
+        self.hardware_roi_changing = false;
+        self.hardware_roi_status = "full sensor".into();
         self.track_x.reset();
         self.track_y.reset();
         self.status = "streaming…".into();
@@ -571,10 +598,15 @@ impl FocusState {
         self.stop = None;
         self.frame_pending = None;
         self.streaming = false;
+        self.hardware_roi = None;
+        self.hardware_roi_changing = false;
+        self.hardware_roi_status = "full sensor".into();
         if self.recording {
             self.recording = false;
-            self.recording_status =
-                format!("recording stopped with camera ({} frames)", self.recorded_frames);
+            self.recording_status = format!(
+                "recording stopped with camera ({} frames)",
+                self.recorded_frames
+            );
         }
         self.status = "stopped".into();
     }
@@ -589,6 +621,7 @@ impl FocusState {
         let mut latest: Option<Box<FocusUpdate>> = None;
         let mut err = None;
         let mut recording_event = None;
+        let mut roi_event = None;
         if let Some(rx) = &self.rx {
             loop {
                 match rx.try_recv() {
@@ -604,12 +637,36 @@ impl FocusState {
                         | FocusMsg::RecordingStopped { .. }
                         | FocusMsg::RecordingError(_)),
                     ) => recording_event = Some(event),
+                    Ok(
+                        event @ (FocusMsg::HardwareRoiChanged(_) | FocusMsg::HardwareRoiError(_)),
+                    ) => roi_event = Some(event),
                     Ok(FocusMsg::Error(e)) => {
                         err = Some(e);
                         break;
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
+            }
+        }
+        if let Some(event) = roi_event {
+            self.hardware_roi_changing = false;
+            match event {
+                FocusMsg::HardwareRoiChanged(roi) => {
+                    self.hardware_roi = roi;
+                    self.hardware_roi_status = match roi {
+                        Some(roi) => format!(
+                            "sensor ROI active: Y {}..{} ({} rows)",
+                            roi.y,
+                            roi.y + roi.h,
+                            roi.h
+                        ),
+                        None => "full sensor".into(),
+                    };
+                }
+                FocusMsg::HardwareRoiError(error) => {
+                    self.hardware_roi_status = format!("sensor ROI failed: {error}");
+                }
+                _ => unreachable!(),
             }
         }
         if let Some(event) = recording_event {
@@ -629,7 +686,12 @@ impl FocusState {
                     self.recorded_frames = frames;
                     self.recording_status = format!("recording · {frames} frames");
                 }
-                FocusMsg::RecordingStopped { path, frames, fps, hw_roi } => {
+                FocusMsg::RecordingStopped {
+                    path,
+                    frames,
+                    fps,
+                    hw_roi,
+                } => {
                     self.recording = false;
                     self.recorded_frames = frames;
                     self.recording_path = Some(path);
@@ -644,7 +706,10 @@ impl FocusState {
                     self.recording = false;
                     self.recording_status = format!("SER recording failed: {error}");
                 }
-                FocusMsg::Frame(_) | FocusMsg::Error(_) => unreachable!(),
+                FocusMsg::Frame(_)
+                | FocusMsg::HardwareRoiChanged(_)
+                | FocusMsg::HardwareRoiError(_)
+                | FocusMsg::Error(_) => unreachable!(),
             }
         }
         if let Some(e) = err {
@@ -715,6 +780,9 @@ impl FocusState {
             }
             if let Some(sc) = u.structure.all {
                 self.lucky_struct.push(sc);
+            }
+            if let Some(edges) = &u.ha_edges {
+                self.lucky_ha_edges.push(edges.focus_score);
             }
             self.accumulate_capture(&spec, &slit, &u);
 
@@ -825,11 +893,12 @@ impl FocusState {
         self.last
             .as_ref()
             .map(|frame| {
+                let y0 = frame.hw_roi_y0.unwrap_or(0) as f64;
                 let mut lines: Vec<(f64, f64)> = frame
                     .lines_y
                     .iter()
                     .filter(|line| line.depth > DEPTH_GATE)
-                    .map(|line| (line.center, line.depth))
+                    .map(|line| (line.center + y0, line.depth))
                     .collect();
                 lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 lines
@@ -838,7 +907,79 @@ impl FocusState {
     }
 
     pub fn current_frame_height(&self) -> Option<usize> {
-        self.last.as_ref().map(|frame| frame.full_h)
+        self.cameras
+            .get(self.selected)
+            .map(|camera| camera.max_height)
+    }
+
+    pub fn ha_edge_metrics(&self) -> Option<&HaEdgeMetrics> {
+        self.last.as_ref()?.ha_edges.as_ref()
+    }
+
+    pub fn desired_hardware_roi(&self, capture_height: usize, anchor_y: f64) -> Option<Roi> {
+        let info = self.cameras.get(self.selected)?;
+        let (y0, height) = vertical_crop_bounds(info.max_height, capture_height, anchor_y);
+        Some(Roi {
+            x: 0,
+            y: y0 & !1,
+            w: info.max_width,
+            h: (height & !1).max(8),
+        })
+    }
+
+    /// Spectral coordinate written into the cropped SER. Guided acquisition
+    /// always records a vertical sensor band, so after reconstruction
+    /// transposes the frame this becomes the primary line's X coordinate.
+    pub fn recording_line_center(&self, capture_height: usize, anchor_y: f64) -> Option<f64> {
+        let info = self.cameras.get(self.selected)?;
+        let y0 = self
+            .hardware_roi
+            .map(|roi| roi.y)
+            .unwrap_or_else(|| {
+                vertical_crop_bounds(info.max_height, capture_height, anchor_y).0
+            });
+        Some((anchor_y - y0 as f64).clamp(0.0, capture_height.saturating_sub(1) as f64))
+    }
+
+    /// Apply or clear sensor-side ROI during acquisition setup. Geometry is
+    /// deliberately immutable once a SER recording begins.
+    pub fn configure_hardware_roi(
+        &mut self,
+        enabled: bool,
+        capture_height: usize,
+        anchor_y: f64,
+    ) -> Result<(), String> {
+        if !self.streaming {
+            return Err("start the camera before changing its sensor ROI".into());
+        }
+        if self.recording {
+            return Err("sensor ROI is locked while acquisition is recording".into());
+        }
+        if self.hardware_roi_changing {
+            return Err("a sensor ROI change is already in progress".into());
+        }
+        let roi = if enabled {
+            if !anchor_y.is_finite() {
+                return Err("select a spectral-line anchor first".into());
+            }
+            self.desired_hardware_roi(capture_height, anchor_y)
+                .ok_or("no camera is selected")?
+                .into()
+        } else {
+            None
+        };
+        let Some(cmd) = &self.cmd else {
+            return Err("camera worker is not running".into());
+        };
+        cmd.send(FocusCmd::SetHardwareRoi(roi))
+            .map_err(|_| "camera worker is not running".to_owned())?;
+        self.hardware_roi_changing = true;
+        self.hardware_roi_status = if let Some(roi) = roi {
+            format!("applying {}-row sensor ROI...", roi.h)
+        } else {
+            "restoring full sensor...".into()
+        };
+        Ok(())
     }
 
     pub fn slit_profile_sample(&self) -> Option<(u64, Vec<f32>)> {
@@ -907,6 +1048,7 @@ impl FocusState {
         match self.tele_metric {
             TeleMetric::LimbEdge => u.limb_width,
             TeleMetric::Structure => u.structure.all,
+            TeleMetric::HaEdges => u.ha_edges.as_ref().map(|edges| edges.focus_score),
         }
     }
 
@@ -952,7 +1094,11 @@ impl FocusState {
 
     fn accumulate_capture(&mut self, spec: &Option<Fit>, slit: &Option<Fit>, u: &FocusUpdate) {
         let tele = self.tele_frame_value(u);
-        let (top, bottom) = (u.structure.top, u.structure.bottom);
+        let (top, bottom) = if self.tele_metric == TeleMetric::Structure {
+            (u.structure.top, u.structure.bottom)
+        } else {
+            (None, None)
+        };
         let stage = self.stage;
         let Some(cap) = &mut self.capture else { return };
 
@@ -993,7 +1139,9 @@ impl FocusState {
     }
 
     fn commit_capture(&mut self) {
-        let Some(cap) = self.capture.take() else { return };
+        let Some(cap) = self.capture.take() else {
+            return;
+        };
         match self.stage {
             Stage::Spectrograph => {
                 // Median over the burst: robust to the odd frame where the
@@ -1030,10 +1178,12 @@ impl FocusState {
                     Some(t) => {
                         self.curve_tele.push(cap.pos, t, cap.tele.len() as f64);
                         if let Some(v) = pick(&cap.tele_top) {
-                            self.curve_tele_top.push(cap.pos, v, cap.tele_top.len() as f64);
+                            self.curve_tele_top
+                                .push(cap.pos, v, cap.tele_top.len() as f64);
                         }
                         if let Some(v) = pick(&cap.tele_bot) {
-                            self.curve_tele_bot.push(cap.pos, v, cap.tele_bot.len() as f64);
+                            self.curve_tele_bot
+                                .push(cap.pos, v, cap.tele_bot.len() as f64);
                         }
                         self.stage_status = format!(
                             "captured @ {:.4}: {} = {t:.3} ({}/{} frames)",
@@ -1053,6 +1203,9 @@ impl FocusState {
                             TeleMetric::Structure => {
                                 "no illuminated slit in that burst — check exposure".into()
                             }
+                            TeleMetric::HaEdges => {
+                                "Hα edges could not be tracked — centre the line in the ROI and increase exposure or gain".into()
+                            }
                         };
                     }
                 }
@@ -1069,6 +1222,7 @@ impl FocusState {
         self.curve_tele_bot = VCurve::new(want_min);
         self.lucky_limb.clear();
         self.lucky_struct.clear();
+        self.lucky_ha_edges.clear();
     }
 
     fn clear_stage_a(&mut self) {
@@ -1257,9 +1411,12 @@ impl FocusState {
         if axis_changed {
             // Stage A only relabels, but Stage B genuinely cuts the frame the
             // other way, so the worker has to be told.
-            self.send_cmd(FocusCmd::Dispersion(self.dispersion == DispAxis::Horizontal));
+            self.send_cmd(FocusCmd::Dispersion(
+                self.dispersion == DispAxis::Horizontal,
+            ));
             self.lucky_limb.clear();
             self.lucky_struct.clear();
+            self.lucky_ha_edges.clear();
         }
         ui.label(
             egui::RichText::new("Spectral lines run ⊥ to this. Sets only which readout is which.")
@@ -1493,7 +1650,11 @@ impl FocusState {
         );
 
         self.capture_row_ui(ui);
-        let n = self.curve_spec.samples.len().min(self.curve_slit.samples.len());
+        let n = self
+            .curve_spec
+            .samples
+            .len()
+            .min(self.curve_slit.samples.len());
         ui.label(
             egui::RichText::new(format!("{n} sample(s) in this sweep"))
                 .small()
@@ -1513,7 +1674,10 @@ impl FocusState {
                         let (verdict, color) = if !trusted {
                             ("not solved yet", WARN_COLOR)
                         } else if sp.nulled() {
-                            ("collimated — Δ is zero within 1σ", egui::Color32::LIGHT_GREEN)
+                            (
+                                "collimated — Δ is zero within 1σ",
+                                egui::Color32::LIGHT_GREEN,
+                            )
                         } else {
                             ("astigmatic — move the collimator", WARN_COLOR)
                         };
@@ -1624,7 +1788,8 @@ impl FocusState {
             egui::RichText::new(
                 "Run only after Stage A is closed — the telescope cannot correct grating \
                  astigmatism, so against a mis-collimated spectrograph it just finds a \
-                 compromise. Measured on continuum columns, not the line core.",
+                 compromise. Limb and contrast use continuum columns; Hα edge mode \
+                 deliberately measures the line itself.",
             )
             .small()
             .weak(),
@@ -1636,10 +1801,12 @@ impl FocusState {
             ui.label("metric:");
             ui.selectable_value(&mut self.tele_metric, TeleMetric::LimbEdge, "limb edge");
             ui.selectable_value(&mut self.tele_metric, TeleMetric::Structure, "contrast");
+            ui.selectable_value(&mut self.tele_metric, TeleMetric::HaEdges, "Hα edges");
         });
         if before != self.tele_metric {
             self.retarget_tele_curves();
-            self.stage_status = "metric changed — Stage B sweep reset (values not comparable)".into();
+            self.stage_status =
+                "metric changed — Stage B sweep reset (values not comparable)".into();
         }
         ui.label(
             egui::RichText::new(match self.tele_metric {
@@ -1652,6 +1819,9 @@ impl FocusState {
                      constant pedestal — the peak position is still right, the curve is just \
                      shallower. Only this metric supports the top/bottom split."
                 }
+                TeleMetric::HaEdges => {
+                    "Tracks both Hα half-depth edges at sub-pixel precision. Maximises resolved filament/Doppler structure while subtracting pixel-scale edge-fit noise. Use a tight ROI around Hα."
+                }
             })
             .small()
             .weak(),
@@ -1662,10 +1832,12 @@ impl FocusState {
         let live = match self.tele_metric {
             TeleMetric::LimbEdge => self.lucky_limb.lucky(want_min),
             TeleMetric::Structure => self.lucky_struct.lucky(want_min),
+            TeleMetric::HaEdges => self.lucky_ha_edges.lucky(want_min),
         };
         let n_lucky = match self.tele_metric {
             TeleMetric::LimbEdge => self.lucky_limb.len(),
             TeleMetric::Structure => self.lucky_struct.len(),
+            TeleMetric::HaEdges => self.lucky_ha_edges.len(),
         };
         egui::Frame::group(ui.style())
             .fill(ui.visuals().faint_bg_color)
@@ -1690,6 +1862,34 @@ impl FocusState {
                         .weak(),
                 );
             });
+
+        if self.tele_metric == TeleMetric::HaEdges {
+            if let Some(edges) = self.last.as_ref().and_then(|u| u.ha_edges.as_ref()) {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "jagged {:.3} px RMS · centre {:.3} · width {:.3} · edge SNR {:.1} · dance {}",
+                        edges.jaggedness_rms_px,
+                        edges.center_rms_px,
+                        edges.width_rms_px,
+                        edges.edge_snr,
+                        edges
+                            .dance_rms_px
+                            .map(|v| format!("{v:.3} px/frame"))
+                            .unwrap_or_else(|| "—".into())
+                    ))
+                    .small()
+                    .color(TELE_COLOR),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "edge lock {:.0}% · maximise the score, not dance alone",
+                        100.0 * edges.valid_fraction
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        }
 
         ui.add_space(6.0);
         ui.label("focuser reading (stepped)");
@@ -1749,7 +1949,11 @@ impl FocusState {
                              mid-disk radius, or fit a flattener."
                         })
                         .small()
-                        .color(if flat { egui::Color32::LIGHT_GREEN } else { WARN_COLOR }),
+                        .color(if flat {
+                            egui::Color32::LIGHT_GREEN
+                        } else {
+                            WARN_COLOR
+                        }),
                     );
                 }
                 _ => {
@@ -1778,7 +1982,10 @@ impl FocusState {
     /// Capture / undo row, shared by both stages.
     fn capture_row_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        let in_progress = self.capture.as_ref().map(|c| (c.total - c.remaining, c.total));
+        let in_progress = self
+            .capture
+            .as_ref()
+            .map(|c| (c.total - c.remaining, c.total));
         ui.horizontal(|ui| match in_progress {
             Some((done, total)) => {
                 ui.add(
@@ -1855,29 +2062,32 @@ impl FocusState {
         &self,
         ui: &mut egui::Ui,
         max_height: f32,
-        selected_y: Option<f64>,
-        capture_height: usize,
+        short_axis_zoom: f32,
+        highlight_edge_motion: bool,
         selectable: bool,
     ) -> Option<f64> {
         let Some(tex) = &self.tex else {
             self.camera_preview_ui(ui, max_height);
             return None;
         };
-        let Some(frame_height) = self.current_frame_height() else {
+        let Some(last) = self.last.as_ref() else {
             self.camera_preview_ui(ui, max_height);
             return None;
         };
+        let frame_height = last.full_h;
+        let sensor_y0 = last.hw_roi_y0.unwrap_or(0) as f64;
         let candidates = self.vertical_anchor_lines();
-        let hw_roi_active = self
-            .last
-            .as_ref()
-            .map(|update| update.hw_roi_active)
-            .unwrap_or(false);
         ui.vertical_centered(|ui| {
             let avail = ui.available_width().max(1.0);
             let aspect = tex.aspect_ratio();
-            let height = (avail / aspect).min(max_height).max(1.0);
-            let width = (height * aspect).min(avail);
+            let base_height = (avail / aspect).min(max_height).max(1.0);
+            let base_width = (base_height * aspect).min(avail);
+            let zoom = short_axis_zoom.clamp(1.0, 5.0);
+            let (width, height) = if base_width >= base_height {
+                (base_width, base_height * zoom)
+            } else {
+                (base_width * zoom, base_height)
+            };
             let sense = if selectable {
                 egui::Sense::click()
             } else {
@@ -1898,19 +2108,11 @@ impl FocusState {
             let sensor_to_screen_y = |sensor_y: f64| {
                 rect.top()
                     + rect.height()
-                        * (sensor_y / frame_height.max(1) as f64).clamp(0.0, 1.0) as f32
+                        * ((sensor_y - sensor_y0) / frame_height.max(1) as f64).clamp(0.0, 1.0)
+                            as f32
             };
 
-            if hw_roi_active {
-                ui.painter().text(
-                    egui::pos2(rect.left() + 8.0, rect.top() + 6.0),
-                    egui::Align2::LEFT_TOP,
-                    "hardware ROI — the view is the capture band",
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgb(255, 205, 75),
-                );
-            }
-            for &(line_y, _) in candidates.iter().filter(|_| !hw_roi_active) {
+            for &(line_y, _) in &candidates {
                 let y = sensor_to_screen_y(line_y);
                 ui.painter().hline(
                     rect.x_range(),
@@ -1918,46 +2120,70 @@ impl FocusState {
                     egui::Stroke::new(1.0_f32, SPECTRAL_COLOR.gamma_multiply(0.45)),
                 );
             }
-            if let Some(anchor) = selected_y.filter(|_| !hw_roi_active) {
-                let half_crop = capture_height as f64 / 2.0;
-                let y0 = sensor_to_screen_y(anchor - half_crop);
-                let y1 = sensor_to_screen_y(anchor + half_crop);
-                let crop_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.left(), y0.min(y1)),
-                    egui::pos2(rect.right(), y0.max(y1)),
-                )
-                .intersect(rect);
-                ui.painter().rect_filled(
-                    crop_rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 190, 70, 18),
-                );
-                let y = sensor_to_screen_y(anchor);
-                ui.painter().hline(
-                    rect.x_range(),
-                    y,
-                    egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 205, 75)),
-                );
-                ui.painter().text(
-                    egui::pos2(rect.left() + 6.0, y - 4.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("selected Y {anchor:.1}"),
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgb(255, 220, 110),
-                );
+            // The motion view colours the measured half-depth edges by their
+            // local frame-to-frame displacement. Median movement of each edge
+            // is removed first, so a slow mount jog reveals moving solar
+            // structure without lighting up fixed smile or a rigid line shift.
+            if highlight_edge_motion && self.spectral_is_y() {
+                if let Some(edges) = last.ha_edges.as_ref() {
+                    let n = edges
+                        .edge_lo
+                        .len()
+                        .min(edges.edge_hi.len())
+                        .min(edges.motion.len());
+                    let step = (n / 640).max(1);
+                    let mut ranked: Vec<f32> = edges
+                        .motion
+                        .iter()
+                        .take(n)
+                        .copied()
+                        .filter(|v| v.is_finite())
+                        .collect();
+                    ranked.sort_by(f32::total_cmp);
+                    if n >= 2 && !ranked.is_empty() {
+                        let p90 = ranked[(ranked.len() * 9 / 10).min(ranked.len() - 1)].max(0.05);
+                        let indices: Vec<usize> = (0..n).step_by(step).collect();
+                        let draw_motion = |trace: &[f32], rgb: (u8, u8, u8)| {
+                            for pair in indices.windows(2) {
+                                let (a, b) = (pair[0], pair[1]);
+                                let strength = (edges.motion[a].max(edges.motion[b]) / p90)
+                                    .clamp(0.0, 1.0);
+                                let point = |i: usize| {
+                                    let x = rect.left()
+                                        + rect.width() * i as f32
+                                            / n.saturating_sub(1).max(1) as f32;
+                                    egui::pos2(
+                                        x,
+                                        sensor_to_screen_y(sensor_y0 + trace[i] as f64),
+                                    )
+                                };
+                                ui.painter().line_segment(
+                                    [point(a), point(b)],
+                                    egui::Stroke::new(
+                                        0.75 + 2.25 * strength,
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            rgb.0,
+                                            rgb.1,
+                                            rgb.2,
+                                            (35.0 + 220.0 * strength) as u8,
+                                        ),
+                                    ),
+                                );
+                            }
+                        };
+                        draw_motion(&edges.edge_lo, (60, 235, 255));
+                        draw_motion(&edges.edge_hi, (255, 90, 210));
+                    }
+                }
             }
 
             if selectable && response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let sensor_y =
-                        ((pointer.y - rect.top()) / rect.height()) as f64 * frame_height as f64;
+                    let sensor_y = sensor_y0
+                        + ((pointer.y - rect.top()) / rect.height()) as f64 * frame_height as f64;
                     return candidates
                         .iter()
-                        .min_by(|a, b| {
-                            (a.0 - sensor_y)
-                                .abs()
-                                .total_cmp(&(b.0 - sensor_y).abs())
-                        })
+                        .min_by(|a, b| (a.0 - sensor_y).abs().total_cmp(&(b.0 - sensor_y).abs()))
                         .map(|line| line.0);
                 }
             }
@@ -1984,17 +2210,19 @@ impl FocusState {
         } else {
             Vec::new()
         };
+        let sensor_y0 = last.hw_roi_y0.unwrap_or(0) as f64;
         profile_plot(
             ui,
             "acquire_spectral",
             &profile,
             None,
             &candidates,
-            selected_y,
+            selected_y.map(|y| y - sensor_y0),
             &labels,
             SPECTRAL_COLOR,
             170.0,
         )
+        .map(|y| y + sensor_y0)
     }
 
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -2124,7 +2352,17 @@ impl FocusState {
                             .small()
                             .color(TELE_COLOR),
                     );
-                    profile_plot(ui, "focus_slitcut", &cut, None, &[], None, &[], TELE_COLOR, 150.0);
+                    profile_plot(
+                        ui,
+                        "focus_slitcut",
+                        &cut,
+                        None,
+                        &[],
+                        None,
+                        &[],
+                        TELE_COLOR,
+                        150.0,
+                    );
                 }
             }
         }
@@ -2348,7 +2586,9 @@ fn saved_focus_path() -> Option<std::path::PathBuf> {
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            })
     }?;
     Some(base.join("GhostSun").join("focus.txt"))
 }
@@ -2621,6 +2861,9 @@ fn worker(
     }
     let mut pending_ser: Option<SerRequest> = None;
     let mut active_ser: Option<ActiveSer> = None;
+    let mut active_hw_roi: Option<Roi> = None;
+    let mut previous_ha_edges: Option<HaEdgeMetrics> = None;
+    let mut ha_detail_lpf: Option<(f64, Instant)> = None;
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2634,7 +2877,31 @@ fn worker(
                 FocusCmd::AutoExposure(on) => {
                     cam.set_auto_exposure(on).ok();
                 }
-                FocusCmd::Dispersion(h) => disp_h = h,
+                FocusCmd::Dispersion(h) => {
+                    disp_h = h;
+                    previous_ha_edges = None;
+                    ha_detail_lpf = None;
+                }
+                FocusCmd::SetHardwareRoi(requested) => {
+                    if pending_ser.is_some() || active_ser.is_some() {
+                        let _ = tx.send(FocusMsg::HardwareRoiError(
+                            "sensor ROI is locked while a SER recording is active".into(),
+                        ));
+                        continue;
+                    }
+                    let target = requested.unwrap_or_else(|| full_frame_roi(&info));
+                    match apply_roi(&mut *cam, target) {
+                        Ok(()) => {
+                            active_hw_roi = requested;
+                            previous_ha_edges = None;
+                            ha_detail_lpf = None;
+                            let _ = tx.send(FocusMsg::HardwareRoiChanged(requested));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(FocusMsg::HardwareRoiError(error));
+                        }
+                    }
+                }
                 FocusCmd::StartSer {
                     path,
                     capture_height,
@@ -2642,69 +2909,46 @@ fn worker(
                     hw_roi,
                 } => {
                     if let Some(active) = active_ser.take() {
-                        let had_hw = active.hw_roi_y0.is_some();
                         finish_ser(active, &tx);
-                        if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
-                                let _ = tx.send(FocusMsg::Error(format!(
-                                    "the full sensor could not be restored: {error}"
-                                )));
-                                return;
-                            }
-                        }
                     }
-                    // Hardware ROI: have the sensor read only the capture band,
-                    // so frame rate is exposure-limited rather than full-frame
-                    // readout-limited (measured on a G3M678M: 23 → 176 fps at
-                    // 256 rows). Frame rate is scan-axis sampling density, so
-                    // this is a direct resolution win. Scoped strictly to the
-                    // recording; a refusal falls back to the software crop --
-                    // a cropped recording beats no recording.
-                    let mut hw_roi_y0 = None;
-                    if hw_roi {
+                    // Camera geometry is configured explicitly during setup.
+                    // Starting, stopping, and alternating scans never touch it.
+                    let expected_hw_roi = if hw_roi {
                         let (y0, height) =
                             vertical_crop_bounds(info.max_height, capture_height, anchor_y);
-                        let band = Roi {
+                        Some(Roi {
                             x: 0,
                             y: y0 & !1,
                             w: info.max_width,
-                            h: (height & !1).max(2),
-                        };
-                        match apply_roi(&mut *cam, band) {
-                            Ok(()) => hw_roi_y0 = Some(band.y),
-                            Err(roi_error) => {
-                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
-                                    let _ = tx.send(FocusMsg::Error(format!(
-                                        "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
-                                    )));
-                                    return;
-                                }
-                            }
-                        }
+                            h: (height & !1).max(8),
+                        })
+                    } else {
+                        None
+                    };
+                    if hw_roi && active_hw_roi != expected_hw_roi {
+                        let _ = tx.send(FocusMsg::RecordingError(
+                            "apply the selected hardware ROI before starting acquisition".into(),
+                        ));
+                        continue;
+                    }
+                    if !hw_roi && active_hw_roi.is_some() {
+                        let _ = tx.send(FocusMsg::RecordingError(
+                            "disable the hardware ROI before starting full-frame acquisition"
+                                .into(),
+                        ));
+                        continue;
                     }
                     pending_ser = Some(SerRequest {
                         path,
                         capture_height,
                         anchor_y,
-                        hw_roi_y0,
+                        hw_roi_y0: active_hw_roi.map(|roi| roi.y),
                     });
                 }
                 FocusCmd::StopSer => {
                     let pending = pending_ser.take();
                     if let Some(active) = active_ser.take() {
-                        let had_hw = active.hw_roi_y0.is_some();
                         let finished = finish_ser_message(active);
-                        // Restore the full sensor BEFORE resuming preview: the
-                        // ROI is scoped strictly to the recording.
-                        if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
-                                let _ = tx.send(finished);
-                                let _ = tx.send(FocusMsg::Error(format!(
-                                    "SER saved, but the full sensor could not be restored: {error}"
-                                )));
-                                return;
-                            }
-                        }
                         let preview = cam.resume_preview();
                         let _ = tx.send(finished);
                         if let Err(error) = preview {
@@ -2714,21 +2958,11 @@ fn worker(
                             return;
                         }
                     } else if let Some(request) = pending {
-                        // No frame ever arrived. If the ROI was already
-                        // applied it must still be unwound.
-                        if request.hw_roi_y0.is_some() {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
-                                let _ = tx.send(FocusMsg::Error(format!(
-                                    "the full sensor could not be restored: {error}"
-                                )));
-                                return;
-                            }
-                        }
                         let _ = tx.send(FocusMsg::RecordingStopped {
                             path: request.path,
                             frames: 0,
                             fps: 0.0,
-                            hw_roi: false,
+                            hw_roi: request.hw_roi_y0.is_some(),
                         });
                     }
                 }
@@ -2786,9 +3020,7 @@ fn worker(
 
                 let mut recording_failed = None;
                 if let Some(active) = active_ser.as_mut() {
-                    if frame.width == 0
-                        || active.y0.saturating_add(active.height) > frame.height
-                    {
+                    if frame.width == 0 || active.y0.saturating_add(active.height) > frame.height {
                         recording_failed =
                             Some("camera dimensions changed during recording".to_owned());
                     } else {
@@ -2806,19 +3038,8 @@ fn worker(
                     }
                 }
                 if let Some(error) = recording_failed {
-                    let had_hw = active_ser
-                        .take()
-                        .map(|active| active.hw_roi_y0.is_some())
-                        .unwrap_or(false);
+                    active_ser.take();
                     let _ = tx.send(FocusMsg::RecordingError(error));
-                    if had_hw {
-                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
-                            let _ = tx.send(FocusMsg::Error(format!(
-                                "the full sensor could not be restored: {error}"
-                            )));
-                            return;
-                        }
-                    }
                 }
 
                 // Always acquire (and therefore drain the camera/SDK), but do
@@ -2839,6 +3060,45 @@ fn worker(
                     .into_iter()
                     .map(Fit::from)
                     .collect();
+                let ha_center = if disp_h { &lines_x } else { &lines_y }
+                    .iter()
+                    .filter(|line| line.depth > DEPTH_GATE)
+                    .max_by(|a, b| {
+                        a.depth
+                            .partial_cmp(&b.depth)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|line| line.center);
+                let mut ha_edges = ha_center.and_then(|center| {
+                    focusmetrics::ha_line_edges(
+                        &frame.data,
+                        frame.width,
+                        frame.height,
+                        disp_h,
+                        center,
+                    )
+                });
+                if let Some(current) = ha_edges.as_mut() {
+                    if let Some((dance, motion)) = previous_ha_edges
+                        .as_ref()
+                        .and_then(|previous| focusmetrics::ha_edge_motion(current, previous))
+                    {
+                        current.dance_rms_px = Some(dance);
+                        current.motion = motion;
+                    }
+                    let now = Instant::now();
+                    current.focus_score = match ha_detail_lpf {
+                        Some((previous, at)) => low_pass_sample(
+                            previous,
+                            current.focus_score,
+                            now.saturating_duration_since(at),
+                            HA_DETAIL_LPF_TAU,
+                        ),
+                        None => current.focus_score,
+                    };
+                    ha_detail_lpf = Some((current.focus_score, now));
+                    previous_ha_edges = Some(current.clone());
+                }
                 let mean = if prof_x.is_empty() {
                     0.0
                 } else {
@@ -2866,14 +3126,12 @@ fn worker(
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
                 let update = Box::new(FocusUpdate {
-                    hw_roi_active: active_ser
-                        .as_ref()
-                        .map(|active| active.hw_roi_y0.is_some())
-                        .unwrap_or(false),
+                    hw_roi_y0: active_hw_roi.map(|roi| roi.y),
                     slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
                     n_continuum,
                     limb_width,
                     structure,
+                    ha_edges,
                     strip,
                     strip_w: sw,
                     strip_h: sh,
@@ -2931,7 +3189,12 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
             } else {
                 0.0
             };
-            FocusMsg::RecordingStopped { path, frames, fps, hw_roi }
+            FocusMsg::RecordingStopped {
+                path,
+                frames,
+                fps,
+                hw_roi,
+            }
         }
         Err(error) => FocusMsg::RecordingError(error.to_string()),
     }
@@ -2946,13 +3209,10 @@ fn full_frame_roi(info: &CameraInfo) -> Roi {
     }
 }
 
-/// Stop → apply ROI → restart. Every backend applies ROI at stream start, so
-/// the cycle is mandatory. A failure leaves the camera stopped; callers must
-/// treat it as fatal for the session unless a full-frame restore succeeds.
+/// Change camera geometry during acquisition setup. Vendor backends may add
+/// checked restart/recovery behaviour; SER start/stop never calls this.
 fn apply_roi(cam: &mut dyn ghostsun_camera::Camera, roi: Roi) -> Result<(), String> {
-    cam.stop();
-    cam.set_roi(roi).map_err(|error| error.to_string())?;
-    cam.start().map_err(|error| error.to_string())
+    cam.reconfigure_roi(roi).map_err(|error| error.to_string())
 }
 
 fn vertical_crop_bounds(
@@ -2962,7 +3222,9 @@ fn vertical_crop_bounds(
 ) -> (usize, usize) {
     let height = requested_height.clamp(1, frame_height.max(1));
     let anchor = if anchor_y.is_finite() {
-        anchor_y.round().clamp(0.0, frame_height.saturating_sub(1) as f64) as usize
+        anchor_y
+            .round()
+            .clamp(0.0, frame_height.saturating_sub(1) as f64) as usize
     } else {
         frame_height / 2
     };
@@ -2998,6 +3260,21 @@ fn make_strip(frame: &ghostsun_camera::Frame) -> (Vec<u8>, usize, usize) {
         .map(|&v| (((v.saturating_sub(lo)) as f32 / span) * 255.0).clamp(0.0, 255.0) as u8)
         .collect();
     (out, sw, sh)
+}
+
+/// Time-aware one-pole low-pass filter. A long gap means the camera/line was
+/// interrupted, so the new sample starts a fresh filter rather than reviving a
+/// stale focus value.
+fn low_pass_sample(previous: f64, sample: f64, dt: Duration, tau: Duration) -> f64 {
+    if !previous.is_finite()
+        || !sample.is_finite()
+        || tau.is_zero()
+        || dt >= tau.saturating_mul(4)
+    {
+        return sample;
+    }
+    let alpha = 1.0 - (-dt.as_secs_f64() / tau.as_secs_f64()).exp();
+    previous + alpha.clamp(0.0, 1.0) * (sample - previous)
 }
 
 /// Mean of the brightest one percent of a 16-bit frame.
@@ -3109,8 +3386,28 @@ mod tests {
             n_continuum: 0,
             limb_width: None,
             structure: StructureSplit::default(),
-            hw_roi_active: false,
+            ha_edges: None,
+            hw_roi_y0: None,
         }
+    }
+
+    #[test]
+    fn ha_detail_lpf_strongly_attenuates_single_frame_changes() {
+        let filtered = low_pass_sample(
+            10.0,
+            20.0,
+            Duration::from_millis(40),
+            HA_DETAIL_LPF_TAU,
+        );
+        assert!(filtered > 10.0 && filtered < 10.25, "filtered {filtered}");
+
+        let reset = low_pass_sample(
+            filtered,
+            20.0,
+            Duration::from_secs(9),
+            HA_DETAIL_LPF_TAU,
+        );
+        assert_eq!(reset, 20.0);
     }
 
     /// Drive one full capture burst at `pos` with the given per-frame values.
@@ -3231,8 +3528,16 @@ mod tests {
         assert_eq!(st.curve_slit.samples.len(), 5);
 
         let sp = vcurve::split(&st.curve_spec, &st.curve_slit).expect("Δ should solve");
-        assert!((sp.spectral.vertex - 0.34).abs() < 1e-6, "{}", sp.spectral.vertex);
-        assert!((sp.spatial.vertex - 0.28).abs() < 1e-6, "{}", sp.spatial.vertex);
+        assert!(
+            (sp.spectral.vertex - 0.34).abs() < 1e-6,
+            "{}",
+            sp.spectral.vertex
+        );
+        assert!(
+            (sp.spatial.vertex - 0.28).abs() < 1e-6,
+            "{}",
+            sp.spatial.vertex
+        );
         // The sign convention the whole procedure hangs on.
         assert!((sp.delta - 0.06).abs() < 1e-6, "delta {}", sp.delta);
         assert!(sp.spectral.trustworthy() && sp.spatial.trustworthy());
@@ -3242,9 +3547,15 @@ mod tests {
     fn a_burst_with_no_usable_line_is_dropped_rather_than_recorded() {
         let mut st = stage_a_state();
         capture_at(&mut st, 0.20, None, None);
-        assert!(st.curve_spec.is_empty(), "a dropout must not become a sample");
+        assert!(
+            st.curve_spec.is_empty(),
+            "a dropout must not become a sample"
+        );
         assert!(st.curve_slit.is_empty());
-        assert!(st.capture.is_none(), "capture should have completed, not stalled");
+        assert!(
+            st.capture.is_none(),
+            "capture should have completed, not stalled"
+        );
     }
 
     #[test]
@@ -3297,19 +3608,30 @@ mod tests {
         st.record_null_point();
         assert_eq!(st.null_points.len(), 1);
         assert!((st.null_points[0].delta - 0.06).abs() < 1e-6);
-        assert!(st.curve_spec.is_empty(), "sweep should reset for the next setting");
+        assert!(
+            st.curve_spec.is_empty(),
+            "sweep should reset for the next setting"
+        );
     }
 
     #[test]
     fn banking_without_a_collimator_reading_is_refused() {
         let mut st = stage_a_state();
         for pos in [0.10, 0.20, 0.30, 0.40, 0.50] {
-            capture_at(&mut st, pos, Some((pos - 0.3) * (pos - 0.3)), Some((pos - 0.2) * (pos - 0.2)));
+            capture_at(
+                &mut st,
+                pos,
+                Some((pos - 0.3) * (pos - 0.3)),
+                Some((pos - 0.2) * (pos - 0.2)),
+            );
         }
         st.collimator_pos_text.clear();
         st.record_null_point();
         assert!(st.null_points.is_empty());
-        assert!(!st.curve_spec.is_empty(), "a refused bank must not discard the sweep");
+        assert!(
+            !st.curve_spec.is_empty(),
+            "a refused bank must not discard the sweep"
+        );
     }
 
     #[test]
@@ -3355,7 +3677,13 @@ mod tests {
 
         st.tele_metric = TeleMetric::Structure;
         st.retarget_tele_curves();
-        assert!(st.curve_tele.is_empty(), "px and contrast are not the same axis");
-        assert!(!st.curve_tele.want_min, "contrast is maximised, not minimised");
+        assert!(
+            st.curve_tele.is_empty(),
+            "px and contrast are not the same axis"
+        );
+        assert!(
+            !st.curve_tele.want_min,
+            "contrast is maximised, not minimised"
+        );
     }
 }
