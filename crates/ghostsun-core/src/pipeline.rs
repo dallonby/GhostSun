@@ -130,6 +130,10 @@ pub struct ReconOptions {
     /// Optional forced spectral column (px on the oriented mean frame) for
     /// the primary line. `None` = multi-candidate continuous AUTO tracking.
     pub line_center_x: Option<f64>,
+    /// Keep the corrected native (pre-warp) disk and its fitted geometry in
+    /// the report so a multi-scan stacker can compose registration with the
+    /// warp and resample the native data exactly once. Costs one disk clone.
+    pub keep_native: bool,
     pub verbose: bool,
     /// optional log/progress sink (UI); when set, vlog! goes here too
     pub progress: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
@@ -163,6 +167,7 @@ impl Default for ReconOptions {
             force_transpose: None,
             multi_line_composite: false,
             line_center_x: None,
+            keep_native: false,
             verbose: true,
             progress: None,
         }
@@ -197,8 +202,20 @@ pub struct ReconReport {
     pub xreg_applied: Vec<f64>,
     /// F11: burst-flagged columns
     pub burst_flags: Vec<bool>,
+    /// F11: per-column contrast-collapse severity (1 = normal, >1 = blurred;
+    /// empty when burst repair was off). Repaired columns keep their measured
+    /// severity — interpolated data adds no independent signal and a stacker
+    /// should down-weight it.
+    pub burst_severity: Vec<f64>,
     /// per-column photometric gain divided out
     pub column_gain: Vec<f64>,
+    /// Corrected native (pre-warp) disk, when `ReconOptions::keep_native`.
+    /// All per-column corrections, demix and NLM are applied; the geometric
+    /// warp is NOT — compose it from `native_geom` + the warp parameters.
+    pub native_disk: Option<Image>,
+    /// Fitted (regularized) ellipse geometry used by the warp, when
+    /// `ReconOptions::keep_native`.
+    pub native_geom: Option<ellipse::EllipseGeom>,
     /// Multi-line composite: number of spectral lines stacked (primary +
     /// companions). `None` when the option was off or no companions found.
     pub composite_n_lines: Option<usize>,
@@ -530,6 +547,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         .unwrap_or_else(|| vec![0.0f64; disk.w]);
     let mut xreg_applied = vec![0.0f64; disk.w];
     let mut burst_flags = vec![false; disk.w];
+    let mut burst_severity: Vec<f64> = Vec::new();
     let mut column_gain = vec![1.0f64; disk.w];
     let mut demix_before_raw: Option<Image> = None;
     if opts.baseline {
@@ -607,6 +625,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 };
                 vlog!(opts, "burst repair: {} column(s) repaired", rep.n_flagged);
                 burst_flags = rep.flags;
+                burst_severity = rep.severity;
                 stage!("burst repair");
             }
             if opts.x_registration && pass == 0 {
@@ -771,6 +790,10 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         "column/slit axis in output: {:+.2} deg from vertical (geometry-aware native-axis correction)",
         crate::warp::slit_axis_angle_deg(&fit.geom, &wp)
     );
+    // Snapshot for the native-domain multi-scan stacker: every per-column
+    // correction is in, the (affine) warp is not.
+    let native_disk = if opts.keep_native { Some(disk.clone()) } else { None };
+    let native_geom = if opts.keep_native { Some(fit.geom) } else { None };
     let mut output = if opts.baseline {
         warp_baseline(&disk, &fit.geom, &wp)
     } else if opts.use_gpu {
@@ -1077,7 +1100,10 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         jitter_applied,
         xreg_applied,
         burst_flags,
+        burst_severity,
         column_gain,
+        native_disk,
+        native_geom,
         composite_n_lines,
         composite_line_offsets_px,
     })

@@ -35,6 +35,10 @@ const SIDEREAL_DEG_PER_SEC: f64 = 15.0 / 3600.0;
 const SETTLE_TIME: Duration = Duration::from_millis(1200);
 const PRE_ROLL: Duration = Duration::from_millis(350);
 const POST_ROLL: Duration = Duration::from_millis(350);
+/// Continue beyond the camera-confirmed far limb. On an alternating scan this
+/// becomes the acceleration runway for the reverse pass, so the mount reaches
+/// its requested scan rate before the disc returns to the slit.
+const FAR_SIDE_RUNOUT: Duration = Duration::from_secs(2);
 const OFF_AXIS_WARN_DEG: f64 = 10.0;
 const PREPOSITION_STEP_DEG: f64 = 0.08;
 const PREPOSITION_SETTLE: Duration = Duration::from_millis(250);
@@ -68,6 +72,7 @@ enum RunPhase {
     PreRoll,
     Scanning,
     ScanTailCheck,
+    FarSideRunout,
     PostRoll,
     WaitingForRecorder,
     Recentering,
@@ -84,6 +89,9 @@ struct ScanRun {
     rate_code: u8,
     rate_multiple: f64,
     scan_span_deg: f64,
+    /// Primary absorption line in the cropped SER after vertical-dispersion
+    /// frames are transposed into pipeline orientation.
+    line_center_x: f64,
     preposition_baseline: f32,
     preposition_last_seq: u64,
     preposition_steps: usize,
@@ -123,10 +131,14 @@ struct Calibration {
 
 pub struct AcquireState {
     capture_height: usize,
-    /// Read only the capture band from the sensor while recording. Measured on
-    /// the G3M678M: 23 fps full-frame → 176 fps at 256 rows, and frame rate is
-    /// scan-axis sampling density. Restored the moment recording stops.
+    /// Keep the sensor on the selected capture band for preview and recording.
+    /// It is configured explicitly before acquisition and remains unchanged
+    /// through scan start/stop and alternating scans.
     use_hw_roi: bool,
+    /// Display-only expansion of the live preview's short axis.
+    live_short_axis_zoom: u8,
+    /// Colour the tracked H-alpha edges by local frame-to-frame movement.
+    highlight_edge_motion: bool,
     anchor_y: Option<f64>,
     output_dir: PathBuf,
     scan_span_deg: f64,
@@ -162,6 +174,8 @@ impl Default for AcquireState {
             // (a 900-frame scan: ~1.3 GB rather than ~6.6 GB).
             capture_height: 256,
             use_hw_roi: true,
+            live_short_axis_zoom: 1,
+            highlight_edge_motion: true,
             anchor_y: None,
             output_dir,
             scan_span_deg: 0.80,
@@ -370,14 +384,12 @@ impl AcquireState {
                         );
 
                         if run.preposition_clear_samples >= PREPOSITION_REQUIRED_SAMPLES {
-                            let distance =
-                                run.preposition_steps as f64 * PREPOSITION_STEP_DEG;
+                            let distance = run.preposition_steps as f64 * PREPOSITION_STEP_DEG;
                             // The configured span is a minimum. If the camera
                             // proves that the first limb is farther away than
                             // the centred-disc assumption, extend the recorded
                             // sweep by the same excess distance.
-                            run.scan_span_deg +=
-                                (distance - run.scan_span_deg / 2.0).max(0.0);
+                            run.scan_span_deg += (distance - run.scan_span_deg / 2.0).max(0.0);
                             run.phase = RunPhase::Settling;
                             run.settle_until = Instant::now() + SETTLE_TIME;
                             self.status = format!(
@@ -443,7 +455,7 @@ impl AcquireState {
                     run.scan_exit_at = None;
                     mount.start_acquisition_nudge(
                         direction,
-                        scan_duration(run.scan_span_deg, run.rate_multiple),
+                        scheduled_scan_duration(run.scan_span_deg, run.rate_multiple),
                         run.rate_code,
                     )?;
                     run.phase = RunPhase::Scanning;
@@ -472,26 +484,24 @@ impl AcquireState {
                             )
                         };
                         if cleared {
-                            mount.stop_acquisition_motion();
-                            run.phase = RunPhase::PostRoll;
-                            run.deadline = Instant::now() + POST_ROLL;
+                            run.phase = RunPhase::FarSideRunout;
+                            run.deadline = Instant::now() + FAR_SIDE_RUNOUT;
                             self.status = format!(
-                                "Scan {}/{}: far limb cleared; stopping and recording post-roll",
+                                "Scan {}/{}: far limb cleared; continuing {:.1} s for reverse-scan acceleration runway",
                                 run.scan_index + 1,
-                                self.scan_count
+                                self.scan_count,
+                                FAR_SIDE_RUNOUT.as_secs_f64(),
                             );
                         }
                     }
-                    if run.phase == RunPhase::Scanning
-                        && mount.take_acquisition_nudge_done()
-                    {
+                    if run.phase == RunPhase::Scanning && mount.take_acquisition_nudge_done() {
                         // The last camera update can arrive just after the
                         // timed motion completion. Allow a short stationary
                         // tail before deciding the safety span was insufficient.
                         run.phase = RunPhase::ScanTailCheck;
                         run.deadline = Instant::now() + SCAN_TAIL_CHECK;
-                        self.status = "Motion span complete; confirming the disc is off-sensor"
-                            .into();
+                        self.status =
+                            "Motion span complete; confirming the disc is off-sensor".into();
                     }
                 }
                 RunPhase::ScanTailCheck => {
@@ -501,12 +511,19 @@ impl AcquireState {
                             (fraction * 100.0).clamp(0.0, 999.0)
                         );
                         if cleared {
-                            run.phase = RunPhase::PostRoll;
-                            run.deadline = Instant::now() + POST_ROLL;
+                            let direction = scan_direction(run.direction, run.scan_index);
+                            mount.start_acquisition_nudge(
+                                direction,
+                                FAR_SIDE_RUNOUT,
+                                run.rate_code,
+                            )?;
+                            run.phase = RunPhase::FarSideRunout;
+                            run.deadline = Instant::now() + FAR_SIDE_RUNOUT;
                             self.status = format!(
-                                "Scan {}/{}: far limb confirmed; recording post-roll",
+                                "Scan {}/{}: far limb confirmed; adding {:.1} s acceleration runway",
                                 run.scan_index + 1,
-                                self.scan_count
+                                self.scan_count,
+                                FAR_SIDE_RUNOUT.as_secs_f64(),
                             );
                         }
                     }
@@ -519,6 +536,33 @@ impl AcquireState {
                         } else {
                             "the camera never detected the solar disc during the scan".into()
                         });
+                    }
+                }
+                RunPhase::FarSideRunout => {
+                    let now = Instant::now();
+                    if now >= run.deadline {
+                        mount.stop_acquisition_motion();
+                        run.phase = RunPhase::PostRoll;
+                        run.deadline = now + POST_ROLL;
+                        self.status = format!(
+                            "Scan {}/{}: acceleration runway complete; recording post-roll",
+                            run.scan_index + 1,
+                            self.scan_count
+                        );
+                    } else if mount.take_acquisition_nudge_done() {
+                        // A conservative safety-span timer can expire shortly
+                        // after the far limb is detected. Restart only for the
+                        // remaining runway so the next reverse pass still has
+                        // the full off-disc distance in which to accelerate.
+                        let remaining = run.deadline.saturating_duration_since(now);
+                        let direction = scan_direction(run.direction, run.scan_index);
+                        mount.start_acquisition_nudge(direction, remaining, run.rate_code)?;
+                        self.status = format!(
+                            "Scan {}/{}: extending off-disc runway for {:.1} s",
+                            run.scan_index + 1,
+                            self.scan_count,
+                            remaining.as_secs_f64()
+                        );
                     }
                 }
                 RunPhase::PostRoll if Instant::now() >= run.deadline => {
@@ -572,9 +616,7 @@ impl AcquireState {
                 RunPhase::RecenterCheck if Instant::now() >= run.settle_until => {
                     if let Some((seq, signal)) = focus
                         .sun_signal_sample()
-                        .filter(|(seq, signal)| {
-                            *seq > run.recenter_last_seq && signal.is_finite()
-                        })
+                        .filter(|(seq, signal)| *seq > run.recenter_last_seq && signal.is_finite())
                     {
                         run.recenter_last_seq = seq;
                         let fraction = signal / run.preposition_baseline;
@@ -687,6 +729,10 @@ impl AcquireState {
             .filter(|(_, signal)| signal.is_finite() && *signal > 0.0)
             .ok_or("wait for a valid live camera signal before beginning")?;
         let configured_span = self.scan_span_deg.clamp(0.55, 2.0);
+        let anchor_y = self.anchor_y.ok_or("spectral-line anchor was lost")?;
+        let line_center_x = focus
+            .recording_line_center(self.capture_height, anchor_y)
+            .ok_or("could not map the selected line into the SER crop")?;
         let mut run = ScanRun {
             phase: RunPhase::PrepositionMoving,
             session_dir,
@@ -696,6 +742,7 @@ impl AcquireState {
             rate_code,
             rate_multiple,
             scan_span_deg: configured_span,
+            line_center_x,
             preposition_baseline,
             preposition_last_seq,
             preposition_steps: 0,
@@ -737,6 +784,18 @@ impl AcquireState {
         if self.anchor_y.is_none() {
             return Err("select a spectral-line anchor".into());
         }
+        let expected_roi = self
+            .anchor_y
+            .and_then(|anchor| focus.desired_hardware_roi(self.capture_height, anchor));
+        if self.use_hw_roi && focus.hardware_roi != expected_roi {
+            return Err("apply the selected hardware ROI before acquisition".into());
+        }
+        if !self.use_hw_roi && focus.hardware_roi.is_some() {
+            return Err("disable the hardware ROI before full-frame acquisition".into());
+        }
+        if focus.hardware_roi_changing {
+            return Err("wait for the sensor ROI change to finish".into());
+        }
         if let Some(minutes) = mount.sun_meridian_offset_minutes() {
             let side = if minutes < 0.0 { -1 } else { 1 };
             if minutes.abs() <= 30.0 && self.meridian_ack_side != side {
@@ -763,6 +822,7 @@ impl AcquireState {
         &mut self,
         files: Vec<(PathBuf, bool)>,
         session_dir: PathBuf,
+        line_center_x: f64,
         ctx: &egui::Context,
     ) {
         self.status = "Reconstructing scan(s) with the high-quality pipeline".into();
@@ -770,7 +830,7 @@ impl AcquireState {
         let tx = self.process_tx.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let result = process_scans(&files, &session_dir, &tx);
+            let result = process_scans(&files, &session_dir, line_center_x, &tx);
             match result {
                 Ok(output) => {
                     let _ = tx.send(ProcessMessage::Done(output));
@@ -786,7 +846,7 @@ impl AcquireState {
     fn begin_processing(&mut self, run: &mut ScanRun, ctx: &egui::Context) {
         let files = run.files.clone();
         let session_dir = run.session_dir.clone();
-        self.start_processing(files, session_dir, ctx);
+        self.start_processing(files, session_dir, run.line_center_x, ctx);
         run.phase = RunPhase::Processing;
     }
 
@@ -898,10 +958,70 @@ impl AcquireState {
                     .suffix(" px"),
             );
         }
-        ui.checkbox(&mut self.use_hw_roi, "hardware ROI while recording")
+        ui.checkbox(&mut self.use_hw_roi, "use hardware ROI")
             .on_hover_text(
-                "The sensor reads only the capture band, so frame rate is set by                  exposure instead of full-frame readout — measured 23 → 176 fps at                  256 px on a G3M678M. More frames per second means finer scan-axis                  sampling. The full sensor comes back the moment recording stops,                  and if the camera refuses the ROI the recording falls back to the                  software crop.",
+                "Apply the capture band to the live sensor stream before acquisition. The same geometry remains active through every scan; acquisition never restarts the camera to change ROI.",
             );
+        let desired_roi = self
+            .anchor_y
+            .and_then(|anchor| focus.desired_hardware_roi(self.capture_height, anchor));
+        let roi_matches = if self.use_hw_roi {
+            desired_roi.is_some() && focus.hardware_roi == desired_roi
+        } else {
+            focus.hardware_roi.is_none()
+        };
+        let roi_controls_enabled = self.run.is_none()
+            && self.calibration.is_none()
+            && !focus.recording
+            && focus.streaming
+            && !focus.hardware_roi_changing;
+        ui.horizontal_wrapped(|ui| {
+            if self.use_hw_roi {
+                let label = format!("Apply {} px sensor ROI", self.capture_height);
+                if ui
+                    .add_enabled(
+                        roi_controls_enabled && !roi_matches && self.anchor_y.is_some(),
+                        egui::Button::new(label),
+                    )
+                    .clicked()
+                {
+                    match focus.configure_hardware_roi(
+                        true,
+                        self.capture_height,
+                        self.anchor_y.unwrap_or(f64::NAN),
+                    ) {
+                        Ok(()) => self.status = "Applying hardware ROI before acquisition".into(),
+                        Err(error) => self.status = error,
+                    }
+                }
+            } else if focus.hardware_roi.is_some() {
+                if ui
+                    .add_enabled(
+                        roi_controls_enabled,
+                        egui::Button::new("Disable hardware ROI"),
+                    )
+                    .clicked()
+                {
+                    match focus.configure_hardware_roi(false, self.capture_height, 0.0) {
+                        Ok(()) => self.status = "Restoring the full sensor".into(),
+                        Err(error) => self.status = error,
+                    }
+                }
+            }
+            ui.label(
+                egui::RichText::new(if roi_matches {
+                    format!("✓ {}", focus.hardware_roi_status)
+                } else {
+                    focus.hardware_roi_status.clone()
+                })
+                .small()
+                .color(if roi_matches {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::YELLOW
+                }),
+            );
+        });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Output");
@@ -995,9 +1115,7 @@ impl AcquireState {
         ui.add(egui::Slider::new(&mut self.scan_count, 1..=8).text("alternating scans"));
         let (_, _, rate_multiple) = ACQUISITION_RATES[self.scan_rate_index];
         let duration = scan_duration(self.scan_span_deg, rate_multiple);
-        let motion_per_exposure = rate_multiple
-            * 15.0
-            * (focus.exposure_us as f64 / 1_000_000.0);
+        let motion_per_exposure = rate_multiple * 15.0 * (focus.exposure_us as f64 / 1_000_000.0);
         ui.label(format!(
             "{rate_multiple:.2}× sidereal · {:.1} s across {:.2}° · ~{motion_per_exposure:.2}″ per exposure",
             duration.as_secs_f64(),
@@ -1090,6 +1208,15 @@ impl AcquireState {
                 let mount_ready = mount.is_connected();
                 let tracking_ready = mount.tracking_is_on();
                 let line_ready = self.anchor_y.is_some();
+                let expected_roi = self
+                    .anchor_y
+                    .and_then(|anchor| focus.desired_hardware_roi(self.capture_height, anchor));
+                let roi_ready = !focus.hardware_roi_changing
+                    && if self.use_hw_roi {
+                        expected_roi.is_some() && focus.hardware_roi == expected_roi
+                    } else {
+                        focus.hardware_roi.is_none()
+                    };
                 let vertical = focus.dispersion == DispAxis::Vertical;
                 let meridian_ready = mount
                     .sun_meridian_offset_minutes()
@@ -1104,6 +1231,7 @@ impl AcquireState {
                     (camera_ready, "Camera streaming"),
                     (vertical, "Dispersion set to Vertical"),
                     (line_ready, "Spectral-line anchor selected"),
+                    (roi_ready, "Sensor ROI configured before acquisition"),
                     (meridian_ready, "Meridian guard satisfied"),
                 ] {
                     ui.label(
@@ -1129,6 +1257,7 @@ impl AcquireState {
                     && mount_ready
                     && tracking_ready
                     && line_ready
+                    && roi_ready
                     && vertical
                     && meridian_ready
                     && off_axis_ready;
@@ -1196,13 +1325,63 @@ impl AcquireState {
     }
 
     pub fn view_ui(&mut self, ui: &mut egui::Ui, focus: &focus::FocusState) {
-        ui.heading("Live acquisition view");
+        ui.horizontal(|ui| {
+            ui.heading("Live acquisition view");
+            ui.separator();
+            ui.label("short axis");
+            for zoom in [1_u8, 2, 5] {
+                ui.selectable_value(&mut self.live_short_axis_zoom, zoom, format!("{zoom}×"));
+            }
+            ui.separator();
+            ui.checkbox(&mut self.highlight_edge_motion, "highlight edge motion")
+                .on_hover_text(
+                    "Bright cyan/magenta segments are local Hα edge movement; fixed smile and whole-line motion are subtracted",
+                );
+        });
+        if let Some(edges) = focus.ha_edge_metrics() {
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().faint_bg_color)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Hα detail score {:.3} (2 s LPF)",
+                                edges.focus_score
+                            ))
+                            .strong()
+                            .color(ACCENT),
+                        );
+                        ui.label(format!(
+                            "jagged {:.3} px RMS · centre {:.3} · width {:.3} · edge SNR {:.1}",
+                            edges.jaggedness_rms_px,
+                            edges.center_rms_px,
+                            edges.width_rms_px,
+                            edges.edge_snr,
+                        ));
+                        ui.label(format!(
+                            "dance {} · lock {:.0}%",
+                            edges
+                                .dance_rms_px
+                                .map(|v| format!("{v:.3} px/frame"))
+                                .unwrap_or_else(|| "—".into()),
+                            edges.valid_fraction * 100.0,
+                        ));
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Focus by maximising Hα detail score. Dance is shown separately because seeing can increase motion without improving focus.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+        }
         let selectable = self.run.is_none();
         if let Some(anchor) = focus.acquisition_preview_ui(
             ui,
             420.0,
-            self.anchor_y,
-            self.capture_height,
+            self.live_short_axis_zoom as f32,
+            self.highlight_edge_motion,
             selectable,
         ) {
             self.anchor_y = Some(anchor);
@@ -1223,7 +1402,11 @@ impl AcquireState {
                 }),
             );
             if !selectable {
-                ui.label(egui::RichText::new("locked during acquisition").small().weak());
+                ui.label(
+                    egui::RichText::new("locked during acquisition")
+                        .small()
+                        .weak(),
+                );
             }
         });
         ui.label(
@@ -1242,11 +1425,7 @@ impl AcquireState {
             let anchor = focus
                 .vertical_anchor_lines()
                 .into_iter()
-                .min_by(|a, b| {
-                    (a.0 - clicked)
-                        .abs()
-                        .total_cmp(&(b.0 - clicked).abs())
-                })
+                .min_by(|a, b| (a.0 - clicked).abs().total_cmp(&(b.0 - clicked).abs()))
                 .map(|line| line.0)
                 .unwrap_or(clicked);
             self.anchor_y = Some(anchor);
@@ -1280,9 +1459,12 @@ fn scan_direction(first: Direction, index: usize) -> Direction {
 
 fn scan_duration(span_deg: f64, rate_multiple: f64) -> Duration {
     Duration::from_secs_f64(
-        span_deg.clamp(0.55, 2.0)
-            / (rate_multiple.max(0.25) * SIDEREAL_DEG_PER_SEC),
+        span_deg.clamp(0.55, 2.0) / (rate_multiple.max(0.25) * SIDEREAL_DEG_PER_SEC),
     )
+}
+
+fn scheduled_scan_duration(span_deg: f64, rate_multiple: f64) -> Duration {
+    scan_duration(span_deg, rate_multiple) + FAR_SIDE_RUNOUT
 }
 
 fn start_preposition_step(run: &mut ScanRun, mount: &mut MountState) -> Result<(), String> {
@@ -1301,10 +1483,7 @@ fn start_preposition_step(run: &mut ScanRun, mount: &mut MountState) -> Result<(
     Ok(())
 }
 
-fn observe_scan_signal(
-    run: &mut ScanRun,
-    focus: &focus::FocusState,
-) -> Option<(f32, bool)> {
+fn observe_scan_signal(run: &mut ScanRun, focus: &focus::FocusState) -> Option<(f32, bool)> {
     let (seq, signal) = focus
         .sun_signal_sample()
         .filter(|(seq, signal)| *seq > run.scan_last_seq && signal.is_finite())?;
@@ -1328,8 +1507,7 @@ fn observe_scan_signal(
         run.scan_clear_samples = 0;
     }
 
-    let cleared =
-        run.scan_seen_disc && run.scan_clear_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES;
+    let cleared = run.scan_seen_disc && run.scan_clear_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES;
     if cleared && run.scan_exit_at.is_none() {
         run.scan_exit_at = Some(Instant::now());
     }
@@ -1351,11 +1529,16 @@ fn recenter_motion(run: &ScanRun) -> Result<(f64, Duration), String> {
     // The midpoint between camera-observed limb crossings is the disc centre.
     // Convert half of that science-rate transit to angular distance, then
     // return over the same distance at the fast positioning rate.
-    let distance_deg = (crossing_seconds * run.rate_multiple * SIDEREAL_DEG_PER_SEC / 2.0)
-        .clamp(0.05, run.scan_span_deg / 2.0);
-    let duration = Duration::from_secs_f64(
-        distance_deg / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+    let half_disc_deg = crossing_seconds * run.rate_multiple * SIDEREAL_DEG_PER_SEC / 2.0;
+    let runout_deg = FAR_SIDE_RUNOUT.as_secs_f64()
+        * run.rate_multiple
+        * SIDEREAL_DEG_PER_SEC;
+    let distance_deg = (half_disc_deg + runout_deg).clamp(
+        0.05,
+        run.scan_span_deg / 2.0 + runout_deg,
     );
+    let duration =
+        Duration::from_secs_f64(distance_deg / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC));
     Ok((distance_deg, duration))
 }
 
@@ -1440,9 +1623,19 @@ fn off_axis_angle(north_shift: f64, east_shift: f64) -> f64 {
 fn process_scans(
     files: &[(PathBuf, bool)],
     session_dir: &Path,
+    line_center_x: f64,
     tx: &Sender<ProcessMessage>,
 ) -> Result<AcquireOutput, String> {
-    let mut images = Vec::with_capacity(files.len());
+    // Everything the native-domain stacker needs from each reconstruction;
+    // `warped` doubles as the per-scan output product.
+    struct ScanData {
+        warped: Image,
+        native: Option<(Image, ghostsun_core::ellipse::EllipseGeom)>,
+        canvas_c: (f64, f64),
+        flip_x: bool,
+        col_weight: Vec<f32>,
+    }
+    let mut scans: Vec<ScanData> = Vec::with_capacity(files.len());
     for (index, (path, reverse)) in files.iter().enumerate() {
         let _ = tx.send(ProcessMessage::Log(format!(
             "Reconstructing scan {}/{}{}",
@@ -1453,6 +1646,17 @@ fn process_scans(
         let log_tx = tx.clone();
         let opts = pipeline::ReconOptions {
             flip_x: *reverse,
+            // The acquisition preflight requires sensor dispersion along Y.
+            // Every SER is therefore transposed into the pipeline's standard
+            // orientation (dispersion X, slit Y). Auto-detection is unreliable
+            // on a deliberately short spectral ROI.
+            force_transpose: Some(true),
+            // Start the fit at the exact line selected in the acquisition UI,
+            // expressed in the cropped SER's local coordinates.
+            line_center_x: Some(line_center_x),
+            // Multi-scan sessions stack in the native domain: keep the
+            // corrected pre-warp disk so the stacker resamples it once.
+            keep_native: files.len() > 1,
             verbose: false,
             progress: Some(Arc::new(move |line: &str| {
                 let _ = log_tx.send(ProcessMessage::Log(line.to_owned()));
@@ -1467,19 +1671,62 @@ fn process_scans(
             .map_err(|e| format!("write {}: {e}", fits.display()))?;
         output::write_png16(&png, &image, None)
             .map_err(|e| format!("write {}: {e}", png.display()))?;
-        images.push(image);
+        let col_weight = stack::column_weights(
+            &report.burst_severity,
+            &report.column_gain,
+            report.native_disk.as_ref().map(|d| d.w).unwrap_or(0),
+        );
+        scans.push(ScanData {
+            warped: image,
+            native: report.native_disk.zip(report.native_geom),
+            canvas_c: (report.output.xc, report.output.yc),
+            flip_x: *reverse,
+            col_weight,
+        });
     }
 
-    let final_image = if images.len() == 1 {
-        images.remove(0)
+    let final_image = if scans.len() == 1 {
+        scans.remove(0).warped
     } else {
-        let _ = tx.send(ProcessMessage::Log(format!(
-            "Registering and robust-stacking {} reconstructions",
-            images.len()
-        )));
-        let n_in = images.len();
-        let srep = stack::stack(&images, true, false)
-            .ok_or("multi-scan registration/stacking failed")?;
+        let n_in = scans.len();
+        let srep = if scans.iter().all(|s| s.native.is_some()) {
+            let _ = tx.send(ProcessMessage::Log(format!(
+                "Stacking {} scans in the native domain (single resample, iterated reference)",
+                n_in
+            )));
+            let inputs: Vec<stack::NativeScan> = scans
+                .iter()
+                .map(|s| {
+                    let (disk, geom) = s.native.as_ref().unwrap();
+                    stack::NativeScan {
+                        disk,
+                        geom: *geom,
+                        rotation_deg: 0.0,
+                        flip_x: s.flip_x,
+                        flip_y: false,
+                        canvas_c: s.canvas_c,
+                        warped: &s.warped,
+                        col_weight: s.col_weight.clone(),
+                        filtered_downscale: true,
+                    }
+                })
+                .collect();
+            stack::stack_native(&inputs, &stack::NativeStackParams::default())
+        } else {
+            None
+        };
+        let srep = match srep {
+            Some(s) => s,
+            None => {
+                // Fallback: warped-domain stack of the per-scan products.
+                let _ = tx.send(ProcessMessage::Log(
+                    "Native-domain stack unavailable; falling back to warped-domain stacking".into(),
+                ));
+                let images: Vec<Image> = scans.iter().map(|s| s.warped.clone()).collect();
+                stack::stack(&images, true, false)
+                    .ok_or("multi-scan registration/stacking failed")?
+            }
+        };
         if srep.n_flipped > 0 {
             // Recovered, but never routine: the stacker had to deduce an
             // orientation this code claims to know.
@@ -1558,5 +1805,6 @@ mod tests {
         assert_eq!(code, 4);
         assert_eq!(multiple, 4.0);
         assert!((scan_duration(0.8, multiple).as_secs_f64() - 48.0).abs() < 0.01);
+        assert!((scheduled_scan_duration(0.8, multiple).as_secs_f64() - 50.0).abs() < 0.01);
     }
 }

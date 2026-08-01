@@ -55,7 +55,7 @@ pub struct WarpOutput {
 /// Lanczos-3 sampling with the x kernel stretched by `scale_x` (>=1):
 /// correct anti-aliased, noise-averaging downsampling in x.
 #[inline]
-fn sample_lanczos3_aniso(img: &Image, x: f64, y: f64, scale_x: f64) -> f32 {
+pub(crate) fn sample_lanczos3_aniso(img: &Image, x: f64, y: f64, scale_x: f64) -> f32 {
     let sx = scale_x.max(1.0);
     let rx = (3.0 * sx).ceil() as isize;
     let xf = x.floor() as isize;

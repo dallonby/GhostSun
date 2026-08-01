@@ -233,6 +233,38 @@ enum Cmd {
         #[arg(long)]
         no_flow: bool,
     },
+    /// Reconstruct multiple SER scans and stack in the native domain (F5.5):
+    /// one Lanczos resample per scan, affine registration, per-column
+    /// quality weights, iterated reference.
+    StackSer {
+        /// input SER scans
+        sers: Vec<PathBuf>,
+        #[arg(long, default_value = "stacked-native")]
+        name: String,
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// disable optical-flow evolution compensation
+        #[arg(long)]
+        no_flow: bool,
+        /// register once against the sharpest scan instead of iterating
+        /// against the first stack
+        #[arg(long)]
+        no_iterate: bool,
+        /// mark scans acquired in the reverse direction, e.g. --reverse 1,3,5
+        #[arg(long)]
+        reverse: Option<String>,
+        /// Spectral dispersion axis on raw SER frames (see `recon`)
+        #[arg(long, value_parser = ["auto", "horizontal", "vertical"], default_value = "auto")]
+        dispersion: String,
+        /// also write each scan's own reconstruction
+        #[arg(long)]
+        save_scans: bool,
+        /// bypass the per-scan reconstruction cache (.recon-cache under
+        /// out-dir); by default a scan whose SER and options are unchanged
+        /// is loaded from cache instead of re-reconstructed (~2 min/scan)
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// Full benchmark: synth -> recon (ghostsun + baseline + ablations) -> eval
     Bench {
         #[arg(long, default_value = "testdata")]
@@ -789,10 +821,266 @@ fn main() {
                 }
             }
         }
+        Cmd::StackSer { sers, name, out_dir, no_flow, no_iterate, reverse, dispersion, save_scans, no_cache } => {
+            if sers.len() < 2 {
+                eprintln!("stack-ser needs at least 2 SER scans");
+                std::process::exit(1);
+            }
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let cache_dir = out_dir.join(".recon-cache");
+            let reversed: Vec<usize> = reverse
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|t| t.trim().parse::<usize>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let force_transpose = match dispersion.as_str() {
+                "horizontal" => Some(false),
+                "vertical" => Some(true),
+                _ => None,
+            };
+            let mut scans_data: Vec<CachedScan> = Vec::new();
+            for (k, ser) in sers.iter().enumerate() {
+                let flip = reversed.contains(&k);
+                if !no_cache {
+                    if let Some(c) = load_cached_scan(&cache_dir, ser, flip, &dispersion) {
+                        println!(
+                            "scan {}/{}: {} — loaded from cache",
+                            k + 1,
+                            sers.len(),
+                            ser.display()
+                        );
+                        scans_data.push(c);
+                        continue;
+                    }
+                }
+                println!(
+                    "reconstructing scan {}/{}: {}{}",
+                    k + 1,
+                    sers.len(),
+                    ser.display(),
+                    if flip { " (reverse)" } else { "" }
+                );
+                let opts = pipeline::ReconOptions {
+                    flip_x: flip,
+                    force_transpose,
+                    keep_native: true,
+                    verbose: false,
+                    ..Default::default()
+                };
+                match pipeline::reconstruct(ser, &opts) {
+                    Ok(rep) => {
+                        let c = CachedScan {
+                            native: rep.native_disk.unwrap(),
+                            warped: rep.output.image,
+                            geom: rep.native_geom.unwrap(),
+                            canvas_c: (rep.output.xc, rep.output.yc),
+                            severity: rep.burst_severity,
+                            gains: rep.column_gain,
+                            flip,
+                        };
+                        if !no_cache {
+                            if let Err(e) = save_cached_scan(&cache_dir, ser, &dispersion, &c) {
+                                println!("  (cache write failed: {e})");
+                            }
+                        }
+                        scans_data.push(c);
+                    }
+                    Err(e) => println!("scan {} failed: {e} — dropped", k + 1),
+                }
+            }
+            if scans_data.len() < 2 {
+                eprintln!("fewer than 2 scans reconstructed; nothing to stack");
+                std::process::exit(1);
+            }
+            if save_scans {
+                for (k, c) in scans_data.iter().enumerate() {
+                    let stem = format!("{name}-scan{:02}", k + 1);
+                    output::write_fits_f32(&out_dir.join(format!("{stem}.fits")), &c.warped).unwrap();
+                    output::write_png16(&out_dir.join(format!("{stem}.png")), &c.warped, None).unwrap();
+                }
+            }
+            let inputs: Vec<stack::NativeScan> = scans_data
+                .iter()
+                .map(|c| stack::NativeScan {
+                    disk: &c.native,
+                    geom: c.geom,
+                    rotation_deg: 0.0,
+                    flip_x: c.flip,
+                    flip_y: false,
+                    canvas_c: c.canvas_c,
+                    warped: &c.warped,
+                    col_weight: stack::column_weights(&c.severity, &c.gains, c.native.w),
+                    filtered_downscale: true,
+                })
+                .collect();
+            let p = stack::NativeStackParams {
+                flow: !no_flow,
+                iterate: !no_iterate,
+                verbose: true,
+                reference: None,
+            };
+            match stack::stack_native(&inputs, &p) {
+                Some(rep) => {
+                    let mx = rep.image.max();
+                    output::write_png16(&out_dir.join(format!("{name}_linear.png")), &rep.image, Some((0.0, mx))).unwrap();
+                    output::write_png16(&out_dir.join(format!("{name}_display.png")), &rep.image, None).unwrap();
+                    output::write_fits_f32(&out_dir.join(format!("{name}.fits")), &rep.image).unwrap();
+                    println!(
+                        "stacked {}/{} scans -> {}/{}.fits (weights {:?})",
+                        rep.n_used,
+                        scans_data.len(),
+                        out_dir.display(),
+                        name,
+                        rep.weights.iter().map(|w| format!("{w:.2}")).collect::<Vec<_>>()
+                    );
+                    if rep.n_flipped > 0 {
+                        println!(
+                            "note: {} scan(s) arrived x-mirrored and were auto-flipped; check --reverse usage",
+                            rep.n_flipped
+                        );
+                    }
+                }
+                None => {
+                    eprintln!("native stacking failed");
+                    std::process::exit(1);
+                }
+            }
+        }
         Cmd::Bench { dir, args, ablations, sweep, json } => {
             run_bench(&dir, &args, ablations, sweep.as_deref(), json.as_deref());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-scan reconstruction cache for `stack-ser`: native disk + warped canvas
+// as FITS sidecars plus a plain-text meta file, keyed by a hash of the SER
+// path. Invalidated when the SER mtime, flip, dispersion or version change.
+// A cache hit skips ~2 minutes of reconstruction per scan, which is nearly
+// all of a stack-iteration cycle's wall clock.
+// ---------------------------------------------------------------------------
+
+const RECON_CACHE_VERSION: u32 = 1;
+
+struct CachedScan {
+    native: Image,
+    warped: Image,
+    geom: ghostsun_core::ellipse::EllipseGeom,
+    canvas_c: (f64, f64),
+    severity: Vec<f64>,
+    gains: Vec<f64>,
+    flip: bool,
+}
+
+fn recon_cache_paths(dir: &Path, ser: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let abs = ser.canonicalize().unwrap_or_else(|_| ser.to_path_buf());
+    let s = abs.to_string_lossy();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let stem = ser
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "scan".into());
+    let key = format!("{stem}-{:08x}", (h as u32) ^ ((h >> 32) as u32));
+    (
+        dir.join(format!("{key}-native.fits")),
+        dir.join(format!("{key}-warped.fits")),
+        dir.join(format!("{key}-meta.txt")),
+    )
+}
+
+fn ser_mtime_secs(ser: &Path) -> u64 {
+    std::fs::metadata(ser)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn save_cached_scan(
+    dir: &Path,
+    ser: &Path,
+    dispersion: &str,
+    c: &CachedScan,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let (p_native, p_warped, p_meta) = recon_cache_paths(dir, ser);
+    output::write_fits_f32(&p_native, &c.native)?;
+    output::write_fits_f32(&p_warped, &c.warped)?;
+    let g = &c.geom;
+    let csv = |v: &[f64]| v.iter().map(|x| format!("{x:.6}")).collect::<Vec<_>>().join(",");
+    let meta = format!(
+        "version={}\nmtime={}\nflip={}\ndispersion={}\ncanvas_xc={}\ncanvas_yc={}\n\
+         xc={}\nyc={}\nan={}\nbn={}\ncn={}\nsx={}\nshear={}\nradius={}\n\
+         severity={}\ngains={}\n",
+        RECON_CACHE_VERSION,
+        ser_mtime_secs(ser),
+        c.flip as u8,
+        dispersion,
+        c.canvas_c.0,
+        c.canvas_c.1,
+        g.xc, g.yc, g.an, g.bn, g.cn, g.sx, g.shear, g.radius,
+        csv(&c.severity),
+        csv(&c.gains),
+    );
+    std::fs::write(&p_meta, meta)
+}
+
+fn load_cached_scan(dir: &Path, ser: &Path, flip: bool, dispersion: &str) -> Option<CachedScan> {
+    let (p_native, p_warped, p_meta) = recon_cache_paths(dir, ser);
+    let meta = std::fs::read_to_string(&p_meta).ok()?;
+    let mut kv = std::collections::HashMap::new();
+    for line in meta.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            kv.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    let getf = |k: &str| -> Option<f64> { kv.get(k)?.parse().ok() };
+    if kv.get("version")?.parse::<u32>().ok()? != RECON_CACHE_VERSION {
+        return None;
+    }
+    if kv.get("mtime")?.parse::<u64>().ok()? != ser_mtime_secs(ser) {
+        return None;
+    }
+    if kv.get("flip")?.parse::<u8>().ok()? != flip as u8 {
+        return None;
+    }
+    if kv.get("dispersion").map(String::as_str) != Some(dispersion) {
+        return None;
+    }
+    let parse_csv = |k: &str| -> Vec<f64> {
+        kv.get(k)
+            .map(|s| s.split(',').filter_map(|t| t.parse().ok()).collect())
+            .unwrap_or_default()
+    };
+    let geom = ghostsun_core::ellipse::EllipseGeom {
+        xc: getf("xc")?,
+        yc: getf("yc")?,
+        an: getf("an")?,
+        bn: getf("bn")?,
+        cn: getf("cn")?,
+        sx: getf("sx")?,
+        shear: getf("shear")?,
+        radius: getf("radius")?,
+    };
+    let native = output::read_fits_f32(&p_native).ok()?;
+    let warped = output::read_fits_f32(&p_warped).ok()?;
+    Some(CachedScan {
+        native,
+        warped,
+        geom,
+        canvas_c: (getf("canvas_xc")?, getf("canvas_yc")?),
+        severity: parse_csv("severity"),
+        gains: parse_csv("gains"),
+        flip,
+    })
 }
 
 struct BenchRow {
@@ -934,15 +1222,23 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         }
     }
 
-    // ---- multi-scan stacking benchmark (F5) ----
+    // ---- multi-scan stacking benchmark (F5 / F5.5) ----
     if params.n_scans > 1 {
         println!("\nstacking {} scans...", params.n_scans);
         let mut recons: Vec<Image> = Vec::new();
+        let mut reports: Vec<pipeline::ReconReport> = Vec::new();
         for k in 0..params.n_scans {
             let path = if k == 0 { ser.clone() } else { dir.join(format!("synth_scan{k}.ser")) };
-            let opts = pipeline::ReconOptions { verbose: false, ..Default::default() };
+            let opts = pipeline::ReconOptions {
+                verbose: false,
+                keep_native: true,
+                ..Default::default()
+            };
             match pipeline::reconstruct(&path, &opts) {
-                Ok(rep) => recons.push(rep.output.image),
+                Ok(rep) => {
+                    recons.push(rep.output.image.clone());
+                    reports.push(rep);
+                }
                 Err(e) => println!("scan {k} recon failed: {e}"),
             }
         }
@@ -971,6 +1267,55 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
                 // which hides a real regression: the stacker returns None when
                 // the scans are offset too far to register.
                 println!("{label:<18} stacking failed (registration returned nothing)");
+            }
+        }
+        // F5.5: native-domain stack — one resample, affine registration,
+        // per-column quality weights, iterated reference.
+        if reports.iter().all(|r| r.native_disk.is_some()) && reports.len() > 1 {
+            let inputs: Vec<stack::NativeScan> = reports
+                .iter()
+                .map(|r| stack::NativeScan {
+                    disk: r.native_disk.as_ref().unwrap(),
+                    geom: r.native_geom.unwrap(),
+                    rotation_deg: 0.0,
+                    flip_x: false,
+                    flip_y: false,
+                    canvas_c: (r.output.xc, r.output.yc),
+                    warped: &r.output.image,
+                    col_weight: stack::column_weights(
+                        &r.burst_severity,
+                        &r.column_gain,
+                        r.native_disk.as_ref().unwrap().w,
+                    ),
+                    filtered_downscale: true,
+                })
+                .collect();
+            for (label, flow) in [("Stack-nat-noflow", false), ("Stack-native", true)] {
+                let p = stack::NativeStackParams {
+                    flow,
+                    iterate: true,
+                    verbose: std::env::var("GS_STACK_DEBUG").is_ok(),
+                    reference: Some(0),
+                };
+                if let Some(srep) = stack::stack_native(&inputs, &p) {
+                    let stem = label.to_lowercase();
+                    let mx = srep.image.max();
+                    output::write_png16(&dir.join(format!("{stem}_linear.png")), &srep.image, Some((0.0, mx))).unwrap();
+                    let mut label = if srep.n_used == reports.len() {
+                        label.to_string()
+                    } else {
+                        format!("{label}[{}/{}]", srep.n_used, reports.len())
+                    };
+                    if srep.n_flipped > 0 {
+                        label = format!("{label}[flip {}]", srep.n_flipped);
+                    }
+                    match metrics::evaluate(&srep.image, &gt_blurred) {
+                        Some(m) => print_row(&label, &Some(m), &None),
+                        None => println!("{label:<18} eval failed"),
+                    }
+                } else {
+                    println!("{label:<18} stacking failed (registration returned nothing)");
+                }
             }
         }
     }
