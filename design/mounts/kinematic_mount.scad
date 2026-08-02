@@ -35,6 +35,8 @@ insertD = 5.6;       // M4 heat-set insert hole
 insertL = 8;
 springHoleD = 3.2;
 mirrorBCD = 40;      // backing-plate bolt circle (measure your mirror!)
+                     // v3 budget MPD124/MPD144: single central M4 tapped
+                     // hole -> set mirrorBoltN = 1, mirrorBCD = 0
 mirrorOffX = 0;      // mirror center offset along X (normally 0)
 mirrorBoltD = 4.4;
 mirrorBoltN = 3;
@@ -119,11 +121,13 @@ module platform() {
             at(a) translate([0,0,plateT-insertL])
                 cylinder(h=insertL+0.01, d=insertD, $fn=32);
         }
-        // OPEN spring hooks: keyhole slots run to the plate edge so the
-        // springs unhook sideways without tools (fast module swap)
+        // OPEN spring hooks: keyhole slots run to the BACK edge so the
+        // springs unhook sideways without tools (fast module swap).
+        // Back edge, not front: the front route crossed a mirror
+        // backing-bolt hole at plateW=105 and the label band.
         for (s = springs) {
             at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
-            at(s) translate([-springHoleD/2, -plateH, -plateT])
+            at(s) translate([-springHoleD/2, 0, -plateT])
                 cube([springHoleD, plateH, 3*plateT]);
         }
         // mirror backing-plate bolt circle at support-triangle centroid
