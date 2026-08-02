@@ -64,32 +64,12 @@ lines.append("gratNormAngs = [" +
 lines.append("// tuning detents: " +
              ", ".join(f"{l}={a:.1f}" for (l, a) in tunings))
 
-# ---- clearance guard: diffracted beam vs OAP1 mount slab ----
-import sys
-SLABW, SLAB1SHIFT, BEAM_D = 86.0, 0.0, 19.0
-f1 = (b(d.C1)[0] - 45.0 * math.cos(math.radians(ang(d.c1))),
-      b(d.C1)[1] - 45.0 * math.sin(math.radians(ang(d.c1))))
-ta = math.radians(ang(d.c1) + 90)
-tg, gp = (math.cos(ta), math.sin(ta)), b(d.G)
-c2b = (math.cos(math.radians(ang(d.c2))), math.sin(math.radians(ang(d.c2))))
-# solve gp + t*c2b = f1 + s*tg (face-plane crossing)
-det = c2b[0] * (-tg[1]) - c2b[1] * (-tg[0])
-rx, ry = f1[0] - gp[0], f1[1] - gp[1]
-t = (rx * (-tg[1]) - ry * (-tg[0])) / det
-s = (c2b[0] * ry - c2b[1] * rx) / det
-lo, hi = SLAB1SHIFT - SLABW / 2, SLAB1SHIFT + SLABW / 2
-if s < lo:
-    marg = (lo - s) - BEAM_D / 2          # clear below the slab edge
-elif s > hi:
-    marg = (s - hi) - BEAM_D / 2          # clear beyond the far edge
-else:
-    marg = -min(s - lo, hi - s)           # inside the slab: collision
-print(f"// GUARD diffracted beam crosses OAP1 slab plane at s={s:.1f} "
-      f"(slab spans [{lo:.0f},{hi:.0f}]) -> clearance {marg:.1f} mm")
-if 0 <= marg < 5:
-    print("// WARNING: <5 mm beam-to-slab clearance", file=sys.stderr)
-if marg < 0:
-    raise SystemExit("FATAL: diffracted beam intersects the OAP1 slab")
+# ---- clearance guard: full pairwise interference check (mech.py) ----
+# Beams are modeled at their aperture-clamped Fraunhofer fan width, not as
+# chief rays. Any negative clearance aborts the export.
+import mech
+guard_dims = {k: CHOSEN[k] for k in ("colD", "camD") if k in CHOSEN}
+mech.assert_clear(d, margin=5.0, dims=guard_dims)
 
 with open("body_geom.scad", "w") as f:
     f.write("\n".join(lines) + "\n")

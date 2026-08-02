@@ -43,7 +43,10 @@ COMMON SPECIFICATIONS for both items (these are the firm requirements):
   400 to 1100 nm
 - Reflected wavefront error: lambda/4 RMS or better at 632.8 nm over the
   clear aperture
-- Surface roughness: 10 nm RMS or better
+- Surface roughness: 2 nm RMS or better. This instrument images dark
+  structure in a dark spectral line core, so low scattered light matters
+  as much as figure. At 10 nm roughness each mirror scatters about 3
+  percent of the beam; at 2 nm this falls to about 0.1 percent.
 - Surface quality: 60-40 scratch-dig or better
 - Mounting: any standard provision is acceptable (tapped back holes,
   plain back for clamping, or a cylindrical body). We will adapt our

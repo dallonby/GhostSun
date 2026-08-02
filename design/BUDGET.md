@@ -1,5 +1,7 @@
 # Ha-only budget prototype ("sanity build") — 2026-07-31
 
+**MECH NOTE (2026-08-02):** mech.py (full-width beam interference checker) finds the diffracted-beam corridor between the slit tower and the OAP1 module infeasible for THIS GEOMETRY at real beam width; earlier clearances were chief-ray only. Do not freeze hardware from these numbers until the corridor decision in MECH.md is made. Stray-light budget: STRAYLIGHT.md.
+
 Goal: cheapest build that validates the all-reflective concept end-to-end
 (geometry, printed mounts, rotator, alignment flow, GhostSun integration)
 using owned parts wherever possible. Active CHOSEN config: T_budget_ha.

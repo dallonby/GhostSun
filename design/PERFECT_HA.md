@@ -1,5 +1,7 @@
 # PERFECT_HA — uncompromising Hα spectroheliograph design study (2026-07-31)
 
+**MECH NOTE (2026-08-02):** mech.py (full-width beam interference checker) finds the diffracted-beam corridor between the slit tower and the OAP1 module infeasible for THIS GEOMETRY at real beam width; earlier clearances were chief-ray only. Do not freeze hardware from these numbers until the corridor decision in MECH.md is made. Stray-light budget: STRAYLIGHT.md.
+
 Clean-sheet Hα-only design for the FSQ-85ED + GhostSun printed platform,
 derived from first principles with all prior assumptions re-examined.
 Analysis tools (new files, run under `design/.venv`): `perfect_ha_req.py`
