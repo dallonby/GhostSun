@@ -42,8 +42,13 @@ baseBoltD = 5.4;     // M5 to housing
 baseCboreD = 10;
 baseCboreZ = 4;
 
+/* [Swappability] */
+label = "OAP1-AU";   // embossed on the platform edge (station + coating)
+liftTabW = 22;       // finger tab on the platform's free corner
+keyFence = true;     // corner fence on the base: platform seats one way only
+
 /* [Render] */
-part = "both";       // both | base | platform
+part = "both";       // both | base | platform | base_cap
 
 m = bossMargin;
 pivot = [m, m];
@@ -72,6 +77,10 @@ module vee_groove() {           // 90-deg vee aimed at the cone (along Y)
 }
 
 module base() {
+    // corner fence: the platform seats in one orientation only
+    if (keyFence)
+        for (f = [[plateW-3, -3, 3, plateH*0.4], [-3, plateH-3, plateW*0.4, 3]])
+            translate([f[0], f[1], 0]) cube([f[2], f[3], plateT + gap*0.6]);
     difference() {
         plate();
         at(pivot) cone_seat();
@@ -87,7 +96,20 @@ module base() {
 
 module platform() {
     difference() {
-        plate();
+        union() {
+            plate();
+            // lift tab on the free corner: tool-free module removal
+            translate([plateW - 2, plateH - liftTabW - 4, 0])
+                cube([14, liftTabW, plateT]);
+        }
+        // grip grooves on the tab
+        for (g = [0:2])
+            translate([plateW + 4 + g*3, plateH - liftTabW - 5, plateT - 1.2])
+                cube([1.4, liftTabW + 2, 2]);
+        // embossed module label on the front edge (station + coating)
+        translate([plateW*0.32, 1.2, plateT*0.25]) rotate([90,0,0])
+            linear_extrude(1.4) text(label, size=plateT*0.5,
+                font="Liberation Sans:style=Bold");
         // pivot ball press-fit pocket (glue), half-ball deep
         at(pivot) translate([0,0,plateT-ballD/2])
             cylinder(h=ballD/2+0.01, d=0.98*ballD, $fn=64);
@@ -97,7 +119,13 @@ module platform() {
             at(a) translate([0,0,plateT-insertL])
                 cylinder(h=insertL+0.01, d=insertD, $fn=32);
         }
-        for (s = springs) at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        // OPEN spring hooks: keyhole slots run to the plate edge so the
+        // springs unhook sideways without tools (fast module swap)
+        for (s = springs) {
+            at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+            at(s) translate([-springHoleD/2, -plateH, -plateT])
+                cube([springHoleD, plateH, 3*plateT]);
+        }
         // mirror backing-plate bolt circle at support-triangle centroid
         for (k = [0 : mirrorBoltN-1])
             at([centroid[0] + mirrorBCD/2*cos(360*k/mirrorBoltN),
@@ -106,6 +134,18 @@ module platform() {
     }
 }
 
+// snap-on dust cap protecting the cone/vee/flat seats while a module
+// is off the instrument (grit in the vee costs arcminutes)
+module base_cap() {
+    difference() {
+        translate([-2, -2, 0]) cube([plateW*0.75, plateH*0.75, 3]);
+        translate([2, 2, -1]) cube([plateW*0.75-8, plateH*0.75-8, 3]);
+    }
+    for (p = [pivot, adjA, adjB])
+        at(p) cylinder(h=6, d=ballD*2.2, $fn=48);
+}
+
+if (part == "base_cap") base_cap();
 if (part == "base" || part == "both") base();
 if (part == "platform" || part == "both")
     translate([0, 0, part == "both" ? plateT + gap : 0])

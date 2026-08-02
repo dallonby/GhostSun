@@ -60,6 +60,23 @@ workable with lock nuts; the plates stay mirror-sized.
   at 48 mm — too coarse vs the 1.5 arcmin yaw tolerance). Lock after
   alignment as before.
 
+## Module swap (engineered-in swappability)
+
+The platform + mirror + adjusters form a married MODULE that retains its
+alignment. The cone/vee/flat coupling is a repeatable connector: unhook
+the two springs (open keyhole slots, no tools), lift by the tab, seat the
+next module, re-hook. Re-seat repeatability is far inside the 1.5 arcmin
+tolerance; verify on the live spectrum in seconds after each swap.
+
+- Print one platform per mirror module (e.g. gold pair + aluminum pair =
+  4 platforms, 2 bases). Set `label` per module ("OAP1-AU", "OAP1-AL"...).
+- Bases are keyed (corner fence) so a module seats one way only; the two
+  stations self-key by size (80 vs 105 plate).
+- Print a `base_cap` per base: it covers the seats whenever a module is
+  off. Grit in the vee costs arcminutes. Blower-puff seats before
+  re-seating.
+- Modules store face-down in a box with the cap on the ball side.
+
 ## Before printing: measure two things
 
 1. The actual bolt pattern on your Edmund mirror backs (set `mirrorBCD`,
