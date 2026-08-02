@@ -26,9 +26,9 @@ margin = 38;
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
 slab1W = 54;         // OAP1 slab (budget KM plate 48 + 6, Ø25.4 MPD124)
-slab2W = 86;         // OAP2 slab (Ø50.8 MPD246, KM plate 80)
+slab2W = 54;         // OAP2 slab (v3: Ø25.4 MPD144, KM plate 48)
 km1Hole = 16;        // KM base bolt triangle half-pitch = plateW/2 - m/2
-km2Hole = 32;        // (bossMargin m = 16 in mounts/)
+km2Hole = 16;        // (bossMargin m = 16 in mounts/)
 m5insD = 6.4; m5insL = 12;
 
 /* [Slit + snout] */
