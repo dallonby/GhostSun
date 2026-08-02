@@ -462,10 +462,11 @@ def build_chosen(lam_nm=656.28):
     """Returns (design, dims) for the CHOSEN geometry."""
     cfg = CONFIGS[CHOSEN["config"]]
     d = Design(lines_per_mm=2400.0, order=1, dev=CHOSEN["dev"],
-               s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **cfg)
+               s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"],
+               fold4=CHOSEN.get("fold4"), **cfg)
     d.build(lam_nm)
-    dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w",
-                                   "slab1_w", "slab2_w") if k in CHOSEN}
+    dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w", "slab1_w",
+                                   "slab2_w", "flat4_d") if k in CHOSEN}
     return d, dims
 
 

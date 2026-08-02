@@ -80,7 +80,9 @@ module light_path() {
     // grating -> OAP2: anamorphically widened (cos b / cos a ~ 1.6 at Ha)
     beam(gratP, oap2P, 19, 19, "red");
     // OAP2 -> sensor: converging to the spectrum image
-    beam(oap2P, sensP, 19, 3, "crimson");
+    // OAP2 -> fold flat -> sensor (v3: fixed 45-deg flat seat)
+    beam(oap2P, flat4P, 14, 8, "crimson");
+    beam(flat4P, sensP, 8, 3, "crimson");
 }
 
 module deck_labels() {
@@ -98,7 +100,7 @@ slab2F = [oap2P[0] + mirrorStack * cos(c2Ang), oap2P[1] + mirrorStack * sin(c2An
 function slabPts(f, a, w) = [for (s = [-1, 1], b = [0, 1])
     [f[0] + s * (w / 2) * cos(a + 90) - b * slabT * cos(a),
      f[1] + s * (w / 2) * sin(a + 90) - b * slabT * sin(a)]];
-allPts = concat([slitP, gratP, sensP, [0, 0]],
+allPts = concat([slitP, gratP, sensP, flat4P, [0, 0]],
                 slabPts(slab1F, c1Ang, slab1W),
                 slabPts(slab2F, c2Ang + 180, slab2W),
                 [[gratP[0], gratP[1] - rotD - 20]]);
@@ -171,6 +173,25 @@ module body() {
                 cylinder(h = snoutExt, d = scopeFlangeD, $fn = 96);
             // camera tunnel: sensor plane -> through front wall + flange
             along(sensP, dfAng) cylinder(h = camLen + 10, d = camTubeD, $fn = 96);
+            // fold-flat seat: fixed 45-deg block. fold_tol.py: flat
+            // tilt is pure image steering (tolerance unbounded), so the
+            // O25.4 flat is clamped in a plain pocket, no adjusters.
+            translate([flat4P[0], flat4P[1], 0])
+                rotate([0, 0, flat4NormAng]) difference() {
+                    translate([-16, -19, 0])
+                        cube([16, 38, beamH + 20]);
+                    translate([0, 0, beamH]) rotate([0, 90, 0]) {
+                        translate([0, 0, -6.2])
+                            cylinder(h = 6.4, d = 25.8, $fn = 96);
+                        translate([0, 0, -0.4])
+                            cylinder(h = 3, d1 = 22, d2 = 30, $fn = 96);
+                    }
+                    // radial nylon-tip grub screws (M3) to clamp the flat
+                    for (a = [90, 210, 330])
+                        translate([-3.2, 0, beamH]) rotate([a, 0, 0])
+                            rotate([0, 90, 0])
+                                cylinder(h = 30, d = 2.7, $fn = 24);
+                }
             // grating turntable seat
             translate([gratP[0], gratP[1], 0])
                 cylinder(h = 6, d = rotD + 10, $fn = 96);

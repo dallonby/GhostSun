@@ -101,6 +101,10 @@ The budget prototype was re-frozen with path 1 plus the camera swap:
   corridor is tighter (bigger fan); re-run the constrained sweep with
   production dims before ordering Edmund glass.
 
+## v3 freeze applied (2026-08-02): the budget body now IS the fold4
+layout (CHOSEN in raytrace.py, BUDGET.md rev 4); the sections below
+record how it was found.
+
 ## Fold-flat escape (2026-08-02, later the same day)
 
 FOLDS.md: plane fold mirrors turn out to dissolve both remaining

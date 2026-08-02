@@ -409,17 +409,20 @@ CONFIGS = {
 }
 
 # Chosen geometry for the CURRENT BUILD. Production broadband design:
-#   config="B_edmund_30s-45", dev=20, s2=-1, Lg=117, Lc=240 -- CORRIDOR
-#   INFEASIBLE per mech.py (MECH.md); production re-freeze pending.
-# Active: Ha-only budget prototype, Thorlabs silver MPD124 (45 deg
-# collimator) + MPD246 (60 deg camera), 7um slit, Shelyak 25mm grating,
-# IMX678 camera. FROZEN 2026-08-02 by mech.py constrained sweep: worst
-# core clearance +3.2mm, fan +0.1mm, edge blur 12.9um (+-0.5nm), exit
-# 6 deg off telescope-parallel at sensor y=70. The extra keys are the
-# mechanical envelope inputs mech.py/body_export.py verify against.
-CHOSEN = dict(config="T_budget_ha_v2", dev=21.0, s2=-1.0,
-              Lg=80.0, Lc=150.0, colD=25.4, camD=50.8,
-              grat_w=25.0, slab1_w=54.0, slab2_w=86.0)
+#   two-floor periscope layout, FOLDS.md (dev 17, Lg 315, Lc 255,
+#   lift2 s=65 h=80) -- CAD started in prod_case.scad, not yet frozen.
+# Active: Ha-only budget prototype v3 (FROZEN 2026-08-02, FOLDS.md):
+# Thorlabs silver MPD124 + MPD144 (45/45) + one O25.4 protected-silver
+# flat 46 mm after OAP2 folding the focused beam +90 deg away from the
+# telescope. Worst core clearance +4.4 mm, fan +1.7 mm, edge blur
+# 9.3 um (+-0.5 nm), R~27.7k slit-limited, ~L467 optics. The flat sits
+# in a FIXED printed seat: fold_tol.py shows its tilt tolerance is
+# unbounded (pure image steering), so it gets no adjusters.
+# Extra keys are the mechanical envelope inputs mech/body_export verify.
+CHOSEN = dict(config="T_budget_ha", dev=24.0, s2=-1.0,
+              Lg=70.0, Lc=130.0, fold4=dict(s=46.0, delta=90.0),
+              colD=25.4, camD=25.4, grat_w=25.0,
+              slab1_w=54.0, slab2_w=54.0, flat4_d=25.4)
 
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),

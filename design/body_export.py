@@ -14,7 +14,7 @@ from raytrace import Design, CONFIGS, CHOSEN, dot
 
 cfg = CONFIGS[CHOSEN["config"]]
 d = Design(lines_per_mm=2400.0, order=1, dev=CHOSEN["dev"], s2=CHOSEN["s2"],
-           Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **cfg)
+           Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], fold4=CHOSEN.get("fold4"), **cfg)
 d.build(656.28)
 
 
@@ -43,7 +43,12 @@ lines = [
     f"c0Ang   = {ang(d.c0):.3f};   // slit -> OAP1 chief",
     f"c1Ang   = {ang(d.c1):.3f};   // OAP1 -> grating (collimated)",
     f"c2Ang   = {ang(d.c2):.3f};   // grating -> OAP2 (diffracted)",
-    f"dfAng   = {ang(d.df):.3f};   // OAP2 -> sensor (focused)",
+    f"df0Ang  = {ang(d.df0):.3f};   // OAP2 -> fold flat (focused)",
+    f"dfAng   = {ang(d.df):.3f};   // final leg -> sensor",
+    f"flat4P  = [{b(d.flat4[0])[0]:.2f}, {b(d.flat4[0])[1]:.2f}];"
+    if d.flat4 else "flat4P = undef;",
+    f"flat4NormAng = {ang(d.flat4[1]):.3f}; // seat face normal"
+    if d.flat4 else "flat4NormAng = undef;",
     f"gratNormAng = {ang(d.gr.n):.3f}; // grating normal at Ha tuning",
     f"rfl1 = {cfg['rfl1']}; rfl2 = {cfg['rfl2']};",
 ]
@@ -56,7 +61,8 @@ tunings = []
 for (label, lam, lpmm) in [("CaK", 393.37, 2400.0), ("Ha", 656.28, 2400.0),
                            ("He1083", 1083.0, 1200.0)]:
     dl = Design(lines_per_mm=lpmm, order=1, dev=CHOSEN["dev"],
-                s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **cfg)
+                s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"],
+                fold4=CHOSEN.get("fold4"), **cfg)
     dl.build(lam)
     tunings.append((label, ang(dl.gr.n)))
 lines.append("gratNormAngs = [" +
@@ -69,8 +75,8 @@ lines.append("// tuning detents: " +
 # from the camera corridor. beam3 must cross by = 25, so the vane can only
 # begin downstream of the crossing plus the fan half-width plus margin.
 import mech
-guard_dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w",
-                                     "slab1_w", "slab2_w") if k in CHOSEN}
+guard_dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w", "slab1_w",
+                                     "slab2_w", "flat4_d") if k in CHOSEN}
 VANE_Y, VANE_T, VANE_END = 25.0, 3.0, 68.0
 gb, c2b2 = b(d.G), bdir(d.c2)
 t_cross = (VANE_Y - gb[1]) / c2b2[1]

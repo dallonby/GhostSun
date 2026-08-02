@@ -1,10 +1,13 @@
-# Ha-only budget prototype ("sanity build") — rev 3, 2026-08-02
+# Ha-only budget prototype ("sanity build") — rev 4 (v3), 2026-08-02
 
-**GEOMETRY RE-FROZEN 2026-08-02** after the mech.py corridor findings
-(MECH.md): camera mirror swapped MPD144 -> MPD246 (60 deg), asymmetric
-slit tower, 48 mm OAP1 KM plate, auto-placed stray vane. body_export.py
-now passes its interference guard with zero collisions and zero fan
-vignettes. Stray-light budget: STRAYLIGHT.md.
+**v3 FROZEN 2026-08-02** (FOLDS.md study): back to the cheap 45/45 pair
+(MPD124 + MPD144) plus one O25.4 protected-silver fold flat 46 mm after
+OAP2, folding the focused beam +90 deg away from the telescope. The
+flat sits in a FIXED printed seat with three nylon-tip grub screws: its
+tilt tolerance is unbounded (fold_tol.py), so no adjusters. Supersedes
+the interim MPD246 60-deg freeze (rev 3), which cost more and imaged
+worse. body_export.py guard: zero collisions, zero fan vignettes.
+Stray-light budget: STRAYLIGHT.md. Thermal: THERMAL.md.
 
 Goal: cheapest build that validates the all-reflective concept end-to-end
 (geometry, printed mounts, rotator, alignment flow, GhostSun integration)
@@ -15,7 +18,8 @@ using owned parts wherever possible. Active CHOSEN config: T_budget_ha_v2.
 | item | part | price |
 |---|---|---|
 | collimator | Thorlabs MPD124-P01 (Ø25.4, 45°, RFL 50.8, prot. silver) | £197 |
-| camera mirror | Thorlabs MPD246-P01 (Ø50.8, 60°, RFL 101.6, prot. silver) | £353 |
+| camera mirror | Thorlabs MPD144-P01 (Ø25.4, 45°, RFL 101.6, prot. silver) | £197 |
+| fold flat | Thorlabs PF10-03-P01 (Ø25.4, lambda/10, prot. silver) | £73 |
 | 4x 100 TPI fine adjusters | Thorlabs | ~£80 |
 | balls, springs, dowel, inserts, screws | — | ~£25 |
 | M42 helical focuser | generic | ~£40 |
@@ -29,23 +33,24 @@ parallel at 70 mm lateral separation and passes the interference check.)
 Owned/printed: Shelyak 2400 l/mm 25 mm grating, 7 um slit, ToupTek
 G3M678M (IMX678), FSQ-85 @ 65 mm, printed body + mounts + rotor (ASA).
 
-## Geometry (CHOSEN, frozen by mech.py sweep 2026-08-02)
+## Geometry (CHOSEN v3, frozen by fold_study.py sweep 2026-08-02)
 
-MPD124 (45 deg) + MPD246 (60 deg), dev = 21 deg off-Littrow, s2 = -1,
-Lg = 80, Lc = 150. alpha 63.7 / beta 42.7, anamorphism 0.603. Mag 2.0:
-slit image 14.0 um spatial / 8.4 um dispersion; disk image 8.4 mm on the
-7.68 mm IMX678 axis -> poles clip ~9% (unchanged; IMX571 path un-clips).
-Worst core-beam clearance +3.2 mm (beam3 vs slit tower); diffraction-fan
-wings graze the tower blade at +0.1 mm by design -> flock that face
-(STRAYLIGHT.md). Camera exits at -174 deg (6 deg off telescope-parallel),
-sensor at body (-46, 70).
+MPD124 + MPD144 (45/45), dev = 24 deg off-Littrow, s2 = -1, Lg = 70,
+Lc = 130, fold flat at 46 mm after OAP2 folding +90 deg. alpha 65.6 /
+beta 41.6, anamorphism 0.552. Mag 2.0: slit image 14.0 um spatial /
+7.7 um dispersion; disk image 8.4 mm on the 7.68 mm IMX678 axis ->
+poles clip ~9% (unchanged; IMX571 production path un-clips).
+Worst core-beam clearance +4.4 mm; worst fan +1.7 mm (no grazes this
+time; flock the tower blade anyway). Sensor at body (-17, 104), camera
+exits through the top back corner at 114 deg: fully decoupled from the
+telescope side.
 
 ## Performance at Ha (+-0.5 nm window, RMS radii)
 
-- Blur: 2.6 um (center) / 12.9 um (disk edge) / ~30 um (slit end) vs
-  14 um slit image. The 45/60 pair gives up ~4 um at the edge vs the
-  collision-impossible 45/45; center of disk is unaffected.
-- R ~ 26,000 slit-limited (0.025 nm) — resolves the 0.05 nm core.
+- Blur: 2.0 um (center) / 9.3 um (disk edge) / ~20 um (slit end) vs
+  14 um slit image.
+- R ~ 27,700 slit-limited (0.024 nm) — resolves the 0.05 nm core.
+- One extra silver reflection: ~2.5% light, ~0.15% veil (2 nm flat).
 - Throughput: silver^2 (~95%) x grating 88% ~ 84% net — HIGHER than the
   production Al design at Ha (81% x 94% ~ 76%). The short collimator's
   tight fan is why the 25 mm grating stops mattering.
@@ -58,7 +63,7 @@ sensor at body (-46, 70).
 - Ha only: silver kills Ca K (~25% net at 393). He I 1083 remains
   possible later (silver ~98% there; needs the 1200 l/mm grating and the
   10 um slit; collimator fan is marginal at Ø25.4 — check before buying).
-- Slit ends soft (~30 um) — full-disk work lives inside the good field.
+- Slit ends soft (~20 um) — full-disk work lives inside the good field.
 - Disk pole clip ~9% on IMX678.
 
 ## Upgrade path
