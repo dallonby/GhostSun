@@ -32,7 +32,8 @@ from raytrace import (Design, CONFIGS, CHOSEN, add, sub, mul, dot, cross,
 
 # ---------------------------------------------------------------- dims ----
 DIMS = dict(
-    slab_w=86.0,        # KM plate 80 + 6 (shg_body slab1W/slab2W)
+    slab1_w=86.0,       # OAP1 KM plate + 6 (shg_body slab1W)
+    slab2_w=86.0,       # OAP2 KM plate + 6 (shg_body slab2W)
     slab_half_x=43.0,   # vertical half-extent of a mirror module
     module_depth=59.0,  # mirror face -> back of mount slab (mirrorStack+slabT)
     rotor_r=28.0,       # grating turntable radius (rotD/2)
@@ -44,9 +45,18 @@ DIMS = dict(
     cam_body=(15.0, 85.0),     # extent along df relative to the sensor plane
     snout_r=28.0,       # scopeFlangeD/2
     snout=(-88.0, -38.0),      # snout extent along z (wall face to tip)
-    scope_r=50.0,       # FSQ-85 tube + fittings (knobs excluded, see note)
-    scope=(-540.0, -90.0),     # OTA extent along z behind the snout tip
-    tower_half=(37.5, 10.0, 10.0),  # slit tower half sizes (x, y, z)
+    # FSQ-85 OTA in two segments behind the M48 face at the snout tip:
+    # focuser drawtube + adapter stack first, then the main tube.
+    scope_r=35.0,       # focuser/drawtube radius
+    scope=(-190.0, -90.0),     # drawtube extent along z
+    scope2_r=50.0,      # main tube radius (focuser knobs excluded)
+    scope2=(-540.0, -190.0),   # main tube extent along z
+    # Slit tower, CAD-true asymmetric footprint (shg_body.scad): the
+    # downstream face is a thin blade wall at z = tower_z[1] (the beam3
+    # side), the cartridge structure extends upstream to tower_z[0].
+    tower_y_half=10.0,  # across-beam half width (cartridge + walls)
+    tower_z=(-10.0, 4.0),  # upstream/downstream faces (blade at +4)
+    tower_x_half=37.5,  # vertical half extent
     cell_depth=22.0,    # mirror + cell depth at the module face
     tower_cx=-22.5,     # tower box center height (deck at -beamH)
     slit_w_um=7.0,      # slit width for the Fraunhofer fan
@@ -192,7 +202,7 @@ def build_solids(d, dims=None):
         dm.update(dims)
     X = (1.0, 0.0, 0.0)
 
-    def module(name, face_center, back_dir, mirror_d):
+    def module(name, face_center, back_dir, mirror_d, slab_w):
         """Two boxes: the mirror in its cell at the face, and the KM
         plate/slab stack behind it (only the slab is slab_w wide; beside
         the cell, the first cell_depth mm is free air)."""
@@ -207,26 +217,40 @@ def build_solids(d, dims=None):
         slab = Box(name + "_mount",
                    add(face_center, mul(a1, cell_d + slab_d / 2.0)),
                    [a1, X, a3],
-                   [slab_d / 2.0, dm["slab_half_x"], dm["slab_w"] / 2.0])
+                   [slab_d / 2.0, dm["slab_half_x"], slab_w / 2.0])
         return [cell, slab]
 
+    z0, z1 = dm["tower_z"]
     solids = [
-        Box("slit_tower", (dm["tower_cx"], 0.0, 0.0),
+        Box("slit_tower", (dm["tower_cx"], 0.0, (z0 + z1) / 2.0),
             [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
-            list(dm["tower_half"])),
-        *module("oap1", d.C1, mul(d.c1, -1.0), dm.get("colD", 50.8)),
-        *module("oap2", d.C2, d.c2, dm.get("camD", 76.2)),
+            [dm["tower_x_half"], dm["tower_y_half"], (z1 - z0) / 2.0]),
+        *module("oap1", d.C1, mul(d.c1, -1.0), dm.get("colD", 50.8),
+                dm["slab1_w"]),
+        *module("oap2", d.C2, d.c2, dm.get("camD", 76.2), dm["slab2_w"]),
         Capsule("rotor", (-60.0, d.G[1], d.G[2]), (40.0, d.G[1], d.G[2]),
                 dm["rotor_r"]),
         Capsule("snout", (0.0, 0.0, dm["snout"][0]),
                 (0.0, 0.0, dm["snout"][1]), dm["snout_r"]),
         Capsule("telescope", (0.0, 0.0, dm["scope"][0]),
                 (0.0, 0.0, dm["scope"][1]), dm["scope_r"]),
+        Capsule("telescope_ota", (0.0, 0.0, dm["scope2"][0]),
+                (0.0, 0.0, dm["scope2"][1]), dm["scope2_r"]),
         Capsule("camera_front", add(d.F2, mul(d.df, dm["cam_front"][0])),
                 add(d.F2, mul(d.df, dm["cam_front"][1])), dm["cam_front_r"]),
         Capsule("camera_body", add(d.F2, mul(d.df, dm["cam_body"][0])),
                 add(d.F2, mul(d.df, dm["cam_body"][1])), dm["cam_body_r"]),
     ]
+    # stray-light vane (optional): vertical strip at y = vane[2],
+    # from world z = vane[0] to vane[1], thickness vane[3]. body_export
+    # computes vane[0] so the diffracted fan clears it.
+    if dm.get("vane"):
+        x0, x1, vy, vt = dm["vane"]
+        solids.append(Box("vane", (2.5, vy + vt / 2.0, (x0 + x1) / 2.0),
+                          [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+                           (0.0, 0.0, 1.0)],
+                          [62.5, vt / 2.0, (x1 - x0) / 2.0]))
+
     # grating tuning arm: body angle = ang(gr normal) + 270 (shg_body.scad)
     th = math.atan2(d.gr.n[1], d.gr.n[2]) + math.radians(270.0)
     arm_dir = (0.0, math.sin(th), math.cos(th))
@@ -271,6 +295,8 @@ _SKIP = {  # rigidly connected pairs: contact is by construction
     frozenset(("oap2_cell", "oap2_mount")),
     frozenset(("camera_front", "camera_body")),
     frozenset(("snout", "telescope")),
+    frozenset(("snout", "telescope_ota")),
+    frozenset(("telescope", "telescope_ota")),
     frozenset(("slit_tower", "snout")),
 }
 
@@ -339,7 +365,8 @@ def build_chosen(lam_nm=656.28):
     d = Design(lines_per_mm=2400.0, order=1, dev=CHOSEN["dev"],
                s2=CHOSEN["s2"], Lg=CHOSEN["Lg"], Lc=CHOSEN["Lc"], **cfg)
     d.build(lam_nm)
-    dims = {k: CHOSEN[k] for k in ("colD", "camD") if k in CHOSEN}
+    dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w",
+                                   "slab1_w", "slab2_w") if k in CHOSEN}
     return d, dims
 
 

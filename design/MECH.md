@@ -77,6 +77,30 @@ Recommendation: path 1. It is a mechanical change only (tower + OAP1
 plate), keeps PERFECT_HA-class optics, and turns the fan clip into a
 designed, flocked baffle edge instead of an accident.
 
+## Re-freeze record (2026-08-02)
+
+The budget prototype was re-frozen with path 1 plus the camera swap:
+
+* config T_budget_ha_v2: MPD124 45 deg collimator + MPD246 60 deg camera
+  (the 45/45 pair's exit converges 25 deg onto the OTA; no placement
+  clears it. The 60 deg fold exits 6 deg off parallel and clears the
+  two-segment FSQ-85 envelope: drawtube r35 to -190, tube r50 beyond).
+* CHOSEN = dev 21.0, s2 -1, Lg 80, Lc 150 from the constrained sweep
+  (both fold senses swept; s2=+1 feasible but always blurrier). Worst
+  core clearance +3.2 mm, fan +0.1 mm (grazes the tower blade: flocked,
+  budgeted in STRAYLIGHT.md). Edge blur 12.9 um, center 2.6 um.
+* Slit tower slimmed to the CAD-true asymmetric footprint: bx -10..+4
+  with the +4 blade wall, across-beam width +-10 (was +-17).
+* OAP1 KM plate 48 mm (slab 54, km1Hole 16): lever 16 mm -> 0.9 deg/turn
+  on 100 TPI, ~7x finer than the arcminute tolerances need.
+* NEW CATCH while re-freezing: the stray-light vane at by=25 spanned the
+  full box and blocked beam3 in the rev-2 committed body. body_export.py
+  now computes vaneX0 from the traced fan crossing (+4 mm margin), emits
+  it into body_geom.scad, and the vane is a mech.py solid in the guard.
+* Production (B_edmund) remains unfrozen: same recipe applies but the
+  corridor is tighter (bigger fan); re-run the constrained sweep with
+  production dims before ordering Edmund glass.
+
 ## Checker limitations
 
 * Envelope dimensions default to shg_body.scad values (86 mm slabs,

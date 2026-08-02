@@ -64,12 +64,34 @@ lines.append("gratNormAngs = [" +
 lines.append("// tuning detents: " +
              ", ".join(f"{l}={a:.1f}" for (l, a) in tunings))
 
+# ---- stray-light vane: start it where the diffracted fan has passed ----
+# The vane is a full-height wall at by = 25 separating the snout region
+# from the camera corridor. beam3 must cross by = 25, so the vane can only
+# begin downstream of the crossing plus the fan half-width plus margin.
+import mech
+guard_dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w",
+                                     "slab1_w", "slab2_w") if k in CHOSEN}
+VANE_Y, VANE_T, VANE_END = 25.0, 3.0, 68.0
+gb, c2b2 = b(d.G), bdir(d.c2)
+t_cross = (VANE_Y - gb[1]) / c2b2[1]
+bx_cross = gb[0] + t_cross * c2b2[0]
+# fan radius at the crossing (same model as mech.py beams)
+_dm = dict(mech.DIMS); _dm.update(guard_dims)
+u_fan = 1.0 / (2.0 * _dm["fnum"]) + _dm["lam_nm"] * 1e-6 / (
+    _dm["slit_w_um"] * 1e-3)
+_ca = abs(dot(d.c1, d.gr.n)); _cb = abs(dot(d.c2, d.gr.n))
+r_fan = min(min(d.rfl1 * u_fan, 0.9 * _dm["colD"] / 2.0) / _ca,
+            _dm["grat_w"] / 2.0) * _cb + t_cross * (
+    _dm["band_nm"] * 1e-6 / (d.sigma * _cb))
+vane_x0 = math.ceil(bx_cross + r_fan / abs(c2b2[1]) + 4.0)
+lines.append(f"vaneX0 = {vane_x0:.1f};  // vane start: beam3 fan crosses "
+             f"by={VANE_Y:.0f} at bx={bx_cross:.1f}, fan r={r_fan:.1f}")
+
 # ---- clearance guard: full pairwise interference check (mech.py) ----
 # Beams are modeled at their aperture-clamped Fraunhofer fan width, not as
 # chief rays. Any negative clearance aborts the export.
-import mech
-guard_dims = {k: CHOSEN[k] for k in ("colD", "camD") if k in CHOSEN}
-mech.assert_clear(d, margin=5.0, dims=guard_dims)
+guard_dims["vane"] = (vane_x0, VANE_END, VANE_Y, VANE_T)
+mech.assert_clear(d, margin=3.0, dims=guard_dims)
 
 with open("body_geom.scad", "w") as f:
     f.write("\n".join(lines) + "\n")

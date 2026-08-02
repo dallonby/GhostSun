@@ -46,8 +46,8 @@ by across):
 * production dev+16, Lg180: zero order leaves the grating toward the
   entry-side wall, first structure ~30 mm from the grating on the wall
   beyond it. Trap: matte black wedge behind/beside the grating turntable.
-* budget dev+25, Lg85: same topology, wall hit ~91 mm out, ~120 mm from
-  the sensor. Same trap concept.
+* budget (frozen dev+21, Lg80): same topology, wall hit ~96 mm out,
+  ~120 mm from the sensor. Same trap concept.
 
 The zero order is also the alignment lamp: make the trap removable or
 hinged, because zero-order autocollimation sets slit/OAP1 despace.

@@ -149,7 +149,9 @@ def run():
     order_map(d, dims, "production B_edmund dev+16 Lg180 Lc290")
 
     db, dimsb = mech.build_chosen()
-    order_map(db, dimsb, "budget T_budget_ha dev+25 Lg85 Lc175")
+    from raytrace import CHOSEN
+    order_map(db, dimsb, f"budget {CHOSEN['config']} dev+{CHOSEN['dev']:.0f} "
+              f"Lg{CHOSEN['Lg']:.0f} Lc{CHOSEN['Lc']:.0f}")
 
     tis_table()
     veiling_budget()

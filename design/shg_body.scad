@@ -25,9 +25,9 @@ margin = 38;
 /* [Mirror mounts] */
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
-slab1W = 86;         // OAP1 slab (KM plate 80 + 6): mirror-sized plates
-slab2W = 86;         // OAP2 slab (Ø50.8 mirror, KM plate 80)
-km1Hole = 32;        // KM base bolt triangle half-pitch = plateW/2 - m/2
+slab1W = 54;         // OAP1 slab (budget KM plate 48 + 6, Ø25.4 MPD124)
+slab2W = 86;         // OAP2 slab (Ø50.8 MPD246, KM plate 80)
+km1Hole = 16;        // KM base bolt triangle half-pitch = plateW/2 - m/2
 km2Hole = 32;        // (bossMargin m = 16 in mounts/)
 m5insD = 6.4; m5insL = 12;
 
@@ -157,9 +157,12 @@ module body() {
             }
             mirror_slab(slab1F, c1Ang, slab1W, km1Hole);
             mirror_slab(slab2F, c2Ang + 180, slab2W, km2Hole);
-            // slit tower
+            // slit tower: asymmetric footprint (MECH.md). The
+            // downstream face at bx=+4 is a thin blade wall (flock it:
+            // the diffracted fan passes just beyond), and the across-beam
+            // width is the cartridge minimum, not the old +-17.
             linear_extrude(beamH + slitSlideH)
-                translate([-10, -17]) square([14, 34]);
+                translate([-10, -10]) square([14, 20]);
             // snout: front wall -> slit tower (enclosed square tunnel)
             translate([minX, -snoutID / 2 - wallT, beamH - snoutID / 2 - wallT])
                 cube([-minX - 8, snoutID + 2 * wallT, snoutID + 2 * wallT]);
@@ -181,8 +184,8 @@ module body() {
             // that the OAP1 mount slab is the separator, and the mirror
             // substrate envelope must stay clear.
             linear_extrude(wallH)
-                translate([minX + wallT - eps, 25])
-                    square([68 - minX - wallT + eps, 3]);
+                translate([vaneX0, 25])
+                    square([68 - vaneX0, 3]);
         }
         // slit cartridge pocket + optical opening (tilted about vertical)
         translate([0, 0, beamH]) rotate([0, 0, slitTilt]) {

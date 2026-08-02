@@ -289,14 +289,24 @@ CONFIGS = {
     "E_edmund_30-30": dict(rfl1=108.89, th1=30.0, rfl2=272.23, th2=30.0),
     # Ha-only budget prototype: Thorlabs protected silver, in stock, £394/pair
     "T_budget_ha": dict(rfl1=50.8, th1=45.0, rfl2=101.6, th2=45.0),
+    # v2: MPD124 collimator + MPD246 60 deg camera (£353). The 60 deg fold
+    # exits the camera parallel to the telescope (kills the 45/45 pair's
+    # convergent-exit collision family). Frozen via mech.py sweep.
+    "T_budget_ha_v2": dict(rfl1=50.8, th1=45.0, rfl2=101.6, th2=60.0),
 }
 
 # Chosen geometry for the CURRENT BUILD. Production broadband design:
-#   config="B_edmund_30s-45", dev=20, s2=-1, Lg=117, Lc=240 (RESULTS.md)
-# Active: Ha-only budget prototype on Thorlabs silver (MPD124+MPD144),
-# 7um slit, Shelyak 25mm grating, IMX678 camera.
-CHOSEN = dict(config="T_budget_ha", dev=25.0, s2=-1.0,
-              Lg=85.0, Lc=175.0, colD=25.4, camD=25.4)
+#   config="B_edmund_30s-45", dev=20, s2=-1, Lg=117, Lc=240 -- CORRIDOR
+#   INFEASIBLE per mech.py (MECH.md); production re-freeze pending.
+# Active: Ha-only budget prototype, Thorlabs silver MPD124 (45 deg
+# collimator) + MPD246 (60 deg camera), 7um slit, Shelyak 25mm grating,
+# IMX678 camera. FROZEN 2026-08-02 by mech.py constrained sweep: worst
+# core clearance +3.2mm, fan +0.1mm, edge blur 12.9um (+-0.5nm), exit
+# 6 deg off telescope-parallel at sensor y=70. The extra keys are the
+# mechanical envelope inputs mech.py/body_export.py verify against.
+CHOSEN = dict(config="T_budget_ha_v2", dev=21.0, s2=-1.0,
+              Lg=80.0, Lc=150.0, colD=25.4, camD=50.8,
+              grat_w=25.0, slab1_w=54.0, slab2_w=86.0)
 
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),
