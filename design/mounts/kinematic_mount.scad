@@ -34,6 +34,8 @@ bossMargin = 16;     // corner margin / boss diameter
 insertD = 5.6;       // M4 heat-set insert hole
 insertL = 8;
 springHoleD = 3.2;
+mirrorD = 76.2;      // mirror diameter; hooks are kept clear of it.
+                     // Print the v3 budget pair with mirrorD = 25.4.
 mirrorBCD = 40;      // backing-plate bolt circle (measure your mirror!)
                      // v3 budget MPD124/MPD144: single central M4 tapped
                      // hole -> set mirrorBoltN = 1, mirrorBCD = 0
@@ -56,9 +58,14 @@ m = bossMargin;
 pivot = [m, m];
 adjA  = [m, m + leverArm];   // vee -> pitch
 adjB  = [m + leverArm, m];   // flat -> yaw
-springs = [[m + 0.35*leverArm, m + 0.35*leverArm],
-           [m + 0.60*leverArm, m + 0.60*leverArm]];
 centroid = [(pivot[0]+adjA[0]+adjB[0])/3 + mirrorOffX, (pivot[1]+adjA[1]+adjB[1])/3];
+// Springs sit symmetric about the plate diagonal, outside the mirror
+// footprint (hooks bear on the platform's outer face, which the mirror
+// must not cover). The pair's resultant still acts at the contact
+// centroid, inside the cone/vee/flat triangle.
+springOff = (mirrorD/2 + 8) / sqrt(2);
+springs = [[centroid[0] + springOff, centroid[1] - springOff],
+           [centroid[0] - springOff, centroid[1] + springOff]];
 
 module plate() { cube([plateW, plateH, plateT]); }
 
@@ -88,10 +95,18 @@ module base() {
         at(pivot) cone_seat();
         at(adjA) vee_groove();
         // flat at adjB: untouched surface
-        for (s = springs) at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        for (s = springs) {
+            at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+            // hook recess on the slab side: the spring hook must not be
+            // squeezed between the base and the housing wall
+            at(s) cylinder(h=4, d=10, $fn=32);
+        }
         for (c = [[plateW-m/2, plateH-m/2], [plateW-m/2, m/2], [m/2, plateH-m/2]]) {
             at(c) cylinder(h=3*plateT, d=baseBoltD, center=true, $fn=32);
-            at(c) cylinder(h=baseCboreZ, d=baseCboreD, $fn=32);
+            // bolt heads recess into the platform-side face (the other
+            // face sits flat on the housing slab)
+            at(c) translate([0, 0, plateT - baseCboreZ])
+                cylinder(h=baseCboreZ + 0.01, d=baseCboreD, $fn=32);
         }
     }
 }
@@ -121,15 +136,16 @@ module platform() {
             at(a) translate([0,0,plateT-insertL])
                 cylinder(h=insertL+0.01, d=insertD, $fn=32);
         }
-        // OPEN spring hooks: keyhole slots run to the BACK edge so the
-        // springs unhook sideways without tools (fast module swap).
-        // Back edge, not front: the front route crossed a mirror
-        // backing-bolt hole at plateW=105 and the label band.
-        for (s = springs) {
-            at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
-            at(s) translate([-springHoleD/2, 0, -plateT])
-                cube([springHoleD, plateH, 3*plateT]);
-        }
+        // OPEN spring hooks: keyhole slots run to each spring's nearest
+        // free edge (slot 0 -> +X, slot 1 -> +Y) so the springs unhook
+        // sideways without tools (fast module swap). Routes verified
+        // clear of every hole at plateW 48 and 105.
+        at(springs[0]) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        at(springs[0]) translate([0, -springHoleD/2, -plateT])
+            cube([plateW, springHoleD, 3*plateT]);
+        at(springs[1]) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        at(springs[1]) translate([-springHoleD/2, 0, -plateT])
+            cube([springHoleD, plateH, 3*plateT]);
         // mirror backing-plate bolt circle at support-triangle centroid
         for (k = [0 : mirrorBoltN-1])
             at([centroid[0] + mirrorBCD/2*cos(360*k/mirrorBoltN),
