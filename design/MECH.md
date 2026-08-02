@@ -101,6 +101,16 @@ The budget prototype was re-frozen with path 1 plus the camera swap:
   corridor is tighter (bigger fan); re-run the constrained sweep with
   production dims before ordering Edmund glass.
 
+## Fold-flat escape (2026-08-02, later the same day)
+
+FOLDS.md: plane fold mirrors turn out to dissolve both remaining
+problems. Budget: one Ø25.4 flat after OAP2 lets the cheaper/sharper
+45/45 pair replace the MPD246 (candidate v3). Production: a two-flat
+vertical periscope in the collimated beam puts the grating floor 80 mm
+up and makes the PERFECT_HA-class geometry legal (dev 17, Lg 315,
+Lc 255). Alignment cost of the flats: zero (fold_tol.py). Thermal:
+THERMAL.md / thermal.py.
+
 ## Checker limitations
 
 * Envelope dimensions default to shg_body.scad values (86 mm slabs,

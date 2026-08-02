@@ -141,7 +141,17 @@ class Design:
          signed: + folds back toward the collimator side."""
 
     def __init__(self, rfl1, th1, rfl2, th2, lines_per_mm, order,
-                 dev=35.0, s2=1.0, Lg=90.0, Lc=90.0):
+                 dev=35.0, s2=1.0, Lg=90.0, Lc=90.0,
+                 fold2=None, fold3=None, fold4=None, lift3=None,
+                 lift2=None):
+        """fold2/fold3/fold4: optional in-plane fold FLATS,
+        dict(s=..., delta=...). fold2 sits in the collimated beam s mm
+        after OAP1 (relocates the grating and everything downstream);
+        fold3 sits in the collimated diffracted beam s mm after the
+        grating; fold4 sits in the converging beam s mm after OAP2.
+        delta = in-plane change of the chief direction (deg, +x rotation
+        sense). Plane mirrors add NO aberration; they only relocate
+        everything downstream (Lc and rfl2 are PATH lengths)."""
         self.rfl1, self.th1 = rfl1, th1
         self.rfl2, self.th2 = rfl2, th2
         self.sigma = 1.0 / lines_per_mm
@@ -149,6 +159,13 @@ class Design:
         self.dev = dev
         self.s2 = s2
         self.Lg, self.Lc = Lg, Lc
+        self.fold2, self.fold3, self.fold4 = fold2, fold3, fold4
+        self.lift2 = lift2   # dict(s=..., h=...): periscope in beam2:
+        # grating and everything downstream move to level x=+h
+        self.lift3 = lift3   # dict(s=..., h=...): vertical periscope
+        # in the diffracted beam: two 45-degree flats lift the beam +h in
+        # x (along the slit axis). Two reflections: no chirality flip,
+        # dev/s2 keep their unfolded meanings; exactly aberration-free.
 
     def build(self, lam0_nm):
         """Position everything; tune grating so the chief at lam0 leaves at
@@ -164,7 +181,30 @@ class Design:
         C1 = mul(c0, self.rfl1)
         assert abs(ang(sub(C1, S), c0)) < 1e-9
 
-        G = add(C1, mul(c1, self.Lg))
+        # optional vertical periscope in the collimated beam: the
+        # grating and everything after it live at level x = +h
+        if self.lift2:
+            sl2, hl2 = self.lift2["s"], self.lift2["h"]
+            up2 = (1.0, 0.0, 0.0)
+            QA = add(C1, mul(c1, sl2))
+            QB = add(QA, mul(up2, hl2))
+            self.lift2A = (QA, norm(sub(up2, c1)))
+            self.lift2B = (QB, norm(sub(c1, up2)))
+        else:
+            self.lift2A = self.lift2B = None
+        # optional fold flat in the collimated beam before the grating
+        if self.fold2:
+            s2f, d2f = self.fold2["s"], self.fold2["delta"]
+            P2f = add(C1, mul(c1, s2f))
+            c1b = rot_x(c1, d2f)
+            self.flat2 = (P2f, norm(sub(c1b, c1)))
+            G = add(P2f, mul(c1b, self.Lg - s2f))
+        else:
+            c1b, self.flat2 = c1, None
+            if self.lift2:
+                G = add(QB, mul(c1, self.Lg - sl2 - hl2))
+            else:
+                G = add(C1, mul(c1, self.Lg))
         gvec = (1.0, 0.0, 0.0)
 
         # Find grating rotation gamma (about x) so the diffracted chief
@@ -177,14 +217,15 @@ class Design:
         target = self.dev
 
         def diff_dir(gamma):
-            n = rot_x(mul(c1, -1.0), gamma)       # normal facing the beam
+            n = rot_x(mul(c1b, -1.0), gamma)      # normal facing the beam
             gr = Grating(G, n, gvec, self.sigma, self.m)
-            r = gr.intersect_diffract(C1, c1, lam)
+            r = gr.intersect_diffract(sub(G, mul(c1b, 10.0)), c1b, lam)
             return (gr, r[1]) if r else (gr, None)
 
         def psi_of(d2):
-            s = dot(cross(c1, d2), (1.0, 0.0, 0.0))
-            return math.copysign(180.0 - ang(c1, d2), s if s != 0 else 1.0)
+            s = dot(cross(c1b, d2), (1.0, 0.0, 0.0))
+            return math.copysign(180.0 - ang(c1b, d2),
+                                 s if s != 0 else 1.0)
 
         best = None
         prev = None
@@ -220,16 +261,49 @@ class Design:
             raise RuntimeError(f"tune landed at psi={got:.2f}, want {target}")
 
         th2 = self.th2
-        C2 = add(G, mul(c2, self.Lc))
-        df = rot_x(c2, self.s2 * (180.0 - th2))   # focused chief direction
-        assert abs(ang(c2, df) - (180.0 - th2)) < 1e-6
-        F2 = add(C2, mul(df, self.rfl2))
+        # optional vertical periscope in the diffracted beam
+        if self.lift3:
+            sl, hl = self.lift3["s"], self.lift3["h"]
+            up = (1.0, 0.0, 0.0)
+            PA = add(G, mul(c2, sl))
+            PB = add(PA, mul(up, hl))
+            self.liftA = (PA, norm(sub(up, c2)))
+            self.liftB = (PB, norm(sub(c2, up)))
+        else:
+            self.liftA = self.liftB = None
+        # optional fold flat in the collimated diffracted beam
+        if self.fold3:
+            s3, d3 = self.fold3["s"], self.fold3["delta"]
+            P3 = add(G, mul(c2, s3))
+            c2b = rot_x(c2, d3)
+            self.flat3 = (P3, norm(sub(c2b, c2)))
+            C2 = add(P3, mul(c2b, self.Lc - s3))
+        else:
+            c2b, self.flat3 = c2, None
+            if self.lift3:
+                C2 = add(PB, mul(c2, self.Lc - sl - hl))
+            else:
+                C2 = add(G, mul(c2, self.Lc))
+        df0 = rot_x(c2b, self.s2 * (180.0 - th2))  # focused chief direction
+        assert abs(ang(c2b, df0) - (180.0 - th2)) < 1e-6
+        # the paraboloid's own focus is the UNFOLDED focal point; a fold4
+        # flat relocates the physical focus F2 without touching the shape
+        F2u = add(C2, mul(df0, self.rfl2))
         P2 = self.rfl2 * (1.0 + math.cos(math.radians(th2))) / 2.0
-        oap2 = Paraboloid(F2, mul(c2, -1.0), P2)
+        oap2 = Paraboloid(F2u, mul(c2b, -1.0), P2)
+        if self.fold4:
+            s4, d4 = self.fold4["s"], self.fold4["delta"]
+            P4 = add(C2, mul(df0, s4))
+            df = rot_x(df0, d4)
+            self.flat4 = (P4, norm(sub(df, df0)))
+            F2 = add(P4, mul(df, self.rfl2 - s4))
+        else:
+            df, F2, self.flat4 = df0, F2u, None
 
         self.oap1, self.oap2 = oap1, oap2
         self.S, self.C1, self.G, self.C2, self.F2 = S, C1, G, C2, F2
         self.c0, self.c1, self.c2, self.df = c0, c1, c2, df
+        self.c1b, self.c2b, self.df0 = c1b, c2b, df0
         # sensor frame: origin F2, normal df; xs ~ world x, ys completes
         ns = mul(df, -1.0)
         xs = sub((1.0, 0.0, 0.0), mul(ns, ns[0]))
@@ -255,12 +329,38 @@ class Design:
             r1 = self.oap1.intersect_reflect(o0, d)
             if r1 is None:
                 continue
+            if self.lift2A:
+                r1 = plane_reflect(r1[0], r1[1], self.lift2A)
+                if r1 is None:
+                    continue
+                r1 = plane_reflect(r1[0], r1[1], self.lift2B)
+                if r1 is None:
+                    continue
+            if self.flat2:
+                r1 = plane_reflect(r1[0], r1[1], self.flat2)
+                if r1 is None:
+                    continue
             r2 = self.gr.intersect_diffract(r1[0], r1[1], lam)
             if r2 is None:
                 continue
+            if self.liftA:
+                r2 = plane_reflect(r2[0], r2[1], self.liftA)
+                if r2 is None:
+                    continue
+                r2 = plane_reflect(r2[0], r2[1], self.liftB)
+                if r2 is None:
+                    continue
+            if self.flat3:
+                r2 = plane_reflect(r2[0], r2[1], self.flat3)
+                if r2 is None:
+                    continue
             r3 = self.oap2.intersect_reflect(r2[0], r2[1])
             if r3 is None:
                 continue
+            if self.flat4:
+                r3 = plane_reflect(r3[0], r3[1], self.flat4)
+                if r3 is None:
+                    continue
             o, dd = r3
             dn = dot(dd, self.sens_n)
             if abs(dn) < 1e-15:
@@ -270,6 +370,19 @@ class Design:
             q = sub(hit, self.F2)
             pts.append((dot(q, self.sens_x), dot(q, self.sens_y)))
         return pts
+
+
+def plane_reflect(o, d, plane):
+    """Reflect ray (o, d) off an infinite plane mirror (point, normal)."""
+    p, n = plane
+    dn = dot(d, n)
+    if abs(dn) < 1e-15:
+        return None
+    t = dot(sub(p, o), n) / dn
+    if t < 1e-9:
+        return None
+    hit = add(o, mul(d, t))
+    return hit, reflect(d, n)
 
 
 def stats(pts):

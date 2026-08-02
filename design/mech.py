@@ -66,6 +66,8 @@ DIMS = dict(
     trim=22.0,          # ignore this much beam near its own end elements
     grat_w=25.0,        # grating ruled width in the dispersion plane (mm)
     ca_frac=0.9,        # clear-aperture fraction of mirror diameters
+    flat3_d=50.8,       # fold-flat diameters (when the Design has folds)
+    flat4_d=50.8,
 )
 
 
@@ -227,9 +229,11 @@ def build_solids(d, dims=None):
             [dm["tower_x_half"], dm["tower_y_half"], (z1 - z0) / 2.0]),
         *module("oap1", d.C1, mul(d.c1, -1.0), dm.get("colD", 50.8),
                 dm["slab1_w"]),
-        *module("oap2", d.C2, d.c2, dm.get("camD", 76.2), dm["slab2_w"]),
-        Capsule("rotor", (-60.0, d.G[1], d.G[2]), (40.0, d.G[1], d.G[2]),
-                dm["rotor_r"]),
+        *module("oap2", d.C2, getattr(d, "c2b", d.c2),
+                dm.get("camD", 76.2), dm["slab2_w"]),
+        Capsule("rotor", (d.G[0] - dm.get("rotor_below", 60.0),
+                          d.G[1], d.G[2]),
+                (d.G[0] + 40.0, d.G[1], d.G[2]), dm["rotor_r"]),
         Capsule("snout", (0.0, 0.0, dm["snout"][0]),
                 (0.0, 0.0, dm["snout"][1]), dm["snout_r"]),
         Capsule("telescope", (0.0, 0.0, dm["scope"][0]),
@@ -251,11 +255,49 @@ def build_solids(d, dims=None):
                            (0.0, 0.0, 1.0)],
                           [62.5, vt / 2.0, (x1 - x0) / 2.0]))
 
-    # grating tuning arm: body angle = ang(gr normal) + 270 (shg_body.scad)
-    th = math.atan2(d.gr.n[1], d.gr.n[2]) + math.radians(270.0)
+    # grating tuning arm: body angle = ang(gr normal) + arm_side
+    # (270 in shg_body.scad today; 90 flips it to the other side of the
+    # rotor when the folded diffracted beam needs that quadrant)
+    th = math.atan2(d.gr.n[1], d.gr.n[2]) + math.radians(
+        dm.get("arm_side", 270.0))
     arm_dir = (0.0, math.sin(th), math.cos(th))
     solids.append(Capsule("arm", d.G, add(d.G, mul(arm_dir, dm["arm_len"])),
                           dm["arm_r"]))
+
+    # optional fold flats (raytrace Design fold3/fold4): mirror + printed
+    # KM mount behind the reflecting face
+    flat2 = getattr(d, "flat2", None)
+    flat3 = getattr(d, "flat3", None)
+    flat4 = getattr(d, "flat4", None)
+    c1b = getattr(d, "c1b", d.c1)
+    c2b = getattr(d, "c2b", d.c2)
+    df0 = getattr(d, "df0", d.df)
+
+    def flat_module(name, plane, dia):
+        # low-profile printed cell + compact 2-screw tip/tilt: 32 mm deep
+        p, n = plane
+        a1 = norm(mul(n, -1.0))            # into the mount, behind the face
+        a3 = norm(cross(a1, X))
+        half_t = (dia + 8.0) / 2.0
+        return Box(name, add(p, mul(a1, 16.0)), [a1, X, a3],
+                   [16.0, max(half_t, 26.0), half_t])
+
+    if flat2:
+        solids.append(flat_module("flat2", flat2, dm.get("flat2_d", 50.8)))
+    lift2A = getattr(d, "lift2A", None)
+    lift2B = getattr(d, "lift2B", None)
+    if lift2A:
+        solids.append(flat_module("lift2A", lift2A, dm.get("lift_d", 50.8)))
+        solids.append(flat_module("lift2B", lift2B, dm.get("lift_d", 50.8)))
+    liftA = getattr(d, "liftA", None)
+    liftB = getattr(d, "liftB", None)
+    if liftA:
+        solids.append(flat_module("liftA", liftA, dm.get("lift_d", 50.8)))
+        solids.append(flat_module("liftB", liftB, dm.get("lift_d", 50.8)))
+    if flat3:
+        solids.append(flat_module("flat3", flat3, dm["flat3_d"]))
+    if flat4:
+        solids.append(flat_module("flat4", flat4, dm["flat4_d"]))
 
     # Beams at two tiers. Half-angles from the slit:
     #   core: 1/(2 f#)             geometric cone, ~94% of the energy
@@ -266,7 +308,8 @@ def build_solids(d, dims=None):
     w = dm["slit_w_um"] * 1e-3
     col_ca = dm["ca_frac"] * dm.get("colD", d.rfl1 / 2.0) / 2.0
     cam_ca = dm["ca_frac"] * dm.get("camD", d.rfl2 / 2.0) / 2.0
-    ca, cb = abs(dot(d.c1, d.gr.n)), abs(dot(d.c2, d.gr.n))
+    ca = abs(dot(c1b, d.gr.n))
+    cb = abs(dot(d.c2, d.gr.n))
     dbeta = dm["band_nm"] * 1e-6 / (d.sigma * cb)   # band spread half-angle
     beams = []
     for tier, u in (("core", 1.0 / (2.0 * dm["fnum"])),
@@ -275,17 +318,71 @@ def build_solids(d, dims=None):
         foot = min(r_col / ca, dm["grat_w"] / 2.0)  # grating footprint
         r_g2 = foot * cb                    # re-projected after diffraction
         r_c2 = min(r_g2 + d.Lc * dbeta, cam_ca)     # at the camera mirror
+        r_f2 = 0.5 + d.rfl2 * dbeta         # at the sensor
         beams += [
             Beam("beam1_slit_oap1", tier, d.S, d.C1, 0.1, r_col,
                  ["slit_tower", "oap1_cell"]),
-            Beam("beam2_oap1_grating", tier, d.C1, d.G, r_col, r_col,
-                 ["oap1_cell", "rotor", "arm"]),
-            Beam("beam3_grating_oap2", tier, d.G, d.C2, r_g2, r_c2,
-                 ["rotor", "arm", "oap2_cell"]),
-            Beam("beam4_oap2_sensor", tier, d.C2, d.F2, r_c2,
-                 0.5 + d.rfl2 * dbeta,
-                 ["oap2_cell", "camera_front", "camera_body"]),
         ]
+        if lift2A:
+            QA, QB = lift2A[0], lift2B[0]
+            beams += [
+                Beam("beam2a_oap1_lift2A", tier, d.C1, QA, r_col, r_col,
+                     ["oap1_cell", "lift2A"]),
+                Beam("beam2v_lift2", tier, QA, QB, r_col, r_col,
+                     ["lift2A", "lift2B"]),
+                Beam("beam2b_lift2B_grating", tier, QB, d.G, r_col, r_col,
+                     ["lift2B", "rotor", "arm"]),
+            ]
+        elif flat2:
+            P2f = flat2[0]
+            beams += [
+                Beam("beam2a_oap1_flat2", tier, d.C1, P2f, r_col, r_col,
+                     ["oap1_cell", "flat2"]),
+                Beam("beam2b_flat2_grating", tier, P2f, d.G, r_col, r_col,
+                     ["flat2", "rotor", "arm"]),
+            ]
+        else:
+            beams.append(Beam("beam2_oap1_grating", tier, d.C1, d.G,
+                              r_col, r_col, ["oap1_cell", "rotor", "arm"]))
+        if liftA:
+            PA, PB = liftA[0], liftB[0]
+            sl = d.lift3["s"]
+            r_pa = min(r_g2 + sl * dbeta, cam_ca)
+            beams += [
+                Beam("beam3a_grating_liftA", tier, d.G, PA, r_g2, r_pa,
+                     ["rotor", "arm", "liftA"]),
+                Beam("beam3v_lift", tier, PA, PB, r_pa, r_pa,
+                     ["liftA", "liftB"]),
+                Beam("beam3b_liftB_oap2", tier, PB, d.C2, r_pa, r_c2,
+                     ["liftB", "oap2_cell"]),
+            ]
+        elif flat3:
+            P3 = flat3[0]
+            s3 = d.fold3["s"]
+            r_p3 = min(r_g2 + s3 * dbeta, cam_ca)
+            beams += [
+                Beam("beam3a_grating_flat3", tier, d.G, P3, r_g2, r_p3,
+                     ["rotor", "arm", "flat3"]),
+                Beam("beam3b_flat3_oap2", tier, P3, d.C2, r_p3, r_c2,
+                     ["flat3", "oap2_cell"]),
+            ]
+        else:
+            beams.append(Beam("beam3_grating_oap2", tier, d.G, d.C2,
+                              r_g2, r_c2, ["rotor", "arm", "oap2_cell"]))
+        if flat4:
+            P4 = flat4[0]
+            s4 = d.fold4["s"]
+            r_p4 = r_c2 + (r_f2 - r_c2) * (s4 / d.rfl2)
+            beams += [
+                Beam("beam4a_oap2_flat4", tier, d.C2, P4, r_c2, r_p4,
+                     ["oap2_cell", "flat4"]),
+                Beam("beam4b_flat4_sensor", tier, P4, d.F2, r_p4, r_f2,
+                     ["flat4", "camera_front", "camera_body"]),
+            ]
+        else:
+            beams.append(Beam("beam4_oap2_sensor", tier, d.C2, d.F2,
+                              r_c2, r_f2,
+                              ["oap2_cell", "camera_front", "camera_body"]))
     return solids, beams
 
 
@@ -293,6 +390,8 @@ _SKIP = {  # rigidly connected pairs: contact is by construction
     frozenset(("rotor", "arm")),
     frozenset(("oap1_cell", "oap1_mount")),
     frozenset(("oap2_cell", "oap2_mount")),
+    frozenset(("liftA", "liftB")),
+    frozenset(("lift2A", "lift2B")),
     frozenset(("camera_front", "camera_body")),
     frozenset(("snout", "telescope")),
     frozenset(("snout", "telescope_ota")),
