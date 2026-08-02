@@ -108,6 +108,13 @@ minX = min([for (p = allPts) p[0]]) - margin;
 maxX = max([for (p = allPts) p[0]]) + 8;
 minY = min([for (p = allPts) p[1]]) - 8;
 maxY = max([for (p = allPts) p[1]]) + 8;
+// camera tunnel length: distance from the sensor plane to whichever
+// wall the exit ray meets first (v3 exits the +Y wall, v2 exited -X)
+camExit = min(
+    u(dfAng)[0] < 0 ? (sensP[0] - minX) / -u(dfAng)[0] :
+    u(dfAng)[0] > 0 ? (maxX - sensP[0]) / u(dfAng)[0] : 1e9,
+    u(dfAng)[1] < 0 ? (sensP[1] - minY) / -u(dfAng)[1] :
+    u(dfAng)[1] > 0 ? (maxY - sensP[1]) / u(dfAng)[1] : 1e9);
 armAng = gratNormAng + 270;          // rotor arm at Ha tuning
 armAngs = [for (a = gratNormAngs) a + 270];   // per-line detents
 armLo = min(armAngs) - 3; armHi = max(armAngs) + 3;
@@ -146,7 +153,7 @@ module along(p2, a) {  // place children at beamH, local +z along angle a
 }
 
 module body() {
-    camLen = (sensP[0] - minX) / -u(dfAng)[0]; // sensor plane -> front wall
+    camLen = camExit;  // sensor plane -> exit wall
     veeX = gratP[0] + (25 - gratP[1]) / u(c2Ang)[1] * u(c2Ang)[0];
     difference() {
         union() {
@@ -294,9 +301,28 @@ module shelyak_adapter() {
     }
 }
 
+// ghost optics: mirror substrates at their traced positions/normals
+showOptics = true;
+function bis(a_in, a_out) = atan2(sin(a_out) - sin(a_in),
+                                  cos(a_out) - cos(a_in));
+module optics_ghost() {
+    // OAP1 (MPD124): face normal bisects slit->OAP1 and OAP1->grating
+    color("lightsteelblue", 0.9) along(oap1P, bis(c0Ang, c1Ang) + 180)
+        cylinder(h = 8, d = 25.4, $fn = 64);
+    // OAP2 (MPD144)
+    color("lightsteelblue", 0.9) along(oap2P, bis(c2Ang, df0Ang) + 180)
+        cylinder(h = 8, d = 25.4, $fn = 64);
+    // fold flat (PF10-03-P01) seated in its pocket
+    color("aliceblue", 0.9) along(flat4P, flat4NormAng + 180)
+        cylinder(h = 6, d = 25.4, $fn = 64);
+    // Shelyak grating 25 x 25 x 6 on the rotor
+    color("mediumblue", 0.9) along(gratP, gratNormAng + 180)
+        translate([-12.5, -12.5, 0]) cube([25, 25, 6]);
+}
+
 // ghost camera envelope (reference only, renders transparent)
 module camera_ghost() {
-    camLenG = (sensP[0] - minX) / -u(dfAng)[0];
+    camLenG = camExit;
     %along(sensP, dfAng) translate([0, 0, camLenG + 10]) {
         cylinder(h = camFocL, d = camFocD, $fn = 64);
         translate([0, 0, camFocL]) cylinder(h = camTiltT, d = camTiltD, $fn = 64);
@@ -309,6 +335,7 @@ if (part == "body" || part == "preview") body();
 if (part == "preview") {
     camera_ghost();
     deck_labels();
+    if (showOptics) optics_ghost();
     if (showBeams) light_path();
 }
 if (part == "rotor") rotor();
