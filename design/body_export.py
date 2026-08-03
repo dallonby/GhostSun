@@ -76,7 +76,8 @@ lines.append("// tuning detents: " +
 # begin downstream of the crossing plus the fan half-width plus margin.
 import mech
 guard_dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w", "slab1_w",
-                                     "slab2_w", "flat4_d") if k in CHOSEN}
+                                     "slab2_w", "flat4_d", "km100_modules",
+                                     "km100_scallop_half") if k in CHOSEN}
 VANE_Y, VANE_T, VANE_END = 25.0, 3.0, 68.0
 gb, c2b2 = b(d.G), bdir(d.c2)
 t_cross = (VANE_Y - gb[1]) / c2b2[1]

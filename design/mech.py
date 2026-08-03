@@ -227,15 +227,35 @@ def build_solids(d, dims=None):
                    [slab_d / 2.0, dm["slab_half_x"], slab_w / 2.0])
         return [cell, slab]
 
+    def km100_module(name, face_center, back_dir):
+        """Thorlabs KM100, knobs removed, RELIEVED EDGE (bore-boss scallop,
+        drawing 6628-E0W) oriented toward the beam corridor. Three boxes:
+        proud barrel, scalloped front plate, full-width body."""
+        a1 = norm(back_dir)
+        a3 = norm(cross(a1, X))
+        return [Box(name + "_cell", add(face_center, mul(a1, 7.5)),
+                    [a1, X, a3], [8.5, 14.7, 14.7]),
+                Box(name + "_plate", add(face_center, mul(a1, 16.5)),
+                    [a1, X, a3],
+                    [3.5, 26.0, dm.get("km100_scallop_half", 19.0)]),
+                Box(name + "_mount", add(face_center, mul(a1, 30.5)),
+                    [a1, X, a3], [10.5, 26.0, 26.0])]
+
     z0, z1 = dm["tower_z"]
+    if dm.get("km100_modules"):
+        mod1 = km100_module("oap1", d.C1, mul(d.c1, -1.0))
+        mod2 = km100_module("oap2", d.C2, getattr(d, "c2b", d.c2))
+    else:
+        mod1 = module("oap1", d.C1, mul(d.c1, -1.0), dm.get("colD", 50.8),
+                      dm["slab1_w"])
+        mod2 = module("oap2", d.C2, getattr(d, "c2b", d.c2),
+                      dm.get("camD", 76.2), dm["slab2_w"])
     solids = [
         Box("slit_tower", (dm["tower_cx"], 0.0, (z0 + z1) / 2.0),
             [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
             [dm["tower_x_half"], dm["tower_y_half"], (z1 - z0) / 2.0]),
-        *module("oap1", d.C1, mul(d.c1, -1.0), dm.get("colD", 50.8),
-                dm["slab1_w"]),
-        *module("oap2", d.C2, getattr(d, "c2b", d.c2),
-                dm.get("camD", 76.2), dm["slab2_w"]),
+        *mod1,
+        *mod2,
         Capsule("rotor", (d.G[0] - dm.get("rotor_below", 60.0),
                           d.G[1], d.G[2]),
                 (d.G[0] + 40.0, d.G[1], d.G[2]), dm["rotor_r"]),
@@ -326,13 +346,13 @@ def build_solids(d, dims=None):
         r_f2 = 0.5 + d.rfl2 * dbeta         # at the sensor
         beams += [
             Beam("beam1_slit_oap1", tier, d.S, d.C1, 0.1, r_col,
-                 ["slit_tower", "oap1_cell", "oap1_mount"]),
+                 ["slit_tower", "oap1_cell", "oap1_mount", "oap1_plate"]),
         ]
         if lift2A:
             QA, QB = lift2A[0], lift2B[0]
             beams += [
                 Beam("beam2a_oap1_lift2A", tier, d.C1, QA, r_col, r_col,
-                     ["oap1_cell", "oap1_mount", "lift2A"]),
+                     ["oap1_cell", "oap1_mount", "oap1_plate", "lift2A"]),
                 Beam("beam2v_lift2", tier, QA, QB, r_col, r_col,
                      ["lift2A", "lift2B"]),
                 Beam("beam2b_lift2B_grating", tier, QB, d.G, r_col, r_col,
@@ -349,7 +369,7 @@ def build_solids(d, dims=None):
         else:
             beams.append(Beam("beam2_oap1_grating", tier, d.C1, d.G,
                               r_col, r_col,
-                              ["oap1_cell", "oap1_mount", "rotor", "arm"]))
+                              ["oap1_cell", "oap1_mount", "oap1_plate", "rotor", "arm"]))
         if liftA:
             PA, PB = liftA[0], liftB[0]
             sl = d.lift3["s"]
@@ -360,7 +380,7 @@ def build_solids(d, dims=None):
                 Beam("beam3v_lift", tier, PA, PB, r_pa, r_pa,
                      ["liftA", "liftB"]),
                 Beam("beam3b_liftB_oap2", tier, PB, d.C2, r_pa, r_c2,
-                     ["liftB", "oap2_cell", "oap2_mount"]),
+                     ["liftB", "oap2_cell", "oap2_mount", "oap2_plate"]),
             ]
         elif flat3:
             P3 = flat3[0]
@@ -370,26 +390,26 @@ def build_solids(d, dims=None):
                 Beam("beam3a_grating_flat3", tier, d.G, P3, r_g2, r_p3,
                      ["rotor", "arm", "flat3"]),
                 Beam("beam3b_flat3_oap2", tier, P3, d.C2, r_p3, r_c2,
-                     ["flat3", "oap2_cell", "oap2_mount"]),
+                     ["flat3", "oap2_cell", "oap2_mount", "oap2_plate"]),
             ]
         else:
             beams.append(Beam("beam3_grating_oap2", tier, d.G, d.C2,
                               r_g2, r_c2,
-                              ["rotor", "arm", "oap2_cell", "oap2_mount"]))
+                              ["rotor", "arm", "oap2_cell", "oap2_mount", "oap2_plate"]))
         if flat4:
             P4 = flat4[0]
             s4 = d.fold4["s"]
             r_p4 = r_c2 + (r_f2 - r_c2) * (s4 / d.rfl2)
             beams += [
                 Beam("beam4a_oap2_flat4", tier, d.C2, P4, r_c2, r_p4,
-                     ["oap2_cell", "oap2_mount", "flat4"]),
+                     ["oap2_cell", "oap2_mount", "oap2_plate", "flat4"]),
                 Beam("beam4b_flat4_sensor", tier, P4, d.F2, r_p4, r_f2,
                      ["flat4", "camera_front", "camera_body"]),
             ]
         else:
             beams.append(Beam("beam4_oap2_sensor", tier, d.C2, d.F2,
                               r_c2, r_f2,
-                              ["oap2_cell", "oap2_mount", "camera_front",
+                              ["oap2_cell", "oap2_mount", "oap2_plate", "camera_front",
                                "camera_body"]))
     return solids, beams
 
@@ -397,7 +417,11 @@ def build_solids(d, dims=None):
 _SKIP = {  # rigidly connected pairs: contact is by construction
     frozenset(("rotor", "arm")),
     frozenset(("oap1_cell", "oap1_mount")),
+    frozenset(("oap1_cell", "oap1_plate")),
+    frozenset(("oap1_plate", "oap1_mount")),
     frozenset(("oap2_cell", "oap2_mount")),
+    frozenset(("oap2_cell", "oap2_plate")),
+    frozenset(("oap2_plate", "oap2_mount")),
     frozenset(("liftA", "liftB")),
     frozenset(("lift2A", "lift2B")),
     frozenset(("camera_front", "camera_body")),
@@ -474,7 +498,8 @@ def build_chosen(lam_nm=656.28):
                fold4=CHOSEN.get("fold4"), **cfg)
     d.build(lam_nm)
     dims = {k: CHOSEN[k] for k in ("colD", "camD", "grat_w", "slab1_w",
-                                   "slab2_w", "flat4_d") if k in CHOSEN}
+                                   "slab2_w", "flat4_d", "km100_modules",
+                                   "km100_scallop_half") if k in CHOSEN}
     return d, dims
 
 

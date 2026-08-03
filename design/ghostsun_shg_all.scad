@@ -65,14 +65,19 @@ margin = 38;
 /* [Mirror mounts] */
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
-slab1W = 54;         // OAP1 slab (budget KM plate 48 + 6, Ø25.4 MPD124)
+slab1W = 56;         // OAP1 slab (v3.2: Thorlabs KM100, 49.9 sq + clr)
 slab2W = 56;         // OAP2 slab (v3.1: Thorlabs KM100, 49.9 sq + clr)
-km1Hole = 16;        // KM base bolt triangle half-pitch = plateW/2 - m/2
+km1Hole = 16;        // (unused since v3.2: both stations carry KM100s)
 km2Hole = 16;        // (unused at slab2 since v3.1; see km100_slab)
-// v3.1: OAP2 carries a Thorlabs KM100 (drawing 6628-E0W) instead of the
-// printed mount. Knobs removed; adjusters reached with a 5/64 hex
-// through the slab. Face stack: 13 mm proud barrel + 21.1 body + tails
-// -> mirrorStack2 = 40 (5 mm less than the printed 45).
+// v3.2: BOTH stations carry Thorlabs KM100s (drawing 6628-E0W).
+// Knobs removed; adjusters reached with a 5/64 hex through the slab.
+// Face stack: 13 mm proud barrel + 21.1 body + tails -> mirrorStack2=40.
+// ORIENTATION IS LOAD-BEARING: each KM100 must be clocked so its
+// relieved front-plate edge (the bore-boss scallop) faces the return
+// beam corridor; the interference margins assume it. Drill patterns
+// below follow that orientation -- VERIFY against the physical mount.
+// OAP1 clocking (6 arcmin sensitive) is registered by a printed collar
+// (part="clocking_collar") indexing the mirror barrel to the plate.
 mirrorStack2 = 40;
 km100MountR = 25.4;   // M4 holes, 2 places at 90 deg  (VERIFY vs 6628-E0W)
 km100AdjXY = 17.1;    // adjuster axes rel bore center (VERIFY vs 6628-E0W)
@@ -143,7 +148,7 @@ module deck_labels() {
 }
 
 // deck extents: optical features plus the mirror-slab corner points
-slab1F = [oap1P[0] - mirrorStack * cos(c1Ang), oap1P[1] - mirrorStack * sin(c1Ang)];
+slab1F = [oap1P[0] - mirrorStack2 * cos(c1Ang), oap1P[1] - mirrorStack2 * sin(c1Ang)];
 slab2F = [oap2P[0] + mirrorStack2 * cos(c2Ang), oap2P[1] + mirrorStack2 * sin(c2Ang)];
 function slabPts(f, a, w) = [for (s = [-1, 1], b = [0, 1])
     [f[0] + s * (w / 2) * cos(a + 90) - b * slabT * cos(a),
@@ -234,7 +239,7 @@ module body() {
                 translate([minX + wallT, minY + wallT])
                     square([maxX - minX - 2 * wallT, maxY - minY - 2 * wallT]);
             }
-            mirror_slab(slab1F, c1Ang, slab1W, km1Hole);
+            km100_slab(slab1F, c1Ang, slab1W);
             km100_slab(slab2F, c2Ang + 180, slab2W);
             // slit tower: asymmetric footprint (MECH.md). The
             // downstream face at bx=+4 is a thin blade wall (flock it:
@@ -412,6 +417,19 @@ if (part == "rotor") rotor();
 if (part == "preview")
     translate([gratP[0], gratP[1], 6.2]) rotate([0, 0, armAng - 180]) rotor();
 if (part == "shelyak_adapter") shelyak_adapter();
+// slip ring for the OAP barrel: index tab laps the KM100 front plate so
+// mirror clocking is set once and survives removal (OAP1 needs 6 arcmin)
+module clocking_collar() {
+    difference() {
+        union() {
+            cylinder(h = 5, d = 30, $fn = 96);
+            translate([12, -4, 0]) cube([8, 8, 11]);
+        }
+        translate([0, 0, -1]) cylinder(h = 7, d = 25.6, $fn = 96);
+        translate([-15, -1.1, -1]) cube([30, 2.2, 7]);  // pinch slot
+    }
+}
+if (part == "clocking_collar") clocking_collar();
 
 // ---- printable kinematic OAP mount ----
 // GhostSun SHG — printable kinematic OAP mount (OpenSCAD twin of the

@@ -422,7 +422,8 @@ CONFIGS = {
 CHOSEN = dict(config="T_budget_ha", dev=24.0, s2=-1.0,
               Lg=70.0, Lc=130.0, fold4=dict(s=46.0, delta=90.0),
               colD=25.4, camD=25.4, grat_w=25.0,
-              slab1_w=54.0, slab2_w=54.0, flat4_d=25.4)
+              km100_modules=True, km100_scallop_half=19.0,
+              slab1_w=56.0, slab2_w=56.0, flat4_d=25.4)
 
 LINES = [  # (label, lambda nm, lines/mm, order)
     ("CaK 393", 393.37, 2400.0, 1),
