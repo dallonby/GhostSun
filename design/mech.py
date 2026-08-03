@@ -156,6 +156,11 @@ class Capsule:
 class Beam:
     """Chain of (point, radius) stations along a traced chief ray.
 
+    A mirror's own mount slab is adjacent to the beams that terminate on
+    that mirror: the slab hides in the mirror's shadow, and the outer-fan
+    spill past the mirror CA is stray-light overshoot (STRAYLIGHT.md),
+    not a mechanical collision.
+
     tier is "core" (geometric f/# cone: carries ~94% of the energy, any
     interference is a hard FAIL) or "fan" (full Fraunhofer fan edge: the
     outer wings carry a few percent, interference means vignetting plus a
@@ -321,13 +326,13 @@ def build_solids(d, dims=None):
         r_f2 = 0.5 + d.rfl2 * dbeta         # at the sensor
         beams += [
             Beam("beam1_slit_oap1", tier, d.S, d.C1, 0.1, r_col,
-                 ["slit_tower", "oap1_cell"]),
+                 ["slit_tower", "oap1_cell", "oap1_mount"]),
         ]
         if lift2A:
             QA, QB = lift2A[0], lift2B[0]
             beams += [
                 Beam("beam2a_oap1_lift2A", tier, d.C1, QA, r_col, r_col,
-                     ["oap1_cell", "lift2A"]),
+                     ["oap1_cell", "oap1_mount", "lift2A"]),
                 Beam("beam2v_lift2", tier, QA, QB, r_col, r_col,
                      ["lift2A", "lift2B"]),
                 Beam("beam2b_lift2B_grating", tier, QB, d.G, r_col, r_col,
@@ -343,7 +348,8 @@ def build_solids(d, dims=None):
             ]
         else:
             beams.append(Beam("beam2_oap1_grating", tier, d.C1, d.G,
-                              r_col, r_col, ["oap1_cell", "rotor", "arm"]))
+                              r_col, r_col,
+                              ["oap1_cell", "oap1_mount", "rotor", "arm"]))
         if liftA:
             PA, PB = liftA[0], liftB[0]
             sl = d.lift3["s"]
@@ -354,7 +360,7 @@ def build_solids(d, dims=None):
                 Beam("beam3v_lift", tier, PA, PB, r_pa, r_pa,
                      ["liftA", "liftB"]),
                 Beam("beam3b_liftB_oap2", tier, PB, d.C2, r_pa, r_c2,
-                     ["liftB", "oap2_cell"]),
+                     ["liftB", "oap2_cell", "oap2_mount"]),
             ]
         elif flat3:
             P3 = flat3[0]
@@ -364,25 +370,27 @@ def build_solids(d, dims=None):
                 Beam("beam3a_grating_flat3", tier, d.G, P3, r_g2, r_p3,
                      ["rotor", "arm", "flat3"]),
                 Beam("beam3b_flat3_oap2", tier, P3, d.C2, r_p3, r_c2,
-                     ["flat3", "oap2_cell"]),
+                     ["flat3", "oap2_cell", "oap2_mount"]),
             ]
         else:
             beams.append(Beam("beam3_grating_oap2", tier, d.G, d.C2,
-                              r_g2, r_c2, ["rotor", "arm", "oap2_cell"]))
+                              r_g2, r_c2,
+                              ["rotor", "arm", "oap2_cell", "oap2_mount"]))
         if flat4:
             P4 = flat4[0]
             s4 = d.fold4["s"]
             r_p4 = r_c2 + (r_f2 - r_c2) * (s4 / d.rfl2)
             beams += [
                 Beam("beam4a_oap2_flat4", tier, d.C2, P4, r_c2, r_p4,
-                     ["oap2_cell", "flat4"]),
+                     ["oap2_cell", "oap2_mount", "flat4"]),
                 Beam("beam4b_flat4_sensor", tier, P4, d.F2, r_p4, r_f2,
                      ["flat4", "camera_front", "camera_body"]),
             ]
         else:
             beams.append(Beam("beam4_oap2_sensor", tier, d.C2, d.F2,
                               r_c2, r_f2,
-                              ["oap2_cell", "camera_front", "camera_body"]))
+                              ["oap2_cell", "oap2_mount", "camera_front",
+                               "camera_body"]))
     return solids, beams
 
 
