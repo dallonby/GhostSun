@@ -26,9 +26,17 @@ margin = 38;
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
 slab1W = 54;         // OAP1 slab (budget KM plate 48 + 6, Ø25.4 MPD124)
-slab2W = 54;         // OAP2 slab (v3: Ø25.4 MPD144, KM plate 48)
+slab2W = 56;         // OAP2 slab (v3.1: Thorlabs KM100, 49.9 sq + clr)
 km1Hole = 16;        // KM base bolt triangle half-pitch = plateW/2 - m/2
-km2Hole = 16;        // (bossMargin m = 16 in mounts/)
+km2Hole = 16;        // (unused at slab2 since v3.1; see km100_slab)
+// v3.1: OAP2 carries a Thorlabs KM100 (drawing 6628-E0W) instead of the
+// printed mount. Knobs removed; adjusters reached with a 5/64 hex
+// through the slab. Face stack: 13 mm proud barrel + 21.1 body + tails
+// -> mirrorStack2 = 40 (5 mm less than the printed 45).
+mirrorStack2 = 40;
+km100MountR = 25.4;   // M4 holes, 2 places at 90 deg  (VERIFY vs 6628-E0W)
+km100AdjXY = 17.1;    // adjuster axes rel bore center (VERIFY vs 6628-E0W)
+km100HexD = 10;       // hex-driver access holes through the slab
 m5insD = 6.4; m5insL = 12;
 
 /* [Slit + snout] */
@@ -96,7 +104,7 @@ module deck_labels() {
 
 // deck extents: optical features plus the mirror-slab corner points
 slab1F = [oap1P[0] - mirrorStack * cos(c1Ang), oap1P[1] - mirrorStack * sin(c1Ang)];
-slab2F = [oap2P[0] + mirrorStack * cos(c2Ang), oap2P[1] + mirrorStack * sin(c2Ang)];
+slab2F = [oap2P[0] + mirrorStack2 * cos(c2Ang), oap2P[1] + mirrorStack2 * sin(c2Ang)];
 function slabPts(f, a, w) = [for (s = [-1, 1], b = [0, 1])
     [f[0] + s * (w / 2) * cos(a + 90) - b * slabT * cos(a),
      f[1] + s * (w / 2) * sin(a + 90) - b * slabT * sin(a)]];
@@ -134,6 +142,28 @@ module thread_male(d, pitch, len) {
     cylinder(h = len, d = 2 * rmin + 0.2, $fn = 96);
 }
 
+// slab wall for a Thorlabs KM100: two M4 heat-set inserts on the
+// mount's 90-degree bolt pattern plus two hex-access holes aligned with
+// the (knob-less) adjuster screws.
+module km100_slab(faceP, normAng, w) {
+    difference() {
+        linear_extrude(wallH)
+            translate(faceP) rotate([0, 0, normAng])
+                translate([-slabT / 2, 0]) square([slabT, w], center = true);
+        for (hv = [[0, km100MountR], [km100MountR, 0]])
+            translate([faceP[0], faceP[1], beamH + hv[1]])
+                rotate([0, 0, normAng]) rotate([0, 90, 0])
+                    translate([0, hv[0], -m5insL])
+                        cylinder(h = m5insL + eps, d = insertM4d(), $fn = 32);
+        for (hv = [[km100AdjXY, km100AdjXY], [km100AdjXY, -km100AdjXY]])
+            translate([faceP[0], faceP[1], beamH + hv[1]])
+                rotate([0, 0, normAng]) rotate([0, 90, 0])
+                    translate([0, hv[0], -slabT - 1])
+                        cylinder(h = slabT + 2, d = km100HexD, $fn = 32);
+    }
+}
+function insertM4d() = 5.6;  // M4 heat-set insert hole
+
 module mirror_slab(faceP, normAng, w, hole) {
     difference() {
         linear_extrude(wallH)
@@ -165,7 +195,7 @@ module body() {
                     square([maxX - minX - 2 * wallT, maxY - minY - 2 * wallT]);
             }
             mirror_slab(slab1F, c1Ang, slab1W, km1Hole);
-            mirror_slab(slab2F, c2Ang + 180, slab2W, km2Hole);
+            km100_slab(slab2F, c2Ang + 180, slab2W);
             // slit tower: asymmetric footprint (MECH.md). The
             // downstream face at bx=+4 is a thin blade wall (flock it:
             // the diffracted fan passes just beyond), and the across-beam

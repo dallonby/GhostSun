@@ -66,9 +66,17 @@ margin = 38;
 mirrorStack = 45;    // optical face -> mount wall face
 slabT = 14;
 slab1W = 54;         // OAP1 slab (budget KM plate 48 + 6, Ø25.4 MPD124)
-slab2W = 54;         // OAP2 slab (v3: Ø25.4 MPD144, KM plate 48)
+slab2W = 56;         // OAP2 slab (v3.1: Thorlabs KM100, 49.9 sq + clr)
 km1Hole = 16;        // KM base bolt triangle half-pitch = plateW/2 - m/2
-km2Hole = 16;        // (bossMargin m = 16 in mounts/)
+km2Hole = 16;        // (unused at slab2 since v3.1; see km100_slab)
+// v3.1: OAP2 carries a Thorlabs KM100 (drawing 6628-E0W) instead of the
+// printed mount. Knobs removed; adjusters reached with a 5/64 hex
+// through the slab. Face stack: 13 mm proud barrel + 21.1 body + tails
+// -> mirrorStack2 = 40 (5 mm less than the printed 45).
+mirrorStack2 = 40;
+km100MountR = 25.4;   // M4 holes, 2 places at 90 deg  (VERIFY vs 6628-E0W)
+km100AdjXY = 17.1;    // adjuster axes rel bore center (VERIFY vs 6628-E0W)
+km100HexD = 10;       // hex-driver access holes through the slab
 m5insD = 6.4; m5insL = 12;
 
 /* [Slit + snout] */
@@ -136,7 +144,7 @@ module deck_labels() {
 
 // deck extents: optical features plus the mirror-slab corner points
 slab1F = [oap1P[0] - mirrorStack * cos(c1Ang), oap1P[1] - mirrorStack * sin(c1Ang)];
-slab2F = [oap2P[0] + mirrorStack * cos(c2Ang), oap2P[1] + mirrorStack * sin(c2Ang)];
+slab2F = [oap2P[0] + mirrorStack2 * cos(c2Ang), oap2P[1] + mirrorStack2 * sin(c2Ang)];
 function slabPts(f, a, w) = [for (s = [-1, 1], b = [0, 1])
     [f[0] + s * (w / 2) * cos(a + 90) - b * slabT * cos(a),
      f[1] + s * (w / 2) * sin(a + 90) - b * slabT * sin(a)]];
@@ -174,6 +182,28 @@ module thread_male(d, pitch, len) {
     cylinder(h = len, d = 2 * rmin + 0.2, $fn = 96);
 }
 
+// slab wall for a Thorlabs KM100: two M4 heat-set inserts on the
+// mount's 90-degree bolt pattern plus two hex-access holes aligned with
+// the (knob-less) adjuster screws.
+module km100_slab(faceP, normAng, w) {
+    difference() {
+        linear_extrude(wallH)
+            translate(faceP) rotate([0, 0, normAng])
+                translate([-slabT / 2, 0]) square([slabT, w], center = true);
+        for (hv = [[0, km100MountR], [km100MountR, 0]])
+            translate([faceP[0], faceP[1], beamH + hv[1]])
+                rotate([0, 0, normAng]) rotate([0, 90, 0])
+                    translate([0, hv[0], -m5insL])
+                        cylinder(h = m5insL + eps, d = insertM4d(), $fn = 32);
+        for (hv = [[km100AdjXY, km100AdjXY], [km100AdjXY, -km100AdjXY]])
+            translate([faceP[0], faceP[1], beamH + hv[1]])
+                rotate([0, 0, normAng]) rotate([0, 90, 0])
+                    translate([0, hv[0], -slabT - 1])
+                        cylinder(h = slabT + 2, d = km100HexD, $fn = 32);
+    }
+}
+function insertM4d() = 5.6;  // M4 heat-set insert hole
+
 module mirror_slab(faceP, normAng, w, hole) {
     difference() {
         linear_extrude(wallH)
@@ -205,7 +235,7 @@ module body() {
                     square([maxX - minX - 2 * wallT, maxY - minY - 2 * wallT]);
             }
             mirror_slab(slab1F, c1Ang, slab1W, km1Hole);
-            mirror_slab(slab2F, c2Ang + 180, slab2W, km2Hole);
+            km100_slab(slab2F, c2Ang + 180, slab2W);
             // slit tower: asymmetric footprint (MECH.md). The
             // downstream face at bx=+4 is a thin blade wall (flock it:
             // the diffracted fan passes just beyond), and the across-beam
@@ -420,6 +450,8 @@ bossMargin = 16;     // corner margin / boss diameter
 insertD = 5.6;       // M4 heat-set insert hole
 insertL = 8;
 springHoleD = 3.2;
+mirrorD = 76.2;      // mirror diameter; hooks are kept clear of it.
+                     // Print the v3 budget pair with mirrorD = 25.4.
 mirrorBCD = 40;      // backing-plate bolt circle (measure your mirror!)
                      // v3 budget MPD124/MPD144: single central M4 tapped
                      // hole -> set mirrorBoltN = 1, mirrorBCD = 0
@@ -441,9 +473,14 @@ m = bossMargin;
 pivot = [m, m];
 adjA  = [m, m + leverArm];   // vee -> pitch
 adjB  = [m + leverArm, m];   // flat -> yaw
-springs = [[m + 0.35*leverArm, m + 0.35*leverArm],
-           [m + 0.60*leverArm, m + 0.60*leverArm]];
 centroid = [(pivot[0]+adjA[0]+adjB[0])/3 + mirrorOffX, (pivot[1]+adjA[1]+adjB[1])/3];
+// Springs sit symmetric about the plate diagonal, outside the mirror
+// footprint (hooks bear on the platform's outer face, which the mirror
+// must not cover). The pair's resultant still acts at the contact
+// centroid, inside the cone/vee/flat triangle.
+springOff = (mirrorD/2 + 8) / sqrt(2);
+springs = [[centroid[0] + springOff, centroid[1] - springOff],
+           [centroid[0] - springOff, centroid[1] + springOff]];
 
 module km_plate() { cube([plateW, plateH, plateT]); }
 
@@ -473,10 +510,18 @@ module km_base() {
         km_at(pivot) cone_seat();
         km_at(adjA) vee_groove();
         // flat at adjB: untouched surface
-        for (s = springs) km_at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        for (s = springs) {
+            km_at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+            // hook recess on the slab side: the spring hook must not be
+            // squeezed between the base and the housing wall
+            km_at(s) cylinder(h=4, d=10, $fn=32);
+        }
         for (c = [[plateW-m/2, plateH-m/2], [plateW-m/2, m/2], [m/2, plateH-m/2]]) {
             km_at(c) cylinder(h=3*plateT, d=baseBoltD, center=true, $fn=32);
-            km_at(c) cylinder(h=baseCboreZ, d=baseCboreD, $fn=32);
+            // bolt heads recess into the platform-side face (the other
+            // face sits flat on the housing slab)
+            km_at(c) translate([0, 0, plateT - baseCboreZ])
+                cylinder(h=baseCboreZ + 0.01, d=baseCboreD, $fn=32);
         }
     }
 }
@@ -506,15 +551,16 @@ module km_platform() {
             km_at(a) translate([0,0,plateT-insertL])
                 cylinder(h=insertL+0.01, d=insertD, $fn=32);
         }
-        // OPEN spring hooks: keyhole slots run to the BACK edge so the
-        // springs unhook sideways without tools (fast module swap).
-        // Back edge, not front: the front route crossed a mirror
-        // backing-bolt hole at plateW=105 and the label band.
-        for (s = springs) {
-            km_at(s) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
-            km_at(s) translate([-springHoleD/2, 0, -plateT])
-                cube([springHoleD, plateH, 3*plateT]);
-        }
+        // OPEN spring hooks: keyhole slots run to each spring's nearest
+        // free edge (slot 0 -> +X, slot 1 -> +Y) so the springs unhook
+        // sideways without tools (fast module swap). Routes verified
+        // clear of every hole at plateW 48 and 105.
+        at(springs[0]) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        at(springs[0]) translate([0, -springHoleD/2, -plateT])
+            cube([plateW, springHoleD, 3*plateT]);
+        at(springs[1]) cylinder(h=3*plateT, d=springHoleD, center=true, $fn=32);
+        at(springs[1]) translate([-springHoleD/2, 0, -plateT])
+            cube([springHoleD, plateH, 3*plateT]);
         // mirror backing-plate bolt circle at support-triangle centroid
         for (k = [0 : mirrorBoltN-1])
             km_at([centroid[0] + mirrorBCD/2*cos(360*k/mirrorBoltN),

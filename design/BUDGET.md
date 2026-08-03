@@ -20,7 +20,8 @@ using owned parts wherever possible. Active CHOSEN config: T_budget_ha_v2.
 | collimator | Thorlabs MPD124-P01 (Ø25.4, 45°, RFL 50.8, prot. silver) | £197 |
 | camera mirror | Thorlabs MPD144-P01 (Ø25.4, 45°, RFL 101.6, prot. silver) | £197 |
 | fold flat | Thorlabs PF10-03-P01 (Ø25.4, lambda/10, prot. silver) | £73 |
-| 4x 100 TPI fine adjusters | Thorlabs | ~£80 |
+| OAP2 mount | Thorlabs KM100 (v3.1: replaces the printed mount at OAP2 only; knobs removed, hex access through the slab; 80 TPI = 0.41 deg/turn) | £43 |
+| 2x 100 TPI fine adjusters (OAP1 printed mount only) | Thorlabs | ~£40 |
 | balls, springs, dowel, inserts, screws | — | ~£25 |
 | M42 helical focuser | generic | ~£40 |
 | **total new spend** | | **~£695 (~$890)** |
