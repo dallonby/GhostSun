@@ -393,6 +393,24 @@ module optics_ghost() {
     // Shelyak grating 25 x 25 x 6 on the rotor
     color("mediumblue", 0.9) along(gratP, gratNormAng + 180)
         translate([-12.5, -12.5, 0]) cube([25, 25, 6]);
+    // ghost KM100s (v3.2): barrel, scalloped front plate, body, adjuster
+    // stubs. Local +y (= backAng + 90 in plan) is the relieved edge and
+    // MUST face the return-beam corridor; both calls below do.
+    km100_ghost(oap1P, c1Ang + 180);
+    km100_ghost(oap2P, c2Ang);
+}
+
+module km100_ghost(p, backAng) {
+    color("darkgray", 0.55) along(p, backAng) {
+        cylinder(h = 13, d = 25.4, $fn = 64);          // proud barrel
+        translate([-24.95, -24.95, 13])
+            cube([49.9, 43.95, 7]);                     // plate, cut at +19
+        translate([-24.95, -24.95, 20])
+            cube([49.9, 49.9, 14]);                     // back body
+        for (v = [17.1, -17.1])
+            translate([v, 17.1, 34])
+                cylinder(h = 6, d = 9, $fn = 32);       // adjuster stubs
+    }
 }
 
 // ghost camera envelope (reference only, renders transparent)
