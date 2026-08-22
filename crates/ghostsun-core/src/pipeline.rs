@@ -118,6 +118,17 @@ pub struct ReconOptions {
     /// file carries them (resamples onto a uniform time grid). No effect on
     /// files without a timestamp trailer.
     pub use_timing: bool,
+    /// Spectral dispersion in A/px, when known from the optics. Supplies the
+    /// scale the telluric anchors cannot establish on their own from a single
+    /// line, and puts wavelength-domain settings on a physical footing.
+    pub dispersion_a_per_px: Option<f64>,
+    /// Dopplergram wing offset in Angstrom. `None` = choose it from the line
+    /// profile (F14). Needs `dispersion_a_per_px` to convert to pixels.
+    pub wing_offset_a: Option<f64>,
+    /// Extra wavelength offsets (px from the line core) to emit alongside the
+    /// primary product, all sharing the primary's geometry so they are
+    /// pixel-for-pixel comparable.
+    pub shift_series: Vec<f64>,
     /// M2: use wgpu compute kernels where available (CPU fallback)
     pub use_gpu: bool,
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
@@ -162,6 +173,9 @@ impl Default for ReconOptions {
             burst_repair: true,
             temporal_nlm: true,
             use_timing: true,
+            dispersion_a_per_px: None,
+            wing_offset_a: None,
+            shift_series: Vec::new(),
             use_gpu: true,
             map_iterations: 0,
             tune: TuneParams::default(),
@@ -202,6 +216,9 @@ pub struct ReconReport {
     pub xreg_applied: Vec<f64>,
     /// F11: burst-flagged columns
     pub burst_flags: Vec<bool>,
+    /// F14: extra wavelength products, `(offset px from core, image)`, on the
+    /// primary's grid.
+    pub shift_products: Vec<(f64, Image)>,
     /// F13: per-frame acquisition timing, when the SER carried timestamps.
     pub timing: Option<crate::timing::TimingSummary>,
     /// Grid columns interpolated across a dropped-frame gap rather than
@@ -517,14 +534,19 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         // degenerate with rotation). Fallback: solar-line estimator
         // (nonlinear component only).
         let mut v_row: Option<Vec<f64>> = None;
-        let flex = match profile::estimate_flexure_telluric(&maps, &smile, 3.0) {
+        let flex = match profile::estimate_flexure_telluric(
+            &maps, &smile, 3.0, opts.dispersion_a_per_px,
+        ) {
             Some(tf) => {
                 vlog!(
                     opts,
-                    "flexure: telluric-anchored, {} line(s) at offsets {:?} px (dispersion {:.4} A/px)",
+                    "flexure: telluric-anchored, {} line(s) at offsets {:?} px (dispersion {} A/px)",
                     tf.n_lines,
                     tf.line_offsets.iter().map(|o| *o as i64).collect::<Vec<_>>(),
-                    tf.dispersion
+                    match tf.dispersion {
+                        Some(d) => format!("{d:.4}"),
+                        None => "unknown".into(),
+                    }
                 );
                 if std::env::var("GS_NO_VROW").is_err() {
                     v_row = profile::slit_velocity_from_telluric(
@@ -864,6 +886,73 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     vlog!(opts, "output: {}x{}", output.image.w, output.image.h);
     stage!("limb+ellipse+warp");
 
+    // ---- F14: co-registered wavelength series ----
+    // Every offset is extracted in frame space, put through the SAME
+    // photometric and registration corrections as the primary, and warped with
+    // the PRIMARY's fitted geometry. Re-fitting the limb per wavelength is
+    // what makes independent `--shift` runs incomparable: the limb profile
+    // changes across the line and the fit follows it, so canvases came out
+    // 2680-3454 px for one scan. Sharing fit.geom is what makes a Dopplergram,
+    // a blink, or any difference between wavelengths meaningful.
+    let mut shift_products: Vec<(f64, Image)> = Vec::new();
+    if !opts.shift_series.is_empty() && !opts.baseline {
+        let flex_off: Option<Vec<f64>> = if flex.iter().any(|f| f.abs() > 0.0) {
+            Some(flex.clone())
+        } else {
+            None
+        };
+        for &sh in &opts.shift_series {
+            let mut d = regrid(reconstruct_disk(
+                &reader,
+                &geom,
+                &ExtractOptions {
+                    shift: opts.shift + sh,
+                    transpose_input: transpose,
+                    kernel: SpectralKernel::Point,
+                    frame_offsets: flex_off.clone(),
+                },
+            ));
+            if opts.transparency_correction {
+                flatfield::apply_column_gains(&mut d, &column_gain);
+            }
+            if jitter_applied.iter().any(|v| v.abs() > 1e-6) {
+                d = jitter::apply_shifts(&d, &jitter_applied);
+            }
+            if xreg_applied.iter().any(|v| v.abs() > 1e-6) {
+                d = jitter::apply_x_offsets(&d, &xreg_applied);
+            }
+            if opts.transversalium_correction {
+                flatfield::correct_transversalium(&mut d, opts.tune.transv_deadband);
+            }
+            if opts.temporal_nlm {
+                let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
+                d = if opts.use_gpu {
+                    quality::nlm_params(&d, opts.tune.nlm_h)
+                        .and_then(|(sigma, h2, thresh)| {
+                            crate::gpu::temporal_nlm(&d, radius, h2, sigma, thresh)
+                        })
+                        .unwrap_or_else(|| quality::temporal_nlm(&d, radius, opts.tune.nlm_h))
+                } else {
+                    quality::temporal_nlm(&d, radius, opts.tune.nlm_h)
+                };
+            }
+            let warped = if opts.use_gpu {
+                crate::gpu::warp_single(&d, &fit.geom, &wp)
+                    .unwrap_or_else(|| warp_single(&d, &fit.geom, &wp))
+            } else {
+                warp_single(&d, &fit.geom, &wp)
+            };
+            shift_products.push((sh, warped.image));
+        }
+        vlog!(
+            opts,
+            "wavelength series: {} offset(s) {:?} px on the primary grid",
+            shift_products.len(),
+            opts.shift_series.iter().map(|s| format!("{s:+.1}")).collect::<Vec<_>>()
+        );
+        stage!("wavelength series");
+    }
+
     // ---- multi-line composite (opt-in detail product) ----
     // Primary science path above is unchanged. When enabled and companions
     // exist, extract each neighbour line with the same shared corrections
@@ -1029,10 +1118,41 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     // column gains and transversalium and is maximally shift-sensitive
     // (wing slope), measuring at bisector depths where rotation is clean.
     let wing_doppler: Option<Image> = if use_profile && !opts.baseline {
-        let wing = std::env::var("GS_WING_OFFSET")
+        // Wing offset, best source first: an explicit env override (diagnosis),
+        // an explicit Angstrom request, then the profile-derived optimum, then
+        // the historical constant. The constant is a poor last resort -- it was
+        // right at 0.085 A/px and is barely off the core at 0.034 -- so it is
+        // only reached when the line is too shallow to measure a flank.
+        let wing = if let Some(v) = std::env::var("GS_WING_OFFSET")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(6.0);
+        {
+            vlog!(opts, "wing offset: {:.1} px (GS_WING_OFFSET override)", v);
+            v
+        } else if let (Some(a), Some(d)) = (opts.wing_offset_a, opts.dispersion_a_per_px) {
+            let px = a / d;
+            vlog!(opts, "wing offset: +-{:.3} A = +-{:.1} px (requested)", a, px);
+            px
+        } else {
+            match profile::optimal_wing_offset(&mean_img, &smile, geom.y1, geom.y2) {
+                Some(wo) => {
+                    let in_a = opts
+                        .dispersion_a_per_px
+                        .map(|d| format!(" = +-{:.3} A", wo.px * d))
+                        .unwrap_or_default();
+                    vlog!(
+                        opts,
+                        "wing offset: +-{:.1} px{} (auto: blue {:+.0}, red {:+.0}, HWHM {:.0} px)",
+                        wo.px, in_a, wo.blue_px, wo.red_px, wo.hwhm_px
+                    );
+                    wo.px
+                }
+                None => {
+                    vlog!(opts, "wing offset: 6.0 px (line too shallow to measure a flank)");
+                    6.0
+                }
+            }
+        };
         let offsets: Option<Vec<f64>> = if std::env::var("GS_WING_NOFLEX").is_ok() {
             None // INTI-condition: wings extracted without flexure correction
         } else if flex.iter().any(|f| f.abs() > 0.0) {
@@ -1126,6 +1246,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         wing_doppler,
         flex,
         psf_sigma,
+        shift_products,
         timing: timing.as_ref().map(|t| t.summarize(regrid_src.is_some())),
         gap_columns: match (&timing, &regrid_src) {
             (Some(t), Some(src)) => crate::timing::gap_columns(t, src),

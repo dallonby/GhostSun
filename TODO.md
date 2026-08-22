@@ -548,6 +548,84 @@ anchor (Hα ideal), weaker in a bland Fe-line stretch — hence the manual
 fallback. Recommended build order: geometry→Å/px + single manual anchor first
 (robust, immediately useful), then catalog auto-ID.
 
+## F14 — Auto-calibrated Doppler wing offset — **IMPLEMENTED 2026-08-22**
+
+**Goal:** stop expressing the Dopplergram wing offset in pixels. Derive it
+automatically, in Ångström, from the measured line profile so it maximises
+Doppler sensitivity per unit noise — and so it survives a change of optics.
+
+**Why (measured 2026-08-22, scan `16_46_23`):** fine-scale (4–20 px) fractional
+contrast across the Hα profile — core 1.26%, ±0.27 Å 1.36/1.43%,
+**±0.41 Å 5.62/5.81%**, ±0.51 Å 2.56/4.25%, ±0.68 Å ~1.0%. The flanks carry
+~4.5× the fine structure of the core, because at line centre dI/dλ ≈ 0 and a
+Doppler shift produces almost no intensity change. Confirmed against physics:
+the flank slope there is ~10%/px, so a 10 km/s velocity (0.64 px at
+0.0342 Å/px) predicts ~6% modulation, matching the 5.6–5.8% measured.
+The current `GS_WING_OFFSET` default of 6 px was correct when the camera lens
+gave 0.085 Å/px (6 px = 0.51 Å). After the change to an AC254-150-A the scale
+is ~0.034 Å/px, so the same constant is 0.21 Å and lands *inside the core* —
+close to the worst available choice. A fixed pixel constant cannot survive an
+optics change; this is the bug class, not the instance.
+
+**Design:**
+- **Sensitivity metric.** For a Doppler measurement read off wing intensity,
+  the SNR-optimal offset maximises `|dI/dλ| / sqrt(I)` — slope carries the
+  signal, `sqrt(I)` is the photon noise. Evaluate on the de-smiled mean
+  profile that `pipeline::mean_spectrum` already builds; no new extraction.
+- **Both flanks independently.** Hα is not symmetric, and a blend or telluric
+  on one side must not drag the other. Report both; use the mean unless one
+  fails its gates.
+- **Constraints:** stay inside the usable window given the smile excursion;
+  keep at least ~1 line HWHM from the core so the two wings do not sample the
+  same photons; fall back to the present default when the line is too shallow
+  for a well-defined flank (reuse `depth_gate`).
+- **Report in both units**, e.g. `wing offset: ±0.41 A (±12.0 px at 0.0342 A/px)`.
+- **CLI** `--wing-offset <angstrom|auto>`, default `auto`. `GS_WING_OFFSET`
+  survives as a px override for diagnosis only.
+
+**Status.** All three parts landed together:
+`profile::optimal_wing_offset` (folded-flank sensitivity search),
+`--wing-offset <A>` / auto, `--a-per-px <A/px>`, `--shifts <list>` for a
+co-registered wavelength series, and the dispersion gate below.
+Measured on `16_46_23`: auto picks **±13.0 px = ±0.445 Å**, against a
+measured contrast optimum of ±0.41 Å — and against 1.26% contrast at the
+old 6 px default, i.e. ~4.5× more fine structure.
+
+**Blocking prerequisite — dispersion must be trustworthy — DONE.**
+`profile::estimate_flexure_telluric` reported `dispersion 0.1540 A/px` on
+`16_46_23` from a **single** anchor. With one line there is no separation to
+calibrate against and the figure is wrong by ~4× (truth ≈0.0342 Å/px from
+grating geometry, ≈0.0359 Å/px reading the +39 px dip as H₂O 6564.20). It must
+**decline to report a dispersion below two anchors**, and the caller must then
+fall back to F12's `lines::geometric_dispersion` from the optics rather than
+trusting it. Fix this first or F14 auto-calibrates against a wrong scale.
+
+**Harness gates:**
+- [x] Real data: chosen offset on `16_46_23` falls in ±0.4–0.5 Å — got ±0.445 Å,
+      matching the independently measured contrast peak at ±0.41 Å.
+- [x] Clean scan / default bench unchanged (35.54 dB / 0.9792).
+- [x] Co-registration: a 6-offset series on one scan emits 7 products all
+      3452², where independent `--shift` runs gave 2680–3454.
+- [x] ~~June-era 0.085 Å/px geometry must pick ≈6 px~~ — **this gate was wrong
+      and is withdrawn.** Auto picks 8 px there, and 8 px is the better answer:
+      the chooser tracks the *measured* HWHM, which is 8 px (0.68 Å) at June's
+      coarser dispersion versus 13 px (0.445 Å) now, because finer dispersion
+      means less instrumental broadening. The old 6 px was a hand-set constant,
+      never a measurement, so it is not a valid reference. What must hold is
+      that the pick tracks ~1×HWHM, which it does on both instruments.
+- [ ] Still to do: `bench --sweep` over offsets on `--doppler` synth, to confirm
+      the sensitivity metric maximises velocity-map SNR and not merely contrast
+      (contrast alone cannot separate real Doppler from amplified wavelength
+      error — the flank amplifies both).
+
+**Pitfalls:** the steep flank amplifies *every* wavelength error, so a badly
+chosen offset degrades smile/flexure residuals as well as weakening the
+Doppler — validate on the residual, not by eye. The offset is an instrument +
+line property: hold it constant across the scan. Choosing it per-frame or
+per-row would inject exactly the structure the Dopplergram is meant to measure.
+
+---
+
 ## Process checklist for every feature (copy into each PR)
 
 - [ ] Synth models the degradation; truth recorded; penalty measured with

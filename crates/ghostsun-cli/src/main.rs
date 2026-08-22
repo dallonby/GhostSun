@@ -175,6 +175,25 @@ enum Cmd {
         /// scan-axis coordinate (F13)
         #[arg(long)]
         no_timing: bool,
+        /// spectral scale in Angstrom per pixel, from your optics. A single
+        /// telluric anchor cannot establish it on its own, so supplying it
+        /// makes the wavelength domain trustworthy. Near-Littrow estimate:
+        /// p*cos(beta)/(m*g*f_cam) — 2400 l/mm, order 1, 150 mm camera lens
+        /// and 2.0 um pixels give 0.0342.
+        #[arg(long)]
+        a_per_px: Option<f64>,
+        /// Dopplergram wing offset in Angstrom (needs --a-per-px). Omit to
+        /// choose it automatically from the line profile, which is where the
+        /// Ha surface texture actually lives — the flanks, not the core.
+        #[arg(long)]
+        wing_offset: Option<f64>,
+        /// Comma-separated wavelength offsets to emit alongside the main
+        /// product, e.g. "-0.5,-0.25,0,0.25,0.5". Angstrom when --a-per-px is
+        /// given, pixels otherwise. All share the primary's geometry, so they
+        /// can be blinked, differenced or combined; independent --shift runs
+        /// cannot, because each re-fits its own limb.
+        #[arg(long, allow_hyphen_values = true)]
+        shifts: Option<String>,
         /// disable GPU compute kernels (CPU only)
         #[arg(long)]
         no_gpu: bool,
@@ -323,6 +342,13 @@ fn save_recon_outputs(dir: &Path, name: &str, rep: &pipeline::ReconReport, veloc
         .map(|t| t.fits_meta())
         .unwrap_or_default();
     output::write_fits_f32_meta(&dir.join(format!("{name}.fits")), img, &meta).unwrap();
+    for (off, im) in &rep.shift_products {
+        let tag = format!("{off:+.1}").replace('.', "p");
+        let base = dir.join(format!("{name}_shift{tag}"));
+        output::write_fits_f32_meta(&base.with_extension("fits"), im, &meta).unwrap();
+        let mx = im.max();
+        output::write_png16(&base.with_extension("png"), im, Some((0.0, mx))).unwrap();
+    }
     if std::env::var_os("GS_SAVE_DEMIX_BEFORE").is_some() {
         if let Some(before) = &rep.demix_before {
             output::write_png16(&dir.join(format!("{name}_before_demix.png")), before, None).unwrap();
@@ -358,7 +384,9 @@ fn main() {
         Cmd::Recon {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
-            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_timing, no_gpu, map_iterations, tune, dispersion, composite, line_x, name,
+            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_timing,
+            a_per_px, wing_offset, shifts, no_gpu, map_iterations, tune, dispersion, composite,
+            line_x, name,
         } => {
             std::fs::create_dir_all(&out_dir).unwrap();
             let force_transpose = match dispersion.as_str() {
@@ -385,6 +413,9 @@ fn main() {
                 burst_repair: !no_burst_repair,
                 temporal_nlm: !no_nlm,
                 use_timing: !no_timing,
+                dispersion_a_per_px: a_per_px,
+                wing_offset_a: wing_offset,
+                shift_series: Vec::new(),
                 use_gpu: !no_gpu,
                 map_iterations,
                 force_transpose,
@@ -392,6 +423,34 @@ fn main() {
                 line_center_x: line_x,
                 ..Default::default()
             };
+            if let Some(spec) = &shifts {
+                let mut series = Vec::new();
+                for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                    match tok.parse::<f64>() {
+                        Ok(v) => series.push(v),
+                        Err(_) => {
+                            eprintln!("--shifts: '{tok}' is not a number");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                match a_per_px {
+                    Some(d) if d > 0.0 => {
+                        println!(
+                            "wavelength series: {:?} A -> {:?} px at {d} A/px",
+                            series,
+                            series.iter().map(|v| format!("{:+.1}", v / d)).collect::<Vec<_>>()
+                        );
+                        opts.shift_series = series.iter().map(|v| v / d).collect();
+                    }
+                    _ => {
+                        println!(
+                            "wavelength series: {series:?} px (no --a-per-px, so these are pixels)"
+                        );
+                        opts.shift_series = series;
+                    }
+                }
+            }
             if let Some(t) = &tune {
                 parse_tune(t, &mut opts.tune);
             }

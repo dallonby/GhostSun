@@ -449,14 +449,20 @@ pub struct TelluricFlex {
     pub flex: Vec<f64>,
     pub n_lines: usize,
     pub line_offsets: Vec<f64>,
-    /// fitted spectral dispersion (A/px) from the anchor pattern
-    pub dispersion: f64,
+    /// Spectral dispersion (A/px). `None` when it could not be established:
+    /// a SINGLE anchor cannot determine it, because some dispersion always
+    /// maps one line onto some catalog entry exactly (a real case: the anchor
+    /// at +39 px sits on H2O 6568.81 at 0.154 A/px and on 6564.21 at 0.036,
+    /// both perfect fits). Only the SEPARATION between two or more anchors
+    /// constrains the scale.
+    pub dispersion: Option<f64>,
 }
 
 pub fn estimate_flexure_telluric(
     maps: &ProfileMaps,
     _smile: &[f64],
     core_sigma: f64,
+    dispersion_hint: Option<f64>,
 ) -> Option<TelluricFlex> {
     let n = maps.frame_spec.len();
     let m = maps.spec_offsets.len();
@@ -555,22 +561,48 @@ pub fn estimate_flexure_telluric(
     let solar_lines: [f64; 4] = [6546.24, 6551.68, 6559.58, 6569.21];
     let halpha = 6562.801;
     let offs: Vec<f64> = anchors.iter().map(|&k| maps.spec_offsets[k]).collect();
-    let mut best = (f64::MAX, 0.0f64);
-    let mut disp = 0.03;
-    while disp <= 0.25 {
-        let mut tot = 0.0;
-        for &o in &offs {
-            let lam = halpha + o * disp;
-            let d1 = h2o.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
-            let d2 = solar_lines.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
-            tot += d1.min(d2);
+    // Establishing the dispersion needs either a caller-supplied scale or at
+    // least TWO anchors. With one anchor the catalog match is degenerate --
+    // scanning the dispersion always finds a value that lands it exactly on
+    // some line -- so a fitted figure there is not a measurement, it is an
+    // accident of which catalog entry the scan reached first.
+    let disp = match dispersion_hint {
+        Some(d) if d.is_finite() && d > 0.0 => Some(d),
+        _ if offs.len() >= 2 => {
+            // Provisional: only kept if >= 2 anchors then MATCH the catalog.
+            let mut best = (f64::MAX, 0.0f64);
+            let mut d = 0.03;
+            while d <= 0.25 {
+                let mut tot = 0.0;
+                for &o in &offs {
+                    let lam = halpha + o * d;
+                    let d1 = h2o.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+                    let d2 = solar_lines.iter().map(|l| (l - lam).abs()).fold(f64::MAX, f64::min);
+                    tot += d1.min(d2);
+                }
+                if tot < best.0 {
+                    best = (tot, d);
+                }
+                d += 0.0005;
+            }
+            Some(best.1)
         }
-        if tot < best.0 {
-            best = (tot, disp);
+        _ => None,
+    };
+    // Without a scale the anchors cannot be classified as telluric rather than
+    // solar, and a solar line carries the rotation ramp this estimator exists
+    // to avoid. Decline, so the caller falls back to the solar-line path.
+    let Some(disp) = disp else {
+        if std::env::var("GS_DEBUG").is_ok() {
+            eprintln!(
+                "[telluric] {} anchor(s) at {:?} px and no dispersion hint -- \
+                 cannot establish the scale from one line; declining",
+                offs.len(),
+                offs.iter().map(|o| *o as i64).collect::<Vec<_>>()
+            );
         }
-        disp += 0.0005;
-    }
-    let disp = best.1;
+        return None;
+    };
     let keep: Vec<usize> = (0..anchors.len())
         .filter(|&a| {
             let lam = halpha + offs[a] * disp;
@@ -587,7 +619,21 @@ pub fn estimate_flexure_telluric(
             keep.iter().map(|&a| offs[a] as i64).collect::<Vec<_>>()
         );
     }
-    if keep.is_empty() {
+    // A dispersion fitted from fewer than two MATCHED anchors is not a
+    // measurement. One anchor can be placed exactly on some catalog line at
+    // many different scales (the +39 px anchor lands on H2O 6568.81 at
+    // 0.154 A/px and on 6564.21 at 0.036, both perfectly), so the classifier
+    // cannot tell telluric from solar -- and a solar line carries the very
+    // rotation ramp this estimator exists to avoid. Decline unless the caller
+    // supplied the scale, in which case one matched anchor is enough.
+    if keep.is_empty() || (dispersion_hint.is_none() && keep.len() < 2) {
+        if std::env::var("GS_DEBUG").is_ok() {
+            eprintln!(
+                "[telluric] only {} matched anchor(s) and no --a-per-px scale; \
+                 declining rather than guessing the dispersion",
+                keep.len()
+            );
+        }
         return None;
     }
     if std::env::var("GS_DUMP").is_ok() {
@@ -657,7 +703,156 @@ pub fn estimate_flexure_telluric(
         flex: out,
         n_lines: keep.len(),
         line_offsets: keep.iter().map(|&a| maps.spec_offsets[anchors[a]]).collect(),
-        dispersion: disp,
+        dispersion: Some(disp),
+    })
+}
+
+/// Where to sample the line wings for a Dopplergram, chosen from the line
+/// profile rather than fixed in pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct WingOffset {
+    /// Offset to use, in px from the line core.
+    pub px: f64,
+    /// Best offset found on each flank (blue negative, red positive).
+    pub blue_px: f64,
+    pub red_px: f64,
+    /// Line half-width at half depth, px — the floor the offsets respect.
+    pub hwhm_px: f64,
+}
+
+/// Pick the Dopplergram wing offset that maximises velocity sensitivity per
+/// unit photon noise.
+///
+/// A Doppler shift is read off the wing as an intensity change, so the signal
+/// scales with the profile slope `|dI/dl|` while the noise scales with
+/// `sqrt(I)`. Their ratio is the quantity to maximise, and it has a genuine
+/// interior optimum: at the core the slope vanishes (which is why a core image
+/// shows almost no Doppler structure at all), and far out in the wings the
+/// slope vanishes again while the photon count is highest.
+///
+/// Both flanks are evaluated separately — Ha is not symmetric, and a blend or
+/// telluric on one side must not drag the other. Returns `None` when the line
+/// is too shallow for a well-defined flank, leaving the caller on its default.
+pub fn optimal_wing_offset(
+    mean_img: &Image,
+    smile: &[f64],
+    y1: usize,
+    y2: usize,
+) -> Option<WingOffset> {
+    let w = mean_img.w;
+    if y2 <= y1 || w < 32 {
+        return None;
+    }
+    // How far the smile lets us sample on both sides without leaving the frame.
+    let (mut cmin, mut cmax) = (f64::MAX, f64::MIN);
+    for y in y1..=y2.min(smile.len().saturating_sub(1)) {
+        cmin = cmin.min(smile[y]);
+        cmax = cmax.max(smile[y]);
+    }
+    if !cmin.is_finite() || !cmax.is_finite() {
+        return None;
+    }
+    let reach = ((cmin - 3.0).min(w as f64 - 4.0 - cmax)).floor() as i64;
+    if reach < 8 {
+        return None;
+    }
+    let reach = reach.min(60) as usize;
+
+    // Flux-weighted de-smiled mean profile: every row resampled about its own
+    // fitted line centre, so the smile does not smear the flanks we measure.
+    let margin = ((y2 - y1) / 20).max(10);
+    let mut prof = vec![0.0f64; 2 * reach + 1];
+    let mut wsum = 0.0;
+    for y in (y1 + margin)..y2.saturating_sub(margin) {
+        let row = mean_img.row(y);
+        let mut coef: Vec<f64> = row.iter().map(|&v| v as f64).collect();
+        crate::mathutil::bspline_prefilter(&mut coef);
+        let c = smile[y];
+        let rw: f64 = row.iter().map(|&v| v as f64).sum();
+        if rw <= 0.0 {
+            continue;
+        }
+        for (k, slot) in prof.iter_mut().enumerate() {
+            let o = k as f64 - reach as f64;
+            *slot += rw * crate::mathutil::bspline_eval(&coef, c + o);
+        }
+        wsum += rw;
+    }
+    if wsum <= 0.0 {
+        return None;
+    }
+    for v in prof.iter_mut() {
+        *v /= wsum;
+    }
+    let sm = crate::mathutil::gaussian_smooth(&prof, 1.2);
+    let core = sm[reach];
+    let cont = sm.iter().cloned().fold(f64::MIN, f64::max);
+    if !(cont > 0.0) || (cont - core) / cont < 0.15 {
+        return None; // too shallow to have a usable flank
+    }
+    // Half depth defines the floor: sampling inside it means both wings draw
+    // on the same photons and the difference stops being a shift measurement.
+    let half = core + 0.5 * (cont - core);
+    let mut hwhm = 1.0f64;
+    for k in reach..sm.len() {
+        if sm[k] >= half {
+            hwhm = (k - reach) as f64;
+            break;
+        }
+    }
+    let floor = hwhm.max(2.0);
+
+    // Search only where a Doppler wing can physically sit. For a line of this
+    // shape |dI/dl| peaks near one HWHM out and dividing by sqrt(I) pulls the
+    // optimum slightly inward, so the answer lives inside roughly half to two
+    // HWHM. Without that bound the metric happily picks a telluric or a blend
+    // far out in the wing, which is exactly what it did on the June scans
+    // (red flank chose +28 px, 2.4 A off core).
+    let (lo_o, hi_o) = (floor.max(0.5 * hwhm), 2.0 * hwhm);
+    let sens = |o: f64| -> Option<f64> {
+        let k = (o + reach as f64).round() as i64;
+        if k < 2 || k as usize >= sm.len() - 2 {
+            return None;
+        }
+        let k = k as usize;
+        let slope = (sm[k + 1] - sm[k - 1]).abs() / 2.0;
+        Some(slope / sm[k].max(1e-9).sqrt())
+    };
+    // Fold the two flanks together before choosing. A Dopplergram samples the
+    // same distance either side anyway, and averaging means a contaminated
+    // flank is diluted by the clean one instead of setting the answer alone.
+    let mut best: Option<(f64, f64)> = None;
+    let mut o = lo_o;
+    while o <= hi_o {
+        if let (Some(sb), Some(sr)) = (sens(-o), sens(o)) {
+            let sc = 0.5 * (sb + sr);
+            if best.map_or(true, |(_, bs)| sc > bs) {
+                best = Some((o, sc));
+            }
+        }
+        o += 0.5;
+    }
+    let (pick, _) = best?;
+    // Per-flank peaks are reported for diagnosis only; a large disagreement
+    // between them is the signature of a blend on one side.
+    let peak_on = |sign: f64| -> f64 {
+        let mut b = (0.0f64, f64::MIN);
+        let mut o = lo_o;
+        while o <= hi_o {
+            if let Some(sv) = sens(sign * o) {
+                if sv > b.1 {
+                    b = (sign * o, sv);
+                }
+            }
+            o += 0.5;
+        }
+        b.0
+    };
+    Some(WingOffset {
+        px: pick,
+        blue_px: peak_on(-1.0),
+        red_px: peak_on(1.0),
+        hwhm_px: hwhm,
     })
 }
 
