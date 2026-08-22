@@ -74,6 +74,10 @@ struct SynthArgs {
     /// frames' timestamps still say where they belong — F13 tests
     #[arg(long, default_value_t = 0.0)]
     drop_frames: f64,
+    /// noise on the RECORDED timestamps only, exposures left uniform — models
+    /// host-stamp capture, where the times are wrong but the scan was steady
+    #[arg(long, default_value_t = 0.0)]
+    timestamp_noise: f64,
 }
 
 impl SynthArgs {
@@ -98,6 +102,7 @@ impl SynthArgs {
             bursts: self.bursts,
             cadence_jitter: self.cadence_jitter,
             drop_frames: self.drop_frames,
+            timestamp_noise: self.timestamp_noise,
             ..Default::default()
         }
     }
@@ -1008,7 +1013,7 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         variants.push(("Ghost-no-xreg".into(), mk(&|o| o.x_registration = false)));
         variants.push(("Ghost-no-burst".into(), mk(&|o| o.burst_repair = false)));
         variants.push(("Ghost-no-nlm".into(), mk(&|o| o.temporal_nlm = false)));
-        if params.cadence_jitter > 0.0 || params.drop_frames > 0.0 {
+        if params.cadence_jitter > 0.0 || params.drop_frames > 0.0 || params.timestamp_noise > 0.0 {
             // F13: what the reconstruction looks like when the per-frame
             // timestamps are ignored and frame index is trusted as position.
             variants.push(("Ghost-no-timing".into(), mk(&|o| o.use_timing = false)));

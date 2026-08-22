@@ -59,6 +59,12 @@ pub struct SynthParams {
     /// after a drop is displaced by a whole column if frame index is trusted
     /// as scan position.
     pub drop_frames: f64,
+    /// Noise added to the RECORDED timestamps only, in fractions of a frame
+    /// interval, leaving the exposures themselves uniform. Models a capture
+    /// program that stamps frames on host arrival rather than on the camera
+    /// clock: the times are wrong even though the scan was steady, so a
+    /// reconstruction that trusts them displaces frames by pure noise.
+    pub timestamp_noise: f64,
     /// Deliberate along-slit dither between scans, peak-to-peak in slit px.
     ///
     /// Slit dust is fixed in `row_gain[y]` while the Sun is offset per scan, so
@@ -93,6 +99,7 @@ impl Default for SynthParams {
             bursts: 0.0,
             cadence_jitter: 0.0,
             drop_frames: 0.0,
+            timestamp_noise: 0.0,
         }
     }
 }
@@ -524,7 +531,8 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
         // let the reconstruction recover. Jitter is bounded to +-0.45 of a
         // slot: past half a slot, "late frame" and "dropped frame" become the
         // same observation and no estimator can separate them.
-        let mut schedule: Vec<(usize, f64)> = Vec::with_capacity(p.n_frames);
+        // (slot, true exposure position, recorded-timestamp position)
+        let mut schedule: Vec<(usize, f64, f64)> = Vec::with_capacity(p.n_frames);
         for slot in 0..p.n_frames {
             if p.drop_frames > 0.0 && slot > 0 && slot + 1 < p.n_frames
                 && rng.gen::<f64>() < p.drop_frames
@@ -536,16 +544,22 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
             } else {
                 0.0
             };
-            schedule.push((slot, slot as f64 + delta));
+            // Recorded time may differ from the true exposure time.
+            let stamp_err = if p.timestamp_noise > 0.0 {
+                (rng.gen::<f64>() - 0.5) * 2.0 * p.timestamp_noise.min(0.45)
+            } else {
+                0.0
+            };
+            schedule.push((slot, slot as f64 + delta, slot as f64 + delta + stamp_err));
         }
 
         let mut frames: Vec<Vec<u16>> = Vec::with_capacity(schedule.len());
         let mut frame_ticks: Vec<i64> = Vec::with_capacity(schedule.len());
-        for &(t, scan_pos) in &schedule {
+        for &(t, scan_pos, stamp_pos) in &schedule {
             let mut frame = vec![0u16; p.spec_w * p.slit_h];
             // Truth vectors are indexed by slot; the sun's position by time.
             let x_scan = (scan_pos - t_center) * p.scan_step + jitter_x[t];
-            frame_ticks.push(crate::ser::synth_frame_ticks_at(scan_pos));
+            frame_ticks.push(crate::ser::synth_frame_ticks_at(stamp_pos));
             for y in 0..p.slit_h {
                 let ycs = y as f64 - yc_slit;
                 let sun_x = x_scan + shear * ycs;
