@@ -40,6 +40,9 @@ pub struct TuneParams {
     /// Dopplergram wing offset in px; 0 = choose it from the line profile.
     /// Exposed here so `bench --sweep wing_px=...` can scan it against truth.
     pub wing_px: f64,
+    /// Wiener noise scaling: 1.0 is the classic filter, higher is more
+    /// aggressive. Swept with `bench --sweep wiener_strength=...`.
+    pub wiener_strength: f64,
 }
 
 impl Default for TuneParams {
@@ -62,6 +65,7 @@ impl Default for TuneParams {
             rl_floor: 1.2,
             denoise_k: 1.0,
             wing_px: 0.0,
+            wiener_strength: 4.0,
         }
     }
 }
@@ -86,6 +90,7 @@ impl TuneParams {
             "rl_floor" => self.rl_floor = v,
             "denoise_k" => self.denoise_k = v,
             "wing_px" => self.wing_px = v,
+            "wiener_strength" => self.wiener_strength = v,
             _ => return Err(format!("unknown tune param: {name}")),
         }
         Ok(())
@@ -134,6 +139,8 @@ pub struct ReconOptions {
     /// primary product, all sharing the primary's geometry so they are
     /// pixel-for-pixel comparable.
     pub shift_series: Vec<f64>,
+    /// F15: Wiener filtering against the image's own measured power spectrum.
+    pub wiener: bool,
     /// M2: use wgpu compute kernels where available (CPU fallback)
     pub use_gpu: bool,
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
@@ -181,6 +188,7 @@ impl Default for ReconOptions {
             dispersion_a_per_px: None,
             wing_offset_a: None,
             shift_series: Vec::new(),
+            wiener: false,
             use_gpu: true,
             map_iterations: 0,
             tune: TuneParams::default(),
@@ -1243,6 +1251,27 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     if opts.denoise && !opts.baseline {
         output.image = denoise::denoise(&output.image, &disk_fit, opts.tune.denoise_k);
         vlog!(opts, "denoise: wavelet shrinkage k={:.2}", opts.tune.denoise_k);
+    }
+
+    // ---- F15: Wiener filtering ----
+    // Last in the chain: it needs the final geometry and the final noise
+    // level, and it is the stage that decides which spatial frequencies are
+    // worth keeping at all.
+    if opts.wiener && !opts.baseline {
+        match denoise::wiener_psd(&output.image, opts.tune.wiener_strength, Some(&disk_fit)) {
+            Some((img, rep)) => {
+                vlog!(
+                    opts,
+                    "wiener: cutoff {:.1} px, removed {:.1}% of power (strength {:.2})",
+                    rep.cutoff_px,
+                    100.0 * rep.removed,
+                    opts.tune.wiener_strength
+                );
+                output.image = img;
+            }
+            None => vlog!(opts, "wiener: image too small, skipped"),
+        }
+        stage!("wiener");
     }
 
     vlog!(opts, "[t] TOTAL: {:.2}s", t_start.elapsed().as_secs_f64());

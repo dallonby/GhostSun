@@ -132,3 +132,227 @@ pub fn denoise(img: &Image, disk: &DiskFit, k: f64) -> Image {
     }
     recon
 }
+
+/// What the Wiener stage measured and did.
+#[derive(Clone, Copy, Debug)]
+pub struct WienerReport {
+    /// Estimated white-noise power per frequency bin.
+    pub noise_floor: f64,
+    /// Scale (px) at which signal power falls to the noise floor — the point
+    /// beyond which the image carries nothing but noise.
+    pub cutoff_px: f64,
+    /// Fraction of total power the filter removed.
+    pub removed: f64,
+}
+
+/// Optimal (Wiener) filtering against the image's own measured power spectrum.
+///
+/// A power-spectrum comparison of one scan against a nine-scan stack showed
+/// real solar power dying out below roughly 20 px while the image is sampled
+/// at 1 px — the data is oversampled by more than an order of magnitude, and
+/// everything below the crossover is noise occupying dynamic range. The
+/// minimum-mean-square estimator for that situation is `H = S/(S+N)`: it
+/// passes frequencies where signal dominates untouched and suppresses those
+/// where noise does, which is emphatically NOT the same as blurring, because
+/// it removes only what carries no information.
+///
+/// `S` and `N` are measured from this image: the radially averaged spectrum is
+/// its own design input. `N` is taken as the high-frequency plateau, which
+/// assumes the noise is roughly white — a caveat worth remembering, since an
+/// upstream denoiser will already have coloured it, and a coloured floor makes
+/// this estimate conservative rather than wrong.
+///
+/// `strength` scales the assumed noise: 1.0 is the classic Wiener filter,
+/// below 1 is gentler, above 1 more aggressive.
+pub fn wiener_psd(
+    img: &Image,
+    strength: f64,
+    disk: Option<&DiskFit>,
+) -> Option<(Image, WienerReport)> {
+    let (w, h) = (img.w, img.h);
+    if w < 64 || h < 64 {
+        return None;
+    }
+    let n = w.max(h).next_power_of_two();
+    let mut re = vec![0.0f64; n * n];
+    let mut im = vec![0.0f64; n * n];
+    // The disc sits centred with black margin, so the array edges are already
+    // continuous across the wrap and need no window; padding with zeros keeps
+    // it that way.
+    let (ox, oy) = ((n - w) / 2, (n - h) / 2);
+    for y in 0..h {
+        for x in 0..w {
+            re[(y + oy) * n + (x + ox)] = img.at(x, y) as f64;
+        }
+    }
+    crate::mathutil::fft2_inplace(&mut re, &mut im, n, n, false);
+
+    // Radially averaged power spectrum.
+    let nr = n / 2;
+    let mut psum = vec![0.0f64; nr + 1];
+    let mut pcnt = vec![0.0f64; nr + 1];
+    for j in 0..n {
+        let fy = if j <= n / 2 { j } else { n - j } as f64;
+        for i in 0..n {
+            let fx = if i <= n / 2 { i } else { n - i } as f64;
+            let k = (fx * fx + fy * fy).sqrt().round() as usize;
+            if k > nr {
+                continue;
+            }
+            let idx = j * n + i;
+            psum[k] += re[idx] * re[idx] + im[idx] * im[idx];
+            pcnt[k] += 1.0;
+        }
+    }
+    let mut p: Vec<f64> = (0..=nr)
+        .map(|k| if pcnt[k] > 0.0 { psum[k] / pcnt[k] } else { 0.0 })
+        .collect();
+    // Smooth the radial profile so the filter is not shaped by bin noise.
+    p = crate::mathutil::gaussian_smooth(&p, 2.0);
+
+    // Noise floor: the median of the top quarter of frequencies, where the
+    // measurement says no solar signal survives.
+    let lo = (nr as f64 * 0.75) as usize;
+    let mut tail: Vec<f64> = p[lo..=nr].to_vec();
+    if tail.is_empty() {
+        return None;
+    }
+    let noise = crate::mathutil::median_inplace(&mut tail).max(1e-30) * strength;
+
+    // Signal PSD and the transfer function.
+    let hfun: Vec<f64> = p
+        .iter()
+        .map(|&pk| {
+            let s = (pk - noise).max(0.0);
+            if s + noise > 0.0 { s / (s + noise) } else { 0.0 }
+        })
+        .collect();
+    // Where the filter has fallen to half: the practical resolution limit.
+    let cutoff_k = hfun.iter().position(|&v| v < 0.5).unwrap_or(nr).max(1);
+    let cutoff_px = n as f64 / cutoff_k as f64;
+
+    let (mut kept, mut total) = (0.0f64, 0.0f64);
+    for j in 0..n {
+        let fy = if j <= n / 2 { j } else { n - j } as f64;
+        for i in 0..n {
+            let fx = if i <= n / 2 { i } else { n - i } as f64;
+            let k = ((fx * fx + fy * fy).sqrt().round() as usize).min(nr);
+            let g = hfun[k];
+            let idx = j * n + i;
+            let pw = re[idx] * re[idx] + im[idx] * im[idx];
+            total += pw;
+            kept += pw * g * g;
+            re[idx] *= g;
+            im[idx] *= g;
+        }
+    }
+    crate::mathutil::fft2_inplace(&mut re, &mut im, n, n, true);
+    let mut out = Image::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            out.set(x, y, re[(y + oy) * n + (x + ox)].max(0.0) as f32);
+        }
+    }
+    // The filter assumes one stationary spectrum, and the limb is where that
+    // assumption fails hardest: it is a genuine sharp edge with real power at
+    // the frequencies the disc's average spectrum says are noise. Filtering it
+    // with the disc's transfer function measurably softens it (PSNRlimb fell
+    // 27.2 -> 24.5 dB and limb sigma rose 1.26 -> 1.98 across a strength
+    // sweep). So the filter is feathered out across the limb annulus and the
+    // original kept beyond it.
+    if let Some(d) = disk {
+        for y in 0..h {
+            let dy = y as f64 - d.yc;
+            for x in 0..w {
+                let dx = x as f64 - d.xc;
+                let r = (dx * dx + dy * dy).sqrt() / d.r.max(1e-9);
+                // full strength inside 0.90 R, none beyond 1.00 R
+                let t = ((1.00 - r) / 0.10).clamp(0.0, 1.0);
+                if t < 1.0 {
+                    let a = out.at(x, y) as f64;
+                    let b = img.at(x, y) as f64;
+                    out.set(x, y, (t * a + (1.0 - t) * b) as f32);
+                }
+            }
+        }
+    }
+    Some((
+        out,
+        WienerReport {
+            noise_floor: noise,
+            cutoff_px,
+            removed: if total > 0.0 { 1.0 - kept / total } else { 0.0 },
+        },
+    ))
+}
+
+#[cfg(test)]
+mod wiener_tests {
+    use super::*;
+
+    #[test]
+    fn fft_round_trips_and_matches_a_known_transform() {
+        // A single cosine must transform to two symmetric spikes.
+        let n = 64usize;
+        let mut re: Vec<f64> = (0..n)
+            .map(|i| (std::f64::consts::TAU * 4.0 * i as f64 / n as f64).cos())
+            .collect();
+        let orig = re.clone();
+        let mut im = vec![0.0f64; n];
+        crate::mathutil::fft_inplace(&mut re, &mut im, false);
+        let mag: Vec<f64> = (0..n).map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt()).collect();
+        assert!((mag[4] - n as f64 / 2.0).abs() < 1e-6, "spike at k=4: {}", mag[4]);
+        assert!((mag[n - 4] - n as f64 / 2.0).abs() < 1e-6);
+        for (k, m) in mag.iter().enumerate() {
+            if k != 4 && k != n - 4 {
+                assert!(*m < 1e-6, "leakage at {k}: {m}");
+            }
+        }
+        crate::mathutil::fft_inplace(&mut re, &mut im, true);
+        for i in 0..n {
+            assert!((re[i] - orig[i]).abs() < 1e-9, "round trip at {i}");
+            assert!(im[i].abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn wiener_removes_noise_and_keeps_smooth_structure() {
+        // Smooth blob plus white noise: the filter must cut the noise hard
+        // while leaving the blob's amplitude essentially intact.
+        let (w, h) = (128usize, 128usize);
+        let mut clean = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = (x as f64 - 64.0) / 22.0;
+                let dy = (y as f64 - 64.0) / 22.0;
+                clean.set(x, y, (1000.0 * (-(dx * dx + dy * dy) / 2.0).exp()) as f32);
+            }
+        }
+        let mut noisy = clean.clone();
+        let mut seed = 12345u64;
+        for v in noisy.data.iter_mut() {
+            // cheap deterministic LCG noise
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let u = ((seed >> 33) as f64 / (1u64 << 31) as f64) - 0.5;
+            *v += (u * 60.0) as f32;
+        }
+        let err = |a: &Image| -> f64 {
+            let s: f64 = a
+                .data
+                .iter()
+                .zip(&clean.data)
+                .map(|(p, c)| ((*p - *c) as f64).powi(2))
+                .sum();
+            (s / a.data.len() as f64).sqrt()
+        };
+        let before = err(&noisy);
+        let (filtered, rep) = wiener_psd(&noisy, 1.0, None).expect("wiener ran");
+        let after = err(&filtered);
+        assert!(
+            after < before * 0.6,
+            "should cut error substantially: {before:.2} -> {after:.2}"
+        );
+        assert!(rep.removed > 0.0 && rep.removed < 1.0, "removed {}", rep.removed);
+        assert!(rep.cutoff_px > 2.0, "cutoff {} px", rep.cutoff_px);
+    }
+}

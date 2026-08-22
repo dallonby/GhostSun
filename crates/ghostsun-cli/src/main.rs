@@ -194,6 +194,11 @@ enum Cmd {
         /// cannot, because each re-fits its own limb.
         #[arg(long, allow_hyphen_values = true)]
         shifts: Option<String>,
+        /// Wiener-filter the result against its own measured power spectrum
+        /// (F15). Suppresses only the frequencies where noise already
+        /// dominates, so it is not a blur.
+        #[arg(long)]
+        wiener: bool,
         /// disable GPU compute kernels (CPU only)
         #[arg(long)]
         no_gpu: bool,
@@ -385,8 +390,8 @@ fn main() {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
             velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_timing,
-            a_per_px, wing_offset, shifts, no_gpu, map_iterations, tune, dispersion, composite,
-            line_x, name,
+            a_per_px, wing_offset, shifts, wiener, no_gpu, map_iterations, tune, dispersion,
+            composite, line_x, name,
         } => {
             std::fs::create_dir_all(&out_dir).unwrap();
             let force_transpose = match dispersion.as_str() {
@@ -416,6 +421,7 @@ fn main() {
                 dispersion_a_per_px: a_per_px,
                 wing_offset_a: wing_offset,
                 shift_series: Vec::new(),
+                wiener,
                 use_gpu: !no_gpu,
                 map_iterations,
                 force_transpose,
@@ -1044,6 +1050,9 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
             if pname.starts_with("denoise") {
                 opts.denoise = true;
             }
+            if pname.starts_with("wiener") {
+                opts.wiener = true;
+            }
             match pipeline::reconstruct(&ser, &opts) {
                 Ok(rep) => {
                     let gtx = if opts.deconv { &gt } else { &gt_blurred };
@@ -1088,6 +1097,11 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         variants.push(("Ghost-no-xreg".into(), mk(&|o| o.x_registration = false)));
         variants.push(("Ghost-no-burst".into(), mk(&|o| o.burst_repair = false)));
         variants.push(("Ghost-no-nlm".into(), mk(&|o| o.temporal_nlm = false)));
+        variants.push(("Ghost-wiener".into(), mk(&|o| o.wiener = true)));
+        variants.push(("Ghost-wiener-only".into(), mk(&|o| {
+            o.wiener = true;
+            o.temporal_nlm = false;
+        })));
         if params.cadence_jitter > 0.0 || params.drop_frames > 0.0 || params.timestamp_noise > 0.0 {
             // F13: what the reconstruction looks like when the per-frame
             // timestamps are ignored and frame index is trusted as position.

@@ -459,3 +459,90 @@ pub fn pca_topk(samples: &[Vec<f64>], k: usize, iters: usize) -> (Vec<Vec<f64>>,
     }
     (comps, mean)
 }
+
+/// In-place radix-2 complex FFT. `re`/`im` must be the same power-of-two
+/// length. `inverse` conjugates the twiddles and scales by 1/n.
+///
+/// Hand-rolled to keep the dependency list short, in the same spirit as the
+/// rest of this module. Iterative Cooley-Tukey: bit-reversal permutation, then
+/// log2(n) butterfly passes.
+pub fn fft_inplace(re: &mut [f64], im: &mut [f64], inverse: bool) {
+    let n = re.len();
+    debug_assert_eq!(n, im.len());
+    debug_assert!(n.is_power_of_two());
+    if n < 2 {
+        return;
+    }
+    // bit-reversal permutation
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let mut len = 2usize;
+    while len <= n {
+        let ang = sign * std::f64::consts::TAU / len as f64;
+        let (wr, wi) = (ang.cos(), ang.sin());
+        let mut i = 0usize;
+        while i < n {
+            let (mut cr, mut ci) = (1.0f64, 0.0f64);
+            for k in 0..len / 2 {
+                let (ur, ui) = (re[i + k], im[i + k]);
+                let (vr, vi) = (
+                    re[i + k + len / 2] * cr - im[i + k + len / 2] * ci,
+                    re[i + k + len / 2] * ci + im[i + k + len / 2] * cr,
+                );
+                re[i + k] = ur + vr;
+                im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr;
+                im[i + k + len / 2] = ui - vi;
+                let nr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = nr;
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+    if inverse {
+        let inv = 1.0 / n as f64;
+        for k in 0..n {
+            re[k] *= inv;
+            im[k] *= inv;
+        }
+    }
+}
+
+/// 2-D FFT over a `w x h` (both powers of two) row-major complex plane.
+pub fn fft2_inplace(re: &mut [f64], im: &mut [f64], w: usize, h: usize, inverse: bool) {
+    use rayon::prelude::*;
+    // rows
+    re.par_chunks_mut(w)
+        .zip(im.par_chunks_mut(w))
+        .for_each(|(rr, ri)| fft_inplace(rr, ri, inverse));
+    // columns: transpose-free gather/scatter, parallel over columns in blocks
+    let cols: Vec<(usize, Vec<f64>, Vec<f64>)> = (0..w)
+        .into_par_iter()
+        .map(|x| {
+            let mut cr: Vec<f64> = (0..h).map(|y| re[y * w + x]).collect();
+            let mut ci: Vec<f64> = (0..h).map(|y| im[y * w + x]).collect();
+            fft_inplace(&mut cr, &mut ci, inverse);
+            (x, cr, ci)
+        })
+        .collect();
+    for (x, cr, ci) in cols {
+        for y in 0..h {
+            re[y * w + x] = cr[y];
+            im[y * w + x] = ci[y];
+        }
+    }
+}
