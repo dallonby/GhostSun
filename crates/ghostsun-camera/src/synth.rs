@@ -121,6 +121,9 @@ impl Camera for SynthCam {
 
         self.frame = self.frame.wrapping_add(1);
         Ok(Frame {
+            host_time: std::time::SystemTime::now(),
+            device_time_us: None,
+            seq: None,
             width: w,
             height: h,
             data,

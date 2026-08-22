@@ -242,6 +242,9 @@ impl AsiCam {
     }
 
     fn frame_from_buffer(&self) -> Frame {
+        // Stamped as soon as the SDK hands the buffer over; the ASI API has
+        // no per-frame camera clock on non-GPS models.
+        let host_time = std::time::SystemTime::now();
         let (w, h) = (self.width, self.height);
         let mut data = vec![0u16; w * h];
         if self.bit_depth <= 8 {
@@ -257,6 +260,9 @@ impl AsiCam {
             width: w,
             height: h,
             data,
+            host_time,
+            device_time_us: None,
+            seq: None,
         }
     }
 }

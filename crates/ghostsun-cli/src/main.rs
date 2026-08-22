@@ -66,6 +66,14 @@ struct SynthArgs {
     /// fraction of frames hit by seeing bursts (F11 tests)
     #[arg(long, default_value_t = 0.0)]
     bursts: f64,
+    /// per-frame delivery jitter as a fraction of the frame interval, written
+    /// into the SER timestamps (0.15 is a realistic USB hiccup) — F13 tests
+    #[arg(long, default_value_t = 0.0)]
+    cadence_jitter: f64,
+    /// fraction of frames dropped before reaching the recorder; the surviving
+    /// frames' timestamps still say where they belong — F13 tests
+    #[arg(long, default_value_t = 0.0)]
+    drop_frames: f64,
 }
 
 impl SynthArgs {
@@ -88,6 +96,8 @@ impl SynthArgs {
             exposure: self.exposure,
             telluric: self.telluric,
             bursts: self.bursts,
+            cadence_jitter: self.cadence_jitter,
+            drop_frames: self.drop_frames,
             ..Default::default()
         }
     }
@@ -156,6 +166,10 @@ enum Cmd {
         /// disable temporal NLM smoothing (F11.5)
         #[arg(long)]
         no_nlm: bool,
+        /// ignore the SER's per-frame timestamps; treat frame index as the
+        /// scan-axis coordinate (F13)
+        #[arg(long)]
+        no_timing: bool,
         /// disable GPU compute kernels (CPU only)
         #[arg(long)]
         no_gpu: bool,
@@ -202,6 +216,13 @@ enum Cmd {
         /// disk tone-curve gamma
         #[arg(long, default_value_t = 0.7)]
         gamma: f64,
+    },
+    /// Report a SER scan's per-frame acquisition timing (F13)
+    Timing {
+        ser: PathBuf,
+        /// also dump per-frame time, slot residual and interval to CSV
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Dump the de-smiled mean spectrum profile of a SER scan (CSV)
     Spectrum {
@@ -288,7 +309,15 @@ fn save_recon_outputs(dir: &Path, name: &str, rep: &pipeline::ReconReport, veloc
     let mx = img.max();
     output::write_png16(&dir.join(format!("{name}_linear.png")), img, Some((0.0, mx))).unwrap();
     output::write_png16(&dir.join(format!("{name}_display.png")), img, None).unwrap();
-    output::write_fits_f32(&dir.join(format!("{name}.fits")), img).unwrap();
+    // Acquisition time belongs on the science product: a scan is a time
+    // series, so the disk is dated by its MID-scan epoch, with the endpoints
+    // recorded alongside.
+    let meta = rep
+        .timing
+        .as_ref()
+        .map(|t| t.fits_meta())
+        .unwrap_or_default();
+    output::write_fits_f32_meta(&dir.join(format!("{name}.fits")), img, &meta).unwrap();
     if std::env::var_os("GS_SAVE_DEMIX_BEFORE").is_some() {
         if let Some(before) = &rep.demix_before {
             output::write_png16(&dir.join(format!("{name}_before_demix.png")), before, None).unwrap();
@@ -324,7 +353,7 @@ fn main() {
         Cmd::Recon {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
-            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_gpu, map_iterations, tune, dispersion, composite, line_x, name,
+            velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_timing, no_gpu, map_iterations, tune, dispersion, composite, line_x, name,
         } => {
             std::fs::create_dir_all(&out_dir).unwrap();
             let force_transpose = match dispersion.as_str() {
@@ -350,6 +379,7 @@ fn main() {
                 x_registration: !no_xreg,
                 burst_repair: !no_burst_repair,
                 temporal_nlm: !no_nlm,
+                use_timing: !no_timing,
                 use_gpu: !no_gpu,
                 map_iterations,
                 force_transpose,
@@ -701,6 +731,84 @@ fn main() {
                 }
             }
         }
+        Cmd::Timing { ser, out } => {
+            let reader = match ghostsun_core::ser::SerReader::open(&ser) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("SER open: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let hdr = &reader.header;
+            println!(
+                "{}: {}x{} x{} frames, {} bit",
+                ser.display(), hdr.width, hdr.height, hdr.frame_count, hdr.bit_depth
+            );
+            println!(
+                "header start: {} UTC",
+                ghostsun_core::ser::ticks_to_iso8601(hdr.date_time_utc)
+            );
+            let Some(ticks) = reader.timestamps.clone() else {
+                println!("no per-frame timestamp trailer — frame index is the only scan coordinate");
+                return;
+            };
+            println!("trailer: {} per-frame timestamps", ticks.len());
+            match ghostsun_core::timing::ScanTiming::from_ticks(&ticks) {
+                None => println!("timestamps unusable (non-monotonic, or too few frames)"),
+                Some(t) => {
+                    println!("  {}", t.summary());
+                    println!(
+                        "  first {} UTC\n  mid   {} UTC\n  last  {} UTC",
+                        ghostsun_core::ser::ticks_to_iso8601(t.first_utc_ticks),
+                        ghostsun_core::ser::ticks_to_iso8601(t.mid_utc_ticks()),
+                        ghostsun_core::ser::ticks_to_iso8601(t.last_utc_ticks),
+                    );
+                    // Interval distribution: how far from a metronome the
+                    // camera actually ran.
+                    let mut iv: Vec<f64> = t
+                        .seconds
+                        .windows(2)
+                        .map(|w| (w[1] - w[0]) * 1e3)
+                        .collect();
+                    iv.sort_by(|a, b| a.total_cmp(b));
+                    let q = |f: f64| iv[((iv.len() - 1) as f64 * f) as usize];
+                    println!(
+                        "  interval ms: min {:.3}  p05 {:.3}  p50 {:.3}  p95 {:.3}  max {:.3}",
+                        iv[0], q(0.05), q(0.5), q(0.95), iv[iv.len() - 1]
+                    );
+                    println!(
+                        "  scan-axis effect: {}",
+                        if t.worth_regridding() {
+                            format!(
+                                "reconstruction regrids {} frames onto {} time columns",
+                                t.position.len(), t.grid_w
+                            )
+                        } else {
+                            "cadence uniform within the deadband; no regrid".to_string()
+                        }
+                    );
+                    if let Some(path) = out {
+                        let mut txt = String::from("frame,seconds,position,slot_residual,interval_ms\n");
+                        for k in 0..t.seconds.len() {
+                            let dt = if k > 0 {
+                                (t.seconds[k] - t.seconds[k - 1]) * 1e3
+                            } else {
+                                0.0
+                            };
+                            txt.push_str(&format!(
+                                "{k},{:.6},{:.4},{:+.4},{:.4}\n",
+                                t.seconds[k], t.position[k], t.residual[k], dt
+                            ));
+                        }
+                        if let Err(e) = std::fs::write(&path, txt) {
+                            eprintln!("write {}: {e}", path.display());
+                        } else {
+                            println!("wrote {}", path.display());
+                        }
+                    }
+                }
+            }
+        }
         Cmd::Spectrum { ser, out } => {
             match pipeline::mean_spectrum(&ser) {
                 Ok((offsets, profile)) => {
@@ -900,6 +1008,11 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         variants.push(("Ghost-no-xreg".into(), mk(&|o| o.x_registration = false)));
         variants.push(("Ghost-no-burst".into(), mk(&|o| o.burst_repair = false)));
         variants.push(("Ghost-no-nlm".into(), mk(&|o| o.temporal_nlm = false)));
+        if params.cadence_jitter > 0.0 || params.drop_frames > 0.0 {
+            // F13: what the reconstruction looks like when the per-frame
+            // timestamps are ignored and frame index is trusted as position.
+            variants.push(("Ghost-no-timing".into(), mk(&|o| o.use_timing = false)));
+        }
         variants.push(("Ghost-map2".into(), mk(&|o| o.map_iterations = 2)));
     }
     if params.psf_seeing_px > 0.0 {

@@ -80,8 +80,44 @@ fn fits_card(key: &str, value: &str) -> [u8; 80] {
     card
 }
 
+/// A quoted FITS string card: `KEY     = 'value'`. Numeric values go through
+/// [`fits_card`], which right-justifies them unquoted as the standard wants.
+fn fits_string_card(key: &str, value: &str) -> [u8; 80] {
+    let mut card = [b' '; 80];
+    // Single quotes inside a FITS string are escaped by doubling.
+    let escaped = value.replace('\'', "''");
+    let s = format!("{:<8}= '{}'", key, escaped);
+    let n = s.len().min(80);
+    card[..n].copy_from_slice(&s.as_bytes()[..n]);
+    card
+}
+
+/// Acquisition metadata for the FITS header. Every field is optional: a scan
+/// whose SER carried no per-frame timestamps simply writes fewer cards.
+#[derive(Clone, Debug, Default)]
+pub struct FitsMeta {
+    /// Mid-scan UTC, ISO-8601. The epoch that describes the whole disk — a
+    /// scan is a time series, so neither end of it dates the image.
+    pub date_obs: Option<String>,
+    /// First and last frame UTC, ISO-8601.
+    pub date_beg: Option<String>,
+    pub date_end: Option<String>,
+    /// Elapsed scan duration in seconds.
+    pub exptime: Option<f64>,
+    /// Mean frame rate over the scan.
+    pub cadence_fps: Option<f64>,
+    /// Frames recorded, and grid columns with no frame in them.
+    pub frames: Option<usize>,
+    pub dropped: Option<usize>,
+}
+
 /// Write a BITPIX=-32 (f32) FITS file — the lossless science product.
 pub fn write_fits_f32(path: &Path, img: &Image) -> io::Result<()> {
+    write_fits_f32_meta(path, img, &FitsMeta::default())
+}
+
+/// As [`write_fits_f32`], with acquisition metadata cards.
+pub fn write_fits_f32_meta(path: &Path, img: &Image, meta: &FitsMeta) -> io::Result<()> {
     let mut f = File::create(path)?;
     let mut header: Vec<u8> = Vec::new();
     let mut simple = [b' '; 80];
@@ -97,6 +133,27 @@ pub fn write_fits_f32(path: &Path, img: &Image) -> io::Result<()> {
     let cs = b"CREATOR = 'GhostSun'";
     creator[..cs.len()].copy_from_slice(cs);
     header.extend_from_slice(&creator);
+    if let Some(v) = &meta.date_obs {
+        header.extend_from_slice(&fits_string_card("DATE-OBS", v));
+    }
+    if let Some(v) = &meta.date_beg {
+        header.extend_from_slice(&fits_string_card("DATE-BEG", v));
+    }
+    if let Some(v) = &meta.date_end {
+        header.extend_from_slice(&fits_string_card("DATE-END", v));
+    }
+    if let Some(v) = meta.exptime {
+        header.extend_from_slice(&fits_card("EXPTIME", &format!("{v:.3}")));
+    }
+    if let Some(v) = meta.cadence_fps {
+        header.extend_from_slice(&fits_card("CADENCE", &format!("{v:.4}")));
+    }
+    if let Some(v) = meta.frames {
+        header.extend_from_slice(&fits_card("NFRAMES", &v.to_string()));
+    }
+    if let Some(v) = meta.dropped {
+        header.extend_from_slice(&fits_card("NDROPPED", &v.to_string()));
+    }
     let mut end = [b' '; 80];
     end[..3].copy_from_slice(b"END");
     header.extend_from_slice(&end);

@@ -114,6 +114,10 @@ pub struct ReconOptions {
     pub burst_repair: bool,
     /// F11.5: temporal non-local-means smoothing
     pub temporal_nlm: bool,
+    /// Use the SER's per-frame timestamps as the scan-axis coordinate when the
+    /// file carries them (resamples onto a uniform time grid). No effect on
+    /// files without a timestamp trailer.
+    pub use_timing: bool,
     /// M2: use wgpu compute kernels where available (CPU fallback)
     pub use_gpu: bool,
     /// F8: extra block-coordinate refinement iterations (0 = single pass)
@@ -157,6 +161,7 @@ impl Default for ReconOptions {
             x_registration: true,
             burst_repair: true,
             temporal_nlm: true,
+            use_timing: true,
             use_gpu: true,
             map_iterations: 0,
             tune: TuneParams::default(),
@@ -197,6 +202,11 @@ pub struct ReconReport {
     pub xreg_applied: Vec<f64>,
     /// F11: burst-flagged columns
     pub burst_flags: Vec<bool>,
+    /// F13: per-frame acquisition timing, when the SER carried timestamps.
+    pub timing: Option<crate::timing::TimingSummary>,
+    /// Grid columns interpolated across a dropped-frame gap rather than
+    /// measured. Empty when no regrid happened.
+    pub gap_columns: Vec<bool>,
     /// per-column photometric gain divided out
     pub column_gain: Vec<f64>,
     /// Multi-line composite: number of spectral lines stacked (primary +
@@ -233,6 +243,40 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let reader = SerReader::open(ser_path).map_err(|e| format!("SER open: {e}"))?;
     let hdr = &reader.header;
     vlog!(opts, "SER: {}x{} x{} frames, {} bit", hdr.width, hdr.height, hdr.frame_count, hdr.bit_depth);
+
+    // ---- F13: per-frame timing ----
+    // Frame index is the scan-axis coordinate only if frames arrive on a
+    // perfect clock. When the file carries timestamps we know where each
+    // frame really belongs, and resample onto a uniform time grid after
+    // extraction. Extraction itself stays frame-indexed, so every later
+    // re-extraction (continuum, wings, companion lines) is regridded the same
+    // way to keep all per-column vectors on one axis.
+    let timing = if opts.use_timing && !opts.baseline {
+        crate::timing::ScanTiming::from_reader(&reader)
+    } else {
+        None
+    };
+    let regrid_src: Option<Vec<f64>> = timing.as_ref().and_then(|t| {
+        if t.worth_regridding() {
+            Some(t.source_columns())
+        } else {
+            None
+        }
+    });
+    if let Some(t) = &timing {
+        vlog!(
+            opts,
+            "timing: {} [{}]",
+            t.summary(),
+            if regrid_src.is_some() { "regridding" } else { "uniform, no regrid" }
+        );
+    }
+    let regrid = |img: Image| -> Image {
+        match &regrid_src {
+            Some(src) => crate::timing::regrid_columns(&img, src),
+            None => img,
+        }
+    };
 
     // ---- mean image over frames with signal (rayon: this was the single
     // largest stage at ~11 s on a 9100-frame scan when serial) ----
@@ -520,14 +564,25 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         };
         (reconstruct_disk(&reader, &geom, &exopts), vec![0.0; n], None)
     };
+    if regrid_src.is_some() {
+        let before = disk.w;
+        disk = regrid(disk);
+        velocity_raw = velocity_raw.map(&regrid);
+        vlog!(opts, "time regrid: {} frames -> {} columns", before, disk.w);
+        stage!("time regrid");
+    }
     let raw_disk = disk.clone();
     vlog!(opts, "raw disk: {}x{}", disk.w, disk.h);
     stage!("extraction");
 
     // ---- photometric & registration corrections ----
-    let mut jitter_applied = pre_extraction_motion
-        .clone()
-        .unwrap_or_else(|| vec![0.0f64; disk.w]);
+    // Per-frame series recorded before the regrid are resampled onto the same
+    // grid, so every per-column vector indexes the regridded disk.
+    let mut jitter_applied = match (&pre_extraction_motion, &regrid_src) {
+        (Some(m), Some(src)) => crate::timing::regrid_series(m, src),
+        (Some(m), None) => m.clone(),
+        (None, _) => vec![0.0f64; disk.w],
+    };
     let mut xreg_applied = vec![0.0f64; disk.w];
     let mut burst_flags = vec![false; disk.w];
     let mut column_gain = vec![1.0f64; disk.w];
@@ -537,7 +592,10 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     } else {
         if opts.transparency_correction {
             let fluxv = if let Some(flux) = profile_continuum_flux.take() {
-                flux
+                match &regrid_src {
+                    Some(src) => crate::timing::regrid_series(&flux, src),
+                    None => flux,
+                }
             } else {
                 let cont_opts = ExtractOptions {
                     shift: opts.shift + continuum_shift,
@@ -545,7 +603,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                     kernel: SpectralKernel::Gaussian { sigma: 1.5 },
                     frame_offsets: if flex.iter().any(|f| f.abs() > 0.0) { Some(flex.clone()) } else { None },
                 };
-                let cont_disk = reconstruct_disk(&reader, &geom, &cont_opts);
+                let cont_disk = regrid(reconstruct_disk(&reader, &geom, &cont_opts));
                 flatfield::measure_column_flux(&cont_disk)
             };
             column_gain = flatfield::transparency_gains(&fluxv, opts.tune.transp_deadband);
@@ -879,7 +937,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                     vlog!(opts, "multi-line: seed {:.1} duplicate of existing line, skip", seed_x);
                     continue;
                 }
-                let mut cdisk = reconstruct_disk(
+                let mut cdisk = regrid(reconstruct_disk(
                     &reader,
                     &cgeom,
                     &ExtractOptions {
@@ -888,7 +946,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                         kernel: SpectralKernel::Point,
                         frame_offsets: flex_off.clone(),
                     },
-                );
+                ));
                 if opts.transparency_correction {
                     flatfield::apply_column_gains(&mut cdisk, &column_gain);
                 }
@@ -983,12 +1041,12 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             None
         };
         let mk = |sh: f64| {
-            reconstruct_disk(&reader, &geom, &ExtractOptions {
+            regrid(reconstruct_disk(&reader, &geom, &ExtractOptions {
                 shift: opts.shift + sh,
                 transpose_input: transpose,
                 kernel: SpectralKernel::Gaussian { sigma: 1.0 },
                 frame_offsets: offsets.clone(),
-            })
+            }))
         };
         let blue = mk(-wing);
         let red = mk(wing);
@@ -1068,6 +1126,11 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         wing_doppler,
         flex,
         psf_sigma,
+        timing: timing.as_ref().map(|t| t.summarize(regrid_src.is_some())),
+        gap_columns: match (&timing, &regrid_src) {
+            (Some(t), Some(src)) => crate::timing::gap_columns(t, src),
+            _ => Vec::new(),
+        },
         line_rms: geom.rms,
         ellipse_inliers: (fit.inliers, fit.total),
         ellipse_rms: fit.residual_rms,

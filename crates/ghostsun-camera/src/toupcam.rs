@@ -17,7 +17,7 @@ use std::os::raw::c_char;
 use std::os::raw::{c_int, c_uint, c_ushort, c_void};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use libloading::{Library, Symbol};
 
@@ -36,6 +36,11 @@ const TOUPCAM_MAX: usize = 128;
 const OPTION_RAW: c_uint = 0x04;
 const OPTION_BITDEPTH: c_uint = 0x06;
 const EVENT_IMAGE: c_uint = 0x0004;
+// Which fields of the frame info the camera actually filled in. The structs
+// are always returned; only these bits say a field means anything.
+const FRAMEINFO_FLAG_SEQ: c_uint = 0x0000_0001;
+const FRAMEINFO_FLAG_TIMESTAMP: c_uint = 0x0000_0002;
+const FRAMEINFO_FLAG_GPS: c_uint = 0x0000_0040;
 const E_PENDING: c_int = 0x8000_000a_u32 as c_int;
 
 #[repr(C)]
@@ -81,6 +86,34 @@ struct FrameInfoV3 {
     blacklevel: c_ushort,
 }
 
+/// GPS block of `ToupcamFrameInfoV4`. `utcstart`/`utcend` are nanoseconds
+/// since the Unix epoch — absolute exposure timing straight from the camera,
+/// present only on GPS-equipped models (flagged by `FRAMEINFO_FLAG_GPS`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Gps {
+    utcstart: u64,
+    utcend: u64,
+    longitude: c_int,
+    latitude: c_int,
+    altitude: c_int,
+    satellite: c_ushort,
+    reserved: c_ushort,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FrameInfoV4 {
+    v3: FrameInfoV3,
+    reserved: c_uint,
+    u_lum: c_uint,
+    u_fv: u64,
+    timecount: u64,
+    framecount: c_uint,
+    tricount: c_uint,
+    gps: Gps,
+}
+
 type EventCb = unsafe extern "C" fn(c_uint, *mut c_void);
 
 type FnEnumV2 = unsafe extern "C" fn(*mut DeviceV2) -> c_uint;
@@ -89,6 +122,8 @@ type FnClose = unsafe extern "C" fn(HToupcam);
 type FnStartPull = unsafe extern "C" fn(HToupcam, Option<EventCb>, *mut c_void) -> c_int;
 type FnPullV3 =
     unsafe extern "C" fn(HToupcam, *mut c_void, c_int, c_int, c_int, *mut FrameInfoV3) -> c_int;
+type FnPullV4 =
+    unsafe extern "C" fn(HToupcam, *mut c_void, c_int, c_int, c_int, *mut FrameInfoV4) -> c_int;
 type FnStop = unsafe extern "C" fn(HToupcam) -> c_int;
 type FnPutOption = unsafe extern "C" fn(HToupcam, c_uint, c_int) -> c_int;
 type FnPutExpoTime = unsafe extern "C" fn(HToupcam, c_uint) -> c_int;
@@ -96,6 +131,8 @@ type FnPutExpoAGain = unsafe extern "C" fn(HToupcam, c_ushort) -> c_int;
 type FnPutAutoExpo = unsafe extern "C" fn(HToupcam, c_int) -> c_int;
 type FnGetExpoTime = unsafe extern "C" fn(HToupcam, *mut c_uint) -> c_int;
 type FnGetExpoAGain = unsafe extern "C" fn(HToupcam, *mut c_ushort) -> c_int;
+type FnGetExpoAGainRange =
+    unsafe extern "C" fn(HToupcam, *mut c_ushort, *mut c_ushort, *mut c_ushort) -> c_int;
 type FnPutRoi = unsafe extern "C" fn(HToupcam, c_uint, c_uint, c_uint, c_uint) -> c_int;
 type FnGetFinalSize = unsafe extern "C" fn(HToupcam, *mut c_int, *mut c_int) -> c_int;
 type FnPutRealTime = unsafe extern "C" fn(HToupcam, c_int) -> c_int;
@@ -116,6 +153,8 @@ struct Api {
     close: FnClose,
     start_pull: FnStartPull,
     pull_v3: FnPullV3,
+    /// V4 adds GPS exposure timestamps; absent from older SDK builds.
+    pull_v4: Option<FnPullV4>,
     stop: FnStop,
     put_option: FnPutOption,
     put_expo: FnPutExpoTime,
@@ -123,6 +162,7 @@ struct Api {
     put_auto_expo: FnPutAutoExpo,
     get_expo: FnGetExpoTime,
     get_gain: FnGetExpoAGain,
+    get_gain_range: Option<FnGetExpoAGainRange>,
     put_roi: FnPutRoi,
     get_final_size: FnGetFinalSize,
     put_real_time: Option<FnPutRealTime>,
@@ -223,6 +263,7 @@ impl Api {
             close: sym(&lib, b"Toupcam_Close")?,
             start_pull: sym(&lib, b"Toupcam_StartPullModeWithCallback")?,
             pull_v3: sym(&lib, b"Toupcam_PullImageV3")?,
+            pull_v4: optional_sym(&lib, b"Toupcam_PullImageV4"),
             stop: sym(&lib, b"Toupcam_Stop")?,
             put_option: sym(&lib, b"Toupcam_put_Option")?,
             put_expo: sym(&lib, b"Toupcam_put_ExpoTime")?,
@@ -230,6 +271,7 @@ impl Api {
             put_auto_expo: sym(&lib, b"Toupcam_put_AutoExpoEnable")?,
             get_expo: sym(&lib, b"Toupcam_get_ExpoTime")?,
             get_gain: sym(&lib, b"Toupcam_get_ExpoAGain")?,
+            get_gain_range: optional_sym(&lib, b"Toupcam_get_ExpoAGainRange"),
             put_roi: sym(&lib, b"Toupcam_put_Roi")?,
             get_final_size: sym(&lib, b"Toupcam_get_FinalSize")?,
             put_real_time: optional_sym(&lib, b"Toupcam_put_RealTime"),
@@ -290,6 +332,8 @@ pub fn enumerate() -> Vec<CameraInfo> {
             max_width: mw,
             max_height: mh,
             exposure_us: 100..=15_000_000,
+            // Conservative guess; the true per-model ceiling needs an open
+            // handle, so `open` re-queries it via get_ExpoAGainRange.
             gain: 100..=1000,
         });
     }
@@ -324,12 +368,21 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
             put_real_time(h, 1);
         }
     }
+    // Replace the enumerate-time gain guess with the device's real range
+    // (e.g. IMX678-class models allow far more than 1000%).
+    let mut info = info.clone();
+    if let Some(get_gain_range) = api.get_gain_range {
+        let (mut lo, mut hi, mut def) = (0 as c_ushort, 0 as c_ushort, 0 as c_ushort);
+        if unsafe { get_gain_range(h, &mut lo, &mut hi, &mut def) } >= 0 && lo < hi {
+            info.gain = lo..=hi;
+        }
+    }
     let (tx, rx) = channel();
     let signal = Box::into_raw(Box::new(Signal { tx }));
     Ok(Box::new(ToupcamCam {
         api,
         h,
-        info: info.clone(),
+        info,
         rx,
         signal,
         width: 0,
@@ -343,21 +396,32 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
 
 /// Passed to the SDK as the callback context; the callback only sends on `tx`.
 struct Signal {
-    tx: Sender<()>,
+    /// Host time at which the SDK announced a ready frame — the earliest
+    /// host-side stamp available, ahead of the pull on the capture thread.
+    tx: Sender<SystemTime>,
 }
 
 unsafe extern "C" fn on_event(n_event: c_uint, ctx: *mut c_void) {
     if n_event == EVENT_IMAGE && !ctx.is_null() {
         let sig = &*(ctx as *const Signal);
-        let _ = sig.tx.send(());
+        let _ = sig.tx.send(SystemTime::now());
     }
+}
+
+/// Per-frame timing the camera reported, filtered by its validity flags.
+#[derive(Clone, Copy, Default)]
+struct FrameTiming {
+    device_us: Option<u64>,
+    seq: Option<u64>,
+    /// GPS exposure start, nanoseconds since the Unix epoch.
+    utc_ns: Option<u64>,
 }
 
 pub struct ToupcamCam {
     api: Api,
     h: HToupcam,
     info: CameraInfo,
-    rx: Receiver<()>,
+    rx: Receiver<SystemTime>,
     signal: *mut Signal,
     width: usize,
     height: usize,
@@ -394,20 +458,37 @@ impl ToupcamCam {
         Ok(())
     }
 
-    fn pull_into_buffer(&mut self) -> crate::Result<(usize, usize)> {
+    fn pull_into_buffer(&mut self) -> crate::Result<(usize, usize, FrameTiming)> {
         let mut fi = FrameInfoV3::default();
+        let mut fi4 = FrameInfoV4::default();
         let bpp = self.bytes_per_pixel();
         let bits = if bpp == 1 { 8 } else { 16 };
         let pitch = (self.width * bpp) as c_int;
-        let hr = unsafe {
-            (self.api.pull_v3)(
-                self.h,
-                self.buf.as_mut_ptr() as *mut c_void,
-                0,
-                bits,
-                pitch,
-                &mut fi,
-            )
+        let hr = match self.api.pull_v4 {
+            Some(pull_v4) => {
+                let hr = unsafe {
+                    pull_v4(
+                        self.h,
+                        self.buf.as_mut_ptr() as *mut c_void,
+                        0,
+                        bits,
+                        pitch,
+                        &mut fi4,
+                    )
+                };
+                fi = fi4.v3;
+                hr
+            }
+            None => unsafe {
+                (self.api.pull_v3)(
+                    self.h,
+                    self.buf.as_mut_ptr() as *mut c_void,
+                    0,
+                    bits,
+                    pitch,
+                    &mut fi,
+                )
+            },
         };
         if hr == E_PENDING {
             return Err(CameraError::Timeout);
@@ -421,10 +502,27 @@ impl ToupcamCam {
                 "PullImageV3 returned bad dimensions".into(),
             ));
         }
-        Ok((w, h))
+        // Only the fields the camera flagged as filled in are trusted; the
+        // structs come back populated either way.
+        Ok((
+            w,
+            h,
+            FrameTiming {
+                device_us: (fi.flag & FRAMEINFO_FLAG_TIMESTAMP != 0).then_some(fi.timestamp),
+                seq: (fi.flag & FRAMEINFO_FLAG_SEQ != 0).then(|| u64::from(fi.seq)),
+                utc_ns: (self.api.pull_v4.is_some() && fi4.v3.flag & FRAMEINFO_FLAG_GPS != 0)
+                    .then_some(fi4.gps.utcstart),
+            },
+        ))
     }
 
-    fn frame_from_buffer(&self, w: usize, h: usize) -> Frame {
+    fn frame_from_buffer(
+        &self,
+        w: usize,
+        h: usize,
+        host_time: SystemTime,
+        t: &FrameTiming,
+    ) -> Frame {
         let mut data = vec![0u16; w * h];
         if self.bytes_per_pixel() == 1 {
             for (i, px) in data.iter_mut().enumerate() {
@@ -440,15 +538,29 @@ impl ToupcamCam {
             width: w,
             height: h,
             data,
+            // Best absolute time the camera offered: a GPS exposure start
+            // beats the host stamp outright, since it needs no latency
+            // correction at all.
+            host_time: match t.utc_ns {
+                Some(ns) => std::time::UNIX_EPOCH + Duration::from_nanos(ns),
+                None => host_time,
+            },
+            // The camera's own free-running clock. Exact in SPACING even when
+            // it has no idea what the absolute time is, which is what the SER
+            // recorder needs to remove host-side delivery jitter.
+            device_time_us: t.device_us,
+            seq: t.seq,
         }
     }
 
-    fn wait_for_image(&self, timeout_ms: u32) -> crate::Result<()> {
+    /// Block for the next frame-ready notification; returns the host time at
+    /// which the SDK raised it.
+    fn wait_for_image(&self, timeout_ms: u32) -> crate::Result<SystemTime> {
         match self
             .rx
             .recv_timeout(Duration::from_millis(timeout_ms as u64))
         {
-            Ok(()) => Ok(()),
+            Ok(t) => Ok(t),
             Err(RecvTimeoutError::Timeout) => Err(CameraError::Timeout),
             Err(RecvTimeoutError::Disconnected) => {
                 Err(CameraError::Sdk("event channel closed".into()))
@@ -471,7 +583,10 @@ impl Camera for ToupcamCam {
     }
 
     fn set_gain(&mut self, gain: u16) -> crate::Result<()> {
-        let hr = unsafe { (self.api.put_gain)(self.h, gain.max(100)) };
+        // Clamp to the device range queried at open; the SDK rejects
+        // out-of-range values outright rather than saturating.
+        let gain = gain.clamp(*self.info.gain.start(), *self.info.gain.end());
+        let hr = unsafe { (self.api.put_gain)(self.h, gain) };
         if hr < 0 {
             return Err(CameraError::Sdk("put_ExpoAGain failed".into()));
         }
@@ -557,9 +672,9 @@ impl Camera for ToupcamCam {
         if !self.started {
             return Err(CameraError::Sdk("camera not started".into()));
         }
-        self.wait_for_image(timeout_ms)?;
-        let (w, h) = self.pull_into_buffer()?;
-        Ok(self.frame_from_buffer(w, h))
+        let host_time = self.wait_for_image(timeout_ms)?;
+        let (w, h, t) = self.pull_into_buffer()?;
+        Ok(self.frame_from_buffer(w, h, host_time, &t))
     }
 
     fn next_preview_frame(&mut self, timeout_ms: u32) -> crate::Result<Frame> {
@@ -572,9 +687,9 @@ impl Camera for ToupcamCam {
         // Toupcam_Flush here can race USB delivery and produce horizontally
         // torn frames on some cameras.
         while self.rx.try_recv().is_ok() {}
-        self.wait_for_image(timeout_ms)?;
-        let (w, h) = self.pull_into_buffer()?;
-        Ok(self.frame_from_buffer(w, h))
+        let host_time = self.wait_for_image(timeout_ms)?;
+        let (w, h, t) = self.pull_into_buffer()?;
+        Ok(self.frame_from_buffer(w, h, host_time, &t))
     }
 
     fn resume_preview(&mut self) -> crate::Result<()> {

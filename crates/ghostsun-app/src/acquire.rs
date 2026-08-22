@@ -1443,6 +1443,8 @@ fn process_scans(
     tx: &Sender<ProcessMessage>,
 ) -> Result<AcquireOutput, String> {
     let mut images = Vec::with_capacity(files.len());
+    // Acquisition metadata of the first scan, carried onto the stacked product.
+    let mut stack_meta: Option<output::FitsMeta> = None;
     for (index, (path, reverse)) in files.iter().enumerate() {
         let _ = tx.send(ProcessMessage::Log(format!(
             "Reconstructing scan {}/{}{}",
@@ -1460,10 +1462,19 @@ fn process_scans(
             ..Default::default()
         };
         let report = pipeline::reconstruct(path, &opts)?;
+        let meta = report
+            .timing
+            .as_ref()
+            .map(|t| t.fits_meta())
+            .unwrap_or_default();
+        // Keep the first scan's acquisition time for the stacked product.
+        if stack_meta.is_none() {
+            stack_meta = Some(meta.clone());
+        }
         let image = report.output.image;
         let fits = session_dir.join(format!("reconstruction-{:02}.fits", index + 1));
         let png = session_dir.join(format!("reconstruction-{:02}.png", index + 1));
-        output::write_fits_f32(&fits, &image)
+        output::write_fits_f32_meta(&fits, &image, &meta)
             .map_err(|e| format!("write {}: {e}", fits.display()))?;
         output::write_png16(&png, &image, None)
             .map_err(|e| format!("write {}: {e}", png.display()))?;
@@ -1506,7 +1517,7 @@ fn process_scans(
     };
     let fits = session_dir.join(format!("{stem}.fits"));
     let png = session_dir.join(format!("{stem}.png"));
-    output::write_fits_f32(&fits, &final_image)
+    output::write_fits_f32_meta(&fits, &final_image, &stack_meta.unwrap_or_default())
         .map_err(|e| format!("write {}: {e}", fits.display()))?;
     output::write_png16(&png, &final_image, None)
         .map_err(|e| format!("write {}: {e}", png.display()))?;

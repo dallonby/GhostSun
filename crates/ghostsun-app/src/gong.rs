@@ -20,7 +20,10 @@ pub struct GongReference {
 pub fn download_nearest(ser_path: &Path) -> Result<GongReference, String> {
     let reader =
         SerReader::open(ser_path).map_err(|e| format!("cannot read SER timestamp: {e}"))?;
-    let ticks = reader.header.date_time_utc;
+    // Mid-scan, not the header's start time: a scan is a time series tens of
+    // seconds long, and the disk being matched is the average of all of it.
+    // Falls back to the header when the SER has no per-frame timestamps.
+    let ticks = reader.scan_mid_utc_ticks();
     if ticks <= DOTNET_UNIX_EPOCH_SECONDS * 10_000_000 {
         return Err(
             "this SER has no valid UTC timestamp; GONG feature matching needs acquisition time"

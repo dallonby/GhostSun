@@ -65,7 +65,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
 use ghostsun_camera::{enumerate_all, open, Backend, CameraInfo, Roi};
 use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
-use ghostsun_core::ser::SerRecorder;
+use ghostsun_core::ser::{FrameTime, SerRecorder};
 
 use crate::focusmetrics::{self, LuckyBuf, StructureSplit};
 use crate::vcurve::{self, NullPoint, ParabolaFit, VCurve};
@@ -196,6 +196,10 @@ pub struct FocusUpdate {
 }
 
 enum FocusMsg {
+    /// Sent once after the camera opens: the open handle knows the true
+    /// control ranges (e.g. the ToupTek per-model gain ceiling), which can be
+    /// wider than the enumerate-time guess bounding the sliders.
+    Opened(CameraInfo),
     Frame(Box<FocusUpdate>),
     RecordingStarted {
         path: PathBuf,
@@ -210,6 +214,8 @@ enum FocusMsg {
         /// Achieved capture rate; 0 when unknown (fewer than two frames).
         fps: f64,
         hw_roi: bool,
+        /// Per-frame times were written from the camera clock, not host stamps.
+        device_clock: bool,
     },
     RecordingError(String),
     Error(String),
@@ -592,6 +598,18 @@ impl FocusState {
         if let Some(rx) = &self.rx {
             loop {
                 match rx.try_recv() {
+                    Ok(FocusMsg::Opened(info)) => {
+                        // Adopt the open handle's true control ranges so the
+                        // sliders (and their clamp) track the real device
+                        // limits rather than the enumerate-time guess.
+                        if let Some(c) = self
+                            .cameras
+                            .iter_mut()
+                            .find(|c| c.backend == info.backend && c.id == info.id)
+                        {
+                            *c = info;
+                        }
+                    }
                     Ok(FocusMsg::Frame(u)) => {
                         if let Some(pending) = &self.frame_pending {
                             pending.store(false, Ordering::Release);
@@ -629,22 +647,25 @@ impl FocusState {
                     self.recorded_frames = frames;
                     self.recording_status = format!("recording · {frames} frames");
                 }
-                FocusMsg::RecordingStopped { path, frames, fps, hw_roi } => {
+                FocusMsg::RecordingStopped { path, frames, fps, hw_roi, device_clock } => {
                     self.recording = false;
                     self.recorded_frames = frames;
                     self.recording_path = Some(path);
                     let mode = if hw_roi { " · hardware ROI" } else { "" };
+                    // The clock behind the per-frame timestamps decides how
+                    // precisely reconstruction can place each column.
+                    let clock = if device_clock { " · camera clock" } else { " · host clock" };
                     self.recording_status = if fps > 0.0 {
-                        format!("saved {frames} frames · {fps:.1} fps{mode}")
+                        format!("saved {frames} frames · {fps:.1} fps{mode}{clock}")
                     } else {
-                        format!("saved {frames} frames{mode}")
+                        format!("saved {frames} frames{mode}{clock}")
                     };
                 }
                 FocusMsg::RecordingError(error) => {
                     self.recording = false;
                     self.recording_status = format!("SER recording failed: {error}");
                 }
-                FocusMsg::Frame(_) | FocusMsg::Error(_) => unreachable!(),
+                FocusMsg::Opened(_) | FocusMsg::Frame(_) | FocusMsg::Error(_) => unreachable!(),
             }
         }
         if let Some(e) = err {
@@ -1236,8 +1257,14 @@ impl FocusState {
         } else {
             "gain"
         });
+        // Device ranges can run to thousands of percent (queried at open);
+        // keep the everyday low end usable by going logarithmic when wide.
+        let wide_gain = gmin > 0 && gmax / gmin >= 20;
         if ui
-            .add_enabled(manual, egui::Slider::new(&mut self.gain, gmin..=gmax))
+            .add_enabled(
+                manual,
+                egui::Slider::new(&mut self.gain, gmin..=gmax).logarithmic(wide_gain),
+            )
             .changed()
         {
             self.send_cmd(FocusCmd::Gain(self.gain));
@@ -2612,6 +2639,7 @@ fn worker(
             return;
         }
     };
+    let _ = tx.send(FocusMsg::Opened(cam.info().clone()));
     cam.set_exposure_us(exposure_us).ok();
     cam.set_gain(gain).ok();
     cam.set_auto_exposure(auto_exposure).ok();
@@ -2729,6 +2757,7 @@ fn worker(
                             frames: 0,
                             fps: 0.0,
                             hw_roi: false,
+                            device_clock: false,
                         });
                     }
                 }
@@ -2794,7 +2823,11 @@ fn worker(
                     } else {
                         let start = active.y0 * frame.width;
                         let end = start + active.height * frame.width;
-                        match active.recorder.write_frame(&frame.data[start..end]) {
+                        let ftime = FrameTime {
+                            host: frame.host_time,
+                            device_us: frame.device_time_us,
+                        };
+                        match active.recorder.write_frame(&frame.data[start..end], ftime) {
                             Ok(()) => {
                                 let frames = active.recorder.frame_count();
                                 if frames == 1 || frames % 10 == 0 {
@@ -2924,14 +2957,26 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
     let elapsed = active.started.elapsed().as_secs_f64();
     let hw_roi = active.hw_roi_y0.is_some();
     match active.recorder.finish() {
-        Ok(frames) => {
-            // (frames - 1) intervals, since `started` is stamped at frame 1.
-            let fps = if frames > 1 && elapsed > 0.0 {
-                (frames as f64 - 1.0) / elapsed
-            } else {
-                0.0
-            };
-            FocusMsg::RecordingStopped { path, frames, fps, hw_roi }
+        Ok(summary) => {
+            let frames = summary.frames;
+            // Prefer the timestamp trailer: it spans first-to-last frame on
+            // the camera clock, where `started` is a capture-thread Instant
+            // taken at recording start.
+            let fps = summary.fps().unwrap_or({
+                // (frames - 1) intervals, since `started` is stamped at frame 1.
+                if frames > 1 && elapsed > 0.0 {
+                    (frames as f64 - 1.0) / elapsed
+                } else {
+                    0.0
+                }
+            });
+            FocusMsg::RecordingStopped {
+                path,
+                frames,
+                fps,
+                hw_roi,
+                device_clock: summary.device_clock,
+            }
         }
         Err(error) => FocusMsg::RecordingError(error.to_string()),
     }

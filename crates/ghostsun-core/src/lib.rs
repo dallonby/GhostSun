@@ -24,4 +24,5 @@ pub mod render;
 pub mod ser;
 pub mod stack;
 pub mod synth;
+pub mod timing;
 pub mod warp;

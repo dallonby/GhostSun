@@ -495,6 +495,9 @@ impl QhyCam {
             }
         }
         Ok(Frame {
+            host_time: std::time::SystemTime::now(),
+            device_time_us: None,
+            seq: None,
             width: self.width,
             height: self.height,
             data,

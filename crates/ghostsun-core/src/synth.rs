@@ -12,7 +12,6 @@
 //! exposure scaling.
 
 use crate::image2d::Image;
-use crate::ser::write_ser;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
@@ -52,6 +51,14 @@ pub struct SynthParams {
     pub telluric: bool,
     /// fraction of frames hit by seeing bursts (blur + displacement runs)
     pub bursts: f64,
+    /// Per-frame delivery jitter, as a fraction of the frame interval. The
+    /// sun keeps moving at a constant rate, so a late frame samples the sky
+    /// slightly further along; the SER timestamps record where it really is.
+    pub cadence_jitter: f64,
+    /// Fraction of frames dropped before reaching the recorder. Everything
+    /// after a drop is displaced by a whole column if frame index is trusted
+    /// as scan position.
+    pub drop_frames: f64,
     /// Deliberate along-slit dither between scans, peak-to-peak in slit px.
     ///
     /// Slit dust is fixed in `row_gain[y]` while the Sun is offset per scan, so
@@ -84,6 +91,8 @@ impl Default for SynthParams {
             exposure: 1.0,
             telluric: false,
             bursts: 0.0,
+            cadence_jitter: 0.0,
+            drop_frames: 0.0,
         }
     }
 }
@@ -508,10 +517,35 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
         let photon_gain = 1.2; // e-/ADU equivalent
         let read_noise = 22.0;
 
-        let mut frames: Vec<Vec<u16>> = Vec::with_capacity(p.n_frames);
-        for t in 0..p.n_frames {
+        // Acquisition schedule. `n_frames` is the number of scan SLOTS; a
+        // slot may be dropped, and a recorded frame may arrive early or late
+        // within its slot. The sun's position follows the frame's true time,
+        // not its index in the file — which is exactly what the timestamps
+        // let the reconstruction recover. Jitter is bounded to +-0.45 of a
+        // slot: past half a slot, "late frame" and "dropped frame" become the
+        // same observation and no estimator can separate them.
+        let mut schedule: Vec<(usize, f64)> = Vec::with_capacity(p.n_frames);
+        for slot in 0..p.n_frames {
+            if p.drop_frames > 0.0 && slot > 0 && slot + 1 < p.n_frames
+                && rng.gen::<f64>() < p.drop_frames
+            {
+                continue;
+            }
+            let delta = if p.cadence_jitter > 0.0 && !p.clean {
+                (rng.gen::<f64>() - 0.5) * 2.0 * p.cadence_jitter.min(0.45)
+            } else {
+                0.0
+            };
+            schedule.push((slot, slot as f64 + delta));
+        }
+
+        let mut frames: Vec<Vec<u16>> = Vec::with_capacity(schedule.len());
+        let mut frame_ticks: Vec<i64> = Vec::with_capacity(schedule.len());
+        for &(t, scan_pos) in &schedule {
             let mut frame = vec![0u16; p.spec_w * p.slit_h];
-            let x_scan = (t as f64 - t_center) * p.scan_step + jitter_x[t];
+            // Truth vectors are indexed by slot; the sun's position by time.
+            let x_scan = (scan_pos - t_center) * p.scan_step + jitter_x[t];
+            frame_ticks.push(crate::ser::synth_frame_ticks_at(scan_pos));
             for y in 0..p.slit_h {
                 let ycs = y as f64 - yc_slit;
                 let sun_x = x_scan + shear * ycs;
@@ -600,7 +634,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
             let dir = out_ser.parent().unwrap_or(Path::new("."));
             dir.join(format!("synth_scan{scan}.ser"))
         };
-        write_ser(&ser_path, p.spec_w, p.slit_h, &frames)?;
+        crate::ser::write_ser_timed(&ser_path, p.spec_w, p.slit_h, &frames, &frame_ticks)?;
 
         if scan == 0 {
             truth_out = Some(SynthTruth {

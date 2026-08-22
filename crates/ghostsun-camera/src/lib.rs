@@ -92,6 +92,18 @@ pub struct Frame {
     pub width: usize,
     pub height: usize,
     pub data: Vec<u16>,
+    /// Host wall-clock at which the frame became available, taken as early
+    /// as the backend allows (ToupTek: in the SDK's frame-ready callback).
+    /// Carries USB/scheduling jitter, so it is an absolute anchor rather
+    /// than an exact per-frame spacing.
+    pub host_time: std::time::SystemTime,
+    /// Camera-side frame timestamp in microseconds when the SDK provides one
+    /// (monotonic within a stream, arbitrary origin). Crystal-timed, so it is
+    /// the exact inter-frame spacing; combine with `host_time` for UTC.
+    pub device_time_us: Option<u64>,
+    /// Camera-side frame sequence counter when provided; a gap means the SDK
+    /// dropped frames before delivering them to the application.
+    pub seq: Option<u64>,
 }
 
 impl Frame {
