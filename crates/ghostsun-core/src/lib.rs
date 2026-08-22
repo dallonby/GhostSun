@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod profile;
 pub mod quality;
 pub mod render;
+pub mod rotation;
 pub mod ser;
 pub mod stack;
 pub mod synth;

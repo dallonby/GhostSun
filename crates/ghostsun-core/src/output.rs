@@ -177,6 +177,26 @@ pub fn write_fits_f32_meta(path: &Path, img: &Image, meta: &FitsMeta) -> io::Res
 
 /// Minimal FITS f32 reader (for files we wrote).
 #[allow(dead_code)]
+/// Read one string-valued card from a FITS header, unquoted. Used to recover
+/// the acquisition epoch a stack needs for de-rotation.
+pub fn read_fits_card(path: &Path, key: &str) -> Option<String> {
+    let mut buf = vec![0u8; 2880 * 8];
+    let mut f = File::open(path).ok()?;
+    let n = std::io::Read::read(&mut f, &mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for c in text.as_bytes().chunks(80) {
+        let card = String::from_utf8_lossy(c);
+        if card.starts_with("END") {
+            break;
+        }
+        if card.starts_with(key) {
+            let v = card.split('=').nth(1)?.trim();
+            return Some(v.trim_matches('\'').trim().to_string());
+        }
+    }
+    None
+}
+
 pub fn read_fits_f32(path: &Path) -> io::Result<Image> {
     let mut buf = Vec::new();
     File::open(path)?.read_to_end(&mut buf)?;

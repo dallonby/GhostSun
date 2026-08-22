@@ -282,6 +282,12 @@ enum Cmd {
         /// disable optical-flow evolution compensation
         #[arg(long)]
         no_flow: bool,
+        /// disable solar differential-rotation compensation between scans
+        #[arg(long)]
+        no_derotate: bool,
+        /// Wiener-filter the stacked result against its measured spectrum
+        #[arg(long)]
+        wiener: bool,
     },
     /// Full benchmark: synth -> recon (ghostsun + baseline + ablations) -> eval
     Bench {
@@ -938,19 +944,41 @@ fn main() {
                 }
             }
         }
-        Cmd::Stack { inputs, name, out_dir, no_flow } => {
+        Cmd::Stack { inputs, name, out_dir, no_flow, no_derotate, wiener } => {
             std::fs::create_dir_all(&out_dir).unwrap();
-            let images: Vec<Image> = inputs
+            let scans: Vec<stack::StackInput> = inputs
                 .iter()
                 .map(|p| {
-                    if p.extension().map(|e| e == "fits").unwrap_or(false) {
+                    let is_fits = p.extension().map(|e| e == "fits").unwrap_or(false);
+                    let image = if is_fits {
                         output::read_fits_f32(p).unwrap()
                     } else {
                         output::read_png16(p).unwrap()
-                    }
+                    };
+                    // DATE-OBS is the mid-scan epoch the recon wrote; without
+                    // it there is no way to know how far the Sun turned.
+                    let jd = if is_fits {
+                        output::read_fits_card(p, "DATE-OBS")
+                            .and_then(|v| ghostsun_core::rotation::jd_from_iso8601(&v))
+                    } else {
+                        None
+                    };
+                    stack::StackInput { image, jd }
                 })
                 .collect();
-            match stack::stack_with_reference(&images, !no_flow, true, Some(0)) {
+            if scans.iter().any(|s| s.jd.is_none()) && !no_derotate {
+                println!(
+                    "note: {} input(s) have no DATE-OBS, so de-rotation is skipped",
+                    scans.iter().filter(|s| s.jd.is_none()).count()
+                );
+            }
+            let sopts = stack::StackOptions {
+                flow: !no_flow,
+                derotate: !no_derotate,
+                wiener: if wiener { Some(pipeline::TuneParams::default().wiener_strength) } else { None },
+                verbose: true,
+            };
+            match stack::stack_scans(scans, &sopts) {
                 Some(rep) => {
                     let mx = rep.image.max();
                     output::write_png16(&out_dir.join(format!("{name}_linear.png")), &rep.image, Some((0.0, mx))).unwrap();

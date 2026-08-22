@@ -1443,6 +1443,8 @@ fn process_scans(
     tx: &Sender<ProcessMessage>,
 ) -> Result<AcquireOutput, String> {
     let mut images = Vec::with_capacity(files.len());
+    // Mid-scan epochs, so the stacker can compensate solar rotation.
+    let mut epochs: Vec<Option<f64>> = Vec::with_capacity(files.len());
     // Acquisition metadata of the first scan, carried onto the stacked product.
     let mut stack_meta: Option<output::FitsMeta> = None;
     for (index, (path, reverse)) in files.iter().enumerate() {
@@ -1471,6 +1473,13 @@ fn process_scans(
         if stack_meta.is_none() {
             stack_meta = Some(meta.clone());
         }
+        epochs.push(
+            report
+                .timing
+                .as_ref()
+                .map(|t| ghostsun_core::ser::ticks_to_iso8601(t.mid_utc_ticks))
+                .and_then(|iso| ghostsun_core::rotation::jd_from_iso8601(&iso)),
+        );
         let image = report.output.image;
         let fits = session_dir.join(format!("reconstruction-{:02}.fits", index + 1));
         let png = session_dir.join(format!("reconstruction-{:02}.png", index + 1));
@@ -1489,7 +1498,27 @@ fn process_scans(
             images.len()
         )));
         let n_in = images.len();
-        let srep = stack::stack(&images, true, false)
+        // Same entry point the CLI uses, so the two cannot drift: de-rotation
+        // to a common epoch (skipped below its deadband, or without epochs),
+        // then registration, then Wiener filtering of the combined result.
+        let scans: Vec<stack::StackInput> = images
+            .drain(..)
+            .zip(epochs.iter().copied())
+            .map(|(image, jd)| stack::StackInput { image, jd })
+            .collect();
+        let missing = scans.iter().filter(|s| s.jd.is_none()).count();
+        if missing > 0 {
+            let _ = tx.send(ProcessMessage::Log(format!(
+                "{missing} scan(s) had no acquisition time, so solar rotation was not compensated"
+            )));
+        }
+        let sopts = stack::StackOptions {
+            flow: true,
+            derotate: true,
+            wiener: Some(pipeline::TuneParams::default().wiener_strength),
+            verbose: false,
+        };
+        let srep = stack::stack_scans(scans, &sopts)
             .ok_or("multi-scan registration/stacking failed")?;
         if srep.n_flipped > 0 {
             // Recovered, but never routine: the stacker had to deduce an

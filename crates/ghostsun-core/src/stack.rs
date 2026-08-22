@@ -397,6 +397,104 @@ pub fn stack_coregistered(images: &[Image], reference: usize) -> Option<StackRep
     })
 }
 
+/// One scan going into a stack, with the epoch it was taken at.
+pub struct StackInput {
+    pub image: Image,
+    /// Mid-scan Julian date, when known. Needed only for de-rotation.
+    pub jd: Option<f64>,
+}
+
+/// How to combine a set of scans.
+#[derive(Clone, Copy, Debug)]
+pub struct StackOptions {
+    /// Optical-flow evolution compensation between scans.
+    pub flow: bool,
+    /// Re-project each scan onto the median epoch through solar differential
+    /// rotation before registering. No-op without epochs, or when the implied
+    /// displacement is below the deadband.
+    pub derotate: bool,
+    /// Wiener-filter the combined result; `None` leaves it unfiltered.
+    pub wiener: Option<f64>,
+    pub verbose: bool,
+}
+
+impl Default for StackOptions {
+    fn default() -> Self {
+        StackOptions { flow: true, derotate: true, wiener: None, verbose: false }
+    }
+}
+
+/// Below this much equatorial displacement, de-rotating costs more in
+/// resampling than the smear it removes. 0.5 px corresponds to roughly two
+/// minutes of elapsed time on a 1500 px disc.
+const DEROTATE_DEADBAND_PX: f64 = 0.5;
+
+/// The one entry point for combining scans, shared by the CLI and the app so
+/// the two cannot drift apart. De-rotates to a common epoch, stacks, and
+/// optionally Wiener-filters the result.
+pub fn stack_scans(inputs: Vec<StackInput>, opts: &StackOptions) -> Option<StackReport> {
+    if inputs.is_empty() {
+        return None;
+    }
+    let epochs: Vec<Option<f64>> = inputs.iter().map(|i| i.jd).collect();
+    let mut images: Vec<Image> = inputs.into_iter().map(|i| i.image).collect();
+
+    if opts.derotate && epochs.iter().all(|e| e.is_some()) && images.len() > 1 {
+        let mut jds: Vec<f64> = epochs.iter().map(|e| e.unwrap()).collect();
+        let mut sorted = jds.clone();
+        let mid = crate::mathutil::median_inplace(&mut sorted);
+        let span_days = jds.iter().cloned().fold(f64::MIN, f64::max)
+            - jds.iter().cloned().fold(f64::MAX, f64::min);
+        // Worst-case equatorial displacement over the session.
+        let r_guess = fit_disk(&images[0]).map(|d| d.r).unwrap_or(1000.0);
+        let worst = crate::rotation::omega_deg_per_day(0.0)
+            * span_days
+            * std::f64::consts::PI
+            / 180.0
+            * r_guess;
+        if worst >= DEROTATE_DEADBAND_PX {
+            let orient = crate::rotation::solar_orientation(mid);
+            if opts.verbose {
+                println!(
+                    "de-rotation: span {:.1} min, up to {:.2} px at the equator (P {:.1} deg, B0 {:.1} deg)",
+                    span_days * 1440.0,
+                    worst,
+                    orient.p.to_degrees(),
+                    orient.b0.to_degrees()
+                );
+            }
+            for (img, jd) in images.iter_mut().zip(jds.drain(..)) {
+                if let Some(d) = fit_disk(img) {
+                    *img = crate::rotation::derotate(img, &d, jd - mid, orient);
+                }
+            }
+        } else if opts.verbose {
+            println!(
+                "de-rotation: skipped, {:.2} px over {:.1} min is below the {DEROTATE_DEADBAND_PX} px deadband",
+                worst,
+                span_days * 1440.0
+            );
+        }
+    }
+
+    let mut rep = stack_with_reference(&images, opts.flow, opts.verbose, Some(0))?;
+    if let Some(strength) = opts.wiener {
+        if let Some(d) = fit_disk(&rep.image) {
+            if let Some((img, wr)) = crate::denoise::wiener_psd(&rep.image, strength, Some(&d)) {
+                if opts.verbose {
+                    println!(
+                        "wiener: cutoff {:.1} px, removed {:.1}% of power",
+                        wr.cutoff_px,
+                        100.0 * wr.removed
+                    );
+                }
+                rep.image = img;
+            }
+        }
+    }
+    Some(rep)
+}
+
 /// Stack with an explicit reference index (None = sharpest scan).
 /// Minimum NCC against the reference for a scan to join the stack in a given
 /// orientation. Correct pairs measure ~0.999 and even photometrically poor
