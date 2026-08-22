@@ -37,6 +37,9 @@ pub struct TuneParams {
     pub rl_tv: f64,           // RL total-variation lambda
     pub rl_floor: f64,        // intrinsic limb-width floor (px)
     pub denoise_k: f64,       // wavelet soft-threshold multiple
+    /// Dopplergram wing offset in px; 0 = choose it from the line profile.
+    /// Exposed here so `bench --sweep wing_px=...` can scan it against truth.
+    pub wing_px: f64,
 }
 
 impl Default for TuneParams {
@@ -58,6 +61,7 @@ impl Default for TuneParams {
             rl_tv: 0.01,
             rl_floor: 1.2,
             denoise_k: 1.0,
+            wing_px: 0.0,
         }
     }
 }
@@ -81,6 +85,7 @@ impl TuneParams {
             "rl_tv" => self.rl_tv = v,
             "rl_floor" => self.rl_floor = v,
             "denoise_k" => self.denoise_k = v,
+            "wing_px" => self.wing_px = v,
             _ => return Err(format!("unknown tune param: {name}")),
         }
         Ok(())
@@ -1129,6 +1134,9 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         {
             vlog!(opts, "wing offset: {:.1} px (GS_WING_OFFSET override)", v);
             v
+        } else if opts.tune.wing_px > 0.0 {
+            vlog!(opts, "wing offset: +-{:.1} px (tune)", opts.tune.wing_px);
+            opts.tune.wing_px
         } else if let (Some(a), Some(d)) = (opts.wing_offset_a, opts.dispersion_a_per_px) {
             let px = a / d;
             vlog!(opts, "wing offset: +-{:.3} A = +-{:.1} px (requested)", a, px);

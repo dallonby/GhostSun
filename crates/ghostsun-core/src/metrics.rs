@@ -501,6 +501,79 @@ fn sector_flatness(na: &Image, ng: &Image, disk: &DiskFit) -> f64 {
 
 /// RMS velocity error (px) over the disk interior, after registering the
 /// intensity pair (velocity maps share their images' grids).
+/// How well a wing Dopplergram recovers the true velocity field.
+///
+/// Unlike [`evaluate_velocity`], the Dopplergram is not in velocity units: it
+/// is `(R-B)/(R+B)`, proportional to velocity through a scale that depends on
+/// the wing offset and the line shape. Comparing it to truth by RMS would
+/// therefore just rank offsets by their scale factor. Instead fit
+/// `dopp = a*v + b` over the disc and report the CORRELATION, which is
+/// scale-free and is monotonic in the recovered velocity SNR — exactly what is
+/// needed to choose an offset.
+///
+/// Returns `(correlation, residual_rms_in_truth_units)`.
+pub fn evaluate_doppler(
+    recon_i: &Image,
+    gt_i: &Image,
+    dopp: &Image,
+    gt_v: &Image,
+) -> Option<(f64, f64)> {
+    let rf = fit_disk(recon_i)?;
+    let gf = fit_disk(gt_i)?;
+    let s = rf.r / gf.r;
+    let n = gt_i.w * gt_i.h;
+    let mut disk_mask = vec![false; n];
+    for y in 0..gt_i.h {
+        for x in 0..gt_i.w {
+            let dx = x as f64 - gf.xc;
+            let dy = y as f64 - gf.yc;
+            if (dx * dx + dy * dy).sqrt() / gf.r < 0.95 {
+                disk_mask[y * gt_i.w + x] = true;
+            }
+        }
+    }
+    let (odx, ody) = find_offset(recon_i, gt_i, &rf, &gf, &disk_mask);
+    let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for y in 0..gt_v.h {
+        for x in 0..gt_v.w {
+            let dx = x as f64 - gf.xc;
+            let dy = y as f64 - gf.yc;
+            if (dx * dx + dy * dy).sqrt() / gf.r >= 0.9 {
+                continue;
+            }
+            let xr = rf.xc + dx * s + odx;
+            let yr = rf.yc + dy * s + ody;
+            if xr < 1.0 || yr < 1.0 || xr > dopp.w as f64 - 2.0 || yr > dopp.h as f64 - 2.0 {
+                continue;
+            }
+            let a = gt_v.at(x, y) as f64;
+            let b = bilinear(dopp, xr, yr) as f64;
+            if !a.is_finite() || !b.is_finite() {
+                continue;
+            }
+            sx += a;
+            sy += b;
+            sxx += a * a;
+            syy += b * b;
+            sxy += a * b;
+            cnt += 1.0;
+        }
+    }
+    if cnt < 100.0 {
+        return None;
+    }
+    let cov = sxy / cnt - (sx / cnt) * (sy / cnt);
+    let va = sxx / cnt - (sx / cnt).powi(2);
+    let vb = syy / cnt - (sy / cnt).powi(2);
+    if va <= 0.0 || vb <= 0.0 {
+        return None;
+    }
+    let r = cov / (va.sqrt() * vb.sqrt());
+    // Residual after the optimal linear map, expressed in truth units.
+    let resid = (va * (1.0 - r * r)).max(0.0).sqrt();
+    Some((r, resid))
+}
+
 pub fn evaluate_velocity(recon_i: &Image, gt_i: &Image, recon_v: &Image, gt_v: &Image) -> Option<f64> {
     let rf = fit_disk(recon_i)?;
     let gf = fit_disk(gt_i)?;

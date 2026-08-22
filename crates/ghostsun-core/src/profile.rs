@@ -800,7 +800,11 @@ pub fn optimal_wing_offset(
             break;
         }
     }
-    let floor = hwhm.max(2.0);
+    // The two wings sit at -o and +o, so they are 2*o apart; requiring one
+    // HWHM of separation means each is half a HWHM from the core, NOT a whole
+    // one. Getting this wrong made the lower bound equal to hwhm, the search
+    // range [hwhm, 2*hwhm], and every "optimum" simply the clamped lower bound.
+    let floor = (0.5 * hwhm).max(2.0);
 
     // Search only where a Doppler wing can physically sit. For a line of this
     // shape |dI/dl| peaks near one HWHM out and dividing by sqrt(I) pulls the
@@ -808,7 +812,7 @@ pub fn optimal_wing_offset(
     // HWHM. Without that bound the metric happily picks a telluric or a blend
     // far out in the wing, which is exactly what it did on the June scans
     // (red flank chose +28 px, 2.4 A off core).
-    let (lo_o, hi_o) = (floor.max(0.5 * hwhm), 2.0 * hwhm);
+    let (lo_o, hi_o) = (floor, 2.0 * hwhm);
     let sens = |o: f64| -> Option<f64> {
         let k = (o + reach as f64).round() as i64;
         if k < 2 || k as usize >= sm.len() - 2 {

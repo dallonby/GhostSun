@@ -986,6 +986,18 @@ fn eval_variant(
     (m, vrms)
 }
 
+/// Correlation of the wing Dopplergram with the true velocity field. This is
+/// the quantity a wing offset should be chosen to maximise; `vrms` above
+/// scores the F2 velocity map, which does not depend on the offset at all.
+fn eval_doppler(rep: &pipeline::ReconReport, gt: &Image, gt_vel: Option<&Image>) -> Option<f64> {
+    match (gt_vel, &rep.wing_doppler) {
+        (Some(gv), Some(wd)) => {
+            metrics::evaluate_doppler(&rep.output.image, gt, wd, gv).map(|(r, _)| r)
+        }
+        _ => None,
+    }
+}
+
 fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>, json: Option<&Path>) {
     std::fs::create_dir_all(dir).unwrap();
     let params = args.to_params();
@@ -1036,7 +1048,11 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
                 Ok(rep) => {
                     let gtx = if opts.deconv { &gt } else { &gt_blurred };
                     let (m, vrms) = eval_variant(&rep, gtx, gt_vel.as_ref());
+                    let dcorr = eval_doppler(&rep, gtx, gt_vel.as_ref());
                     print_row(&format!("{pname}={v}"), &m, &vrms);
+                    if let Some(c) = dcorr {
+                        println!("      doppler-corr {c:+.4}");
+                    }
                 }
                 Err(e) => println!("{pname}={v}: recon failed: {e}"),
             }

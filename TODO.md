@@ -613,10 +613,27 @@ trusting it. Fix this first or F14 auto-calibrates against a wrong scale.
       means less instrumental broadening. The old 6 px was a hand-set constant,
       never a measurement, so it is not a valid reference. What must hold is
       that the pick tracks ~1×HWHM, which it does on both instruments.
-- [ ] Still to do: `bench --sweep` over offsets on `--doppler` synth, to confirm
-      the sensitivity metric maximises velocity-map SNR and not merely contrast
-      (contrast alone cannot separate real Doppler from amplified wavelength
-      error — the flank amplifies both).
+- [x] `bench --sweep wing_px=...` over `--doppler` synth — **DONE, and it found
+      a bug.** Two things had to be built first: the sweep needed `wing_px` as a
+      `TuneParams` field, and it needed a metric that scores the WING
+      DOPPLERGRAM, because the existing `vRMS` scores the F2 velocity map, which
+      does not depend on the wing offset at all (confirmed: vRMS sat at 0.0092
+      across every offset). `metrics::evaluate_doppler` reports the CORRELATION
+      of `(R-B)/(R+B)` with truth — the Dopplergram is not in velocity units, so
+      an RMS would rank offsets by their scale factor rather than their fidelity.
+      Result: a clean interior optimum at **0.5 × HWHM** (3.0 px at HWHM 6;
+      2 → 0.9845, 3 → 0.9867, 4 → 0.9829), and the sweep exposed that
+      `optimal_wing_offset` had its lower bound set to `hwhm` rather than
+      `0.5*hwhm`, so every "optimum" it had ever returned was the clamped bound.
+      After the fix auto picks exactly 3.0 px on synth, and the two real
+      instruments agree physically for the first time: ±0.359 Å at 0.0342 Å/px
+      and ±0.383 Å at 0.085 Å/px, the same line at 2.5× different dispersion.
+- [ ] Open: the real-data CONTRAST peak sits near 0.9 × HWHM (±12 px, 5.8%)
+      while the truth-based gate says 0.5 × HWHM. Contrast cannot separate real
+      Doppler from amplified wavelength error, so the gate is the one to trust —
+      but that leaves the real-data optimum unconfirmed against truth, because
+      there is no truth on real data. Worth a synth run with a deliberately
+      asymmetric/blended line before trusting the chooser on lines other than Hα.
 
 **Pitfalls:** the steep flank amplifies *every* wavelength error, so a badly
 chosen offset degrades smile/flexure residuals as well as weakening the
