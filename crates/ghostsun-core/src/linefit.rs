@@ -128,8 +128,18 @@ fn max_line_depth_dispersion_along_width(img: &Image) -> f64 {
         {
             continue;
         }
+        // Continuum probes. The absolute distances suit a wide dispersion
+        // axis, but they must never exceed what the frame can offer: on a
+        // NARROW one -- the 120 px crop around Halpha that a 3840x120 Sol'Ex
+        // capture presents on its transposed axis -- no probe fits either side
+        // of the middle, `cont` stays zero, and the real line in the centre is
+        // skipped without ever being scored. The axis then reports 0.000 and
+        // the frame is oriented by the weak contrast tie-break instead, which
+        // gets it wrong. Capping at w/3 leaves wide axes (w >= 450) untouched
+        // and gives a narrow one the furthest reference it actually has.
+        let cap = (img.w / 3).max(8);
         let mut cont = 0.0f64;
-        for &off in &[80usize, 100, 120, 150] {
+        for off in [80usize, 100, 120, 150].iter().map(|&o| o.min(cap)) {
             if x >= off {
                 cont = cont.max(sm[x - off]);
             }
@@ -1325,6 +1335,53 @@ mod orientation_tests {
         assert!(
             transposed < 0.3,
             "slit-axis structure must stay below the real line: {transposed:.3}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_dispersion_crop_still_finds_its_line() {
+        // The user's real Sol'Ex capture geometry: a 3840x120 SER, where the
+        // 3840 axis is the SLIT and the whole dispersion axis is a 120 px crop
+        // around Halpha. The frame must transpose.
+        //
+        // This is the case that made every scan of 2026-08-22 fail to
+        // reconstruct: the continuum probes were fixed 80-150 px distances, so
+        // on the 120 px axis nothing fit either side of the middle, the real
+        // line at y~66 was skipped without being scored, and the axis reported
+        // 0.000 against a spurious 0.018 on the slit axis.
+        let (w, h) = (3840usize, 120usize);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = 3000.0f32;
+                // Halpha across the dispersion crop, core FWHM ~12 px.
+                let d = (y as f32 - 66.0) / 5.0;
+                v *= 1.0 - 0.7 * (-0.5 * d * d).exp();
+                // Disc short of both slit ends, and a few dust columns
+                // (fixed slit positions, all wavelengths).
+                if x < 300 || x >= 3500 {
+                    v *= 0.02;
+                }
+                for x0 in [900usize, 2100, 2680] {
+                    if x >= x0 && x < x0 + 4 {
+                        v *= 0.85;
+                    }
+                }
+                img.set(x, y, v);
+            }
+        }
+        let (transpose, native, transposed) = should_transpose_for_dispersion(&img);
+        assert!(
+            transpose,
+            "narrow dispersion crop must transpose: native {native:.3} vs transposed {transposed:.3}"
+        );
+        assert!(
+            transposed > 0.3,
+            "the real line on the narrow axis must score: {transposed:.3}"
+        );
+        assert!(
+            transposed > native,
+            "slit-axis structure must not outscore the real line: native {native:.3} vs transposed {transposed:.3}"
         );
     }
 
