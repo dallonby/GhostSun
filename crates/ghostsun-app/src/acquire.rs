@@ -889,15 +889,28 @@ impl AcquireState {
                     );
                 }
             });
-        if let Some(frame_height) = focus.current_frame_height() {
-            self.capture_height = self.capture_height.clamp(32, frame_height);
-            ui.add(
-                egui::DragValue::new(&mut self.capture_height)
-                    .range(32..=frame_height)
-                    .prefix("vertical capture ")
-                    .suffix(" px"),
-            );
-        }
+        // Always render this. It used to be gated on a LIVE FRAME, so before
+        // the preview was started the control was absent rather than disabled
+        // and there was no way to set the capture band at all. Bound it by the
+        // live frame when there is one, otherwise by the selected camera's
+        // advertised height.
+        let frame_height = focus.known_frame_height();
+        let bound = frame_height.unwrap_or(4096);
+        self.capture_height = self.capture_height.clamp(32, bound);
+        let live = focus.current_frame_height().is_some();
+        ui.add(
+            egui::DragValue::new(&mut self.capture_height)
+                .range(32..=bound)
+                .prefix("vertical capture ")
+                .suffix(" px"),
+        )
+        .on_hover_text(if live {
+            "Rows read out per frame — the slit-axis extent of the scan."
+        } else {
+            "Rows read out per frame — the slit-axis extent of the scan. \
+             Bounded by the selected camera's advertised height until the \
+             preview is running and the real frame size is known."
+        });
         ui.checkbox(&mut self.use_hw_roi, "hardware ROI while recording")
             .on_hover_text(
                 "The sensor reads only the capture band, so frame rate is set by                  exposure instead of full-frame readout — measured 23 → 176 fps at                  256 px on a G3M678M. More frames per second means finer scan-axis                  sampling. The full sensor comes back the moment recording stops,                  and if the camera refuses the ROI the recording falls back to the                  software crop.",

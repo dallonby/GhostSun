@@ -2205,11 +2205,9 @@ impl MountState {
             });
         }
 
-        let sensor_height = focus
-            .current_frame_height()
-            .or_else(|| focus.cameras.get(focus.selected).map(|camera| camera.max_height))
-            .unwrap_or(1024)
-            .max(1);
+        // Shared helper, so this and the acquire tab cannot drift on how they
+        // bound the capture band before a frame has arrived.
+        let sensor_height = focus.known_frame_height().unwrap_or(1024).max(1);
         self.capture_height = self.capture_height.clamp(1, sensor_height);
         let vertical_dispersion = focus.dispersion == focus::DispAxis::Vertical;
 

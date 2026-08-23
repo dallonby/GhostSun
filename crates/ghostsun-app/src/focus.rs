@@ -862,6 +862,21 @@ impl FocusState {
         self.last.as_ref().map(|frame| frame.full_h)
     }
 
+    /// Best available sensor height for bounding capture-band controls.
+    ///
+    /// Falls back to the SELECTED CAMERA's advertised height when no frame has
+    /// arrived yet. Without this, anything gated on a live frame simply does
+    /// not render before the preview is started — which is not a disabled
+    /// control the user can reason about, it is a missing one.
+    pub fn known_frame_height(&self) -> Option<usize> {
+        self.current_frame_height().or_else(|| {
+            self.cameras
+                .get(self.selected)
+                .map(|c| c.max_height)
+                .filter(|h| *h >= 32)
+        })
+    }
+
     pub fn slit_profile_sample(&self) -> Option<(u64, Vec<f32>)> {
         self.last
             .as_ref()
