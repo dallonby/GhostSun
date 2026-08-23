@@ -46,6 +46,16 @@ const SCAN_SIGNAL_REQUIRED_SAMPLES: usize = 2;
 const SCAN_TAIL_CHECK: Duration = Duration::from_millis(1500);
 const RECENTER_SETTLE: Duration = Duration::from_millis(400);
 const RECENTER_CHECK_TIMEOUT: Duration = Duration::from_millis(1800);
+/// Extra travel past each limb, beyond the point where the photosphere stops
+/// lighting the slit.
+///
+/// The limb search watches DISC brightness, so it reports "clear" the moment
+/// the photosphere leaves — which is where prominences begin, not where they
+/// end. Stopping there clips them. It also leaves the mount starting the next
+/// sweep from rest exactly where data begins, with no room to come up to
+/// speed. 0.08 deg is about 0.3 solar radii, past all but the tallest
+/// prominences.
+const LIMB_MARGIN_DEFAULT_DEG: f64 = 0.08;
 
 pub struct AcquireOutput {
     pub image: Image,
@@ -63,10 +73,14 @@ enum ProcessMessage {
 enum RunPhase {
     PrepositionMoving,
     PrepositionSampling,
+    /// Travelling the limb margin past the near limb before the sweep starts.
+    PrepositionMargin,
     Settling,
     AwaitRecorder,
     PreRoll,
     Scanning,
+    /// Still moving and recording past the far limb, covering the margin.
+    Overshoot,
     ScanTailCheck,
     PostRoll,
     WaitingForRecorder,
@@ -84,6 +98,7 @@ struct ScanRun {
     rate_code: u8,
     rate_multiple: f64,
     scan_span_deg: f64,
+    limb_margin_deg: f64,
     preposition_baseline: f32,
     preposition_last_seq: u64,
     preposition_steps: usize,
@@ -130,6 +145,7 @@ pub struct AcquireState {
     anchor_y: Option<f64>,
     output_dir: PathBuf,
     scan_span_deg: f64,
+    limb_margin_deg: f64,
     scan_count: usize,
     scan_rate_index: usize,
     direction: Direction,
@@ -165,6 +181,7 @@ impl Default for AcquireState {
             anchor_y: None,
             output_dir,
             scan_span_deg: 0.80,
+            limb_margin_deg: LIMB_MARGIN_DEFAULT_DEG,
             scan_count: 1,
             scan_rate_index: DEFAULT_ACQUISITION_RATE,
             direction: Direction::East,
@@ -378,12 +395,34 @@ impl AcquireState {
                             // sweep by the same excess distance.
                             run.scan_span_deg +=
                                 (distance - run.scan_span_deg / 2.0).max(0.0);
-                            run.phase = RunPhase::Settling;
-                            run.settle_until = Instant::now() + SETTLE_TIME;
-                            self.status = format!(
-                                "Disc has cleared the slit; settling for a {:.2}° scan",
-                                run.scan_span_deg
-                            );
+                            // Back off the same margin the sweep will overrun
+                            // at the far limb, so both limbs get equal
+                            // prominence coverage and the mount is already at
+                            // speed when the near limb arrives.
+                            if run.limb_margin_deg > 0.0 {
+                                let duration = Duration::from_secs_f64(
+                                    run.limb_margin_deg
+                                        / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+                                );
+                                mount.start_acquisition_nudge(
+                                    run.direction.opposite(),
+                                    duration,
+                                    PROBE_RATE_INDEX,
+                                )?;
+                                run.scan_span_deg += 2.0 * run.limb_margin_deg;
+                                run.phase = RunPhase::PrepositionMargin;
+                                self.status = format!(
+                                    "Disc cleared; backing off a further {:.2}° limb margin",
+                                    run.limb_margin_deg
+                                );
+                            } else {
+                                run.phase = RunPhase::Settling;
+                                run.settle_until = Instant::now() + SETTLE_TIME;
+                                self.status = format!(
+                                    "Disc has cleared the slit; settling for a {:.2}° scan",
+                                    run.scan_span_deg
+                                );
+                            }
                         } else if run.preposition_samples >= PREPOSITION_REQUIRED_SAMPLES {
                             start_preposition_step(&mut run, mount)?;
                             self.status = format!(
@@ -397,6 +436,14 @@ impl AcquireState {
                                 .into(),
                         );
                     }
+                }
+                RunPhase::PrepositionMargin if mount.take_acquisition_nudge_done() => {
+                    run.phase = RunPhase::Settling;
+                    run.settle_until = Instant::now() + SETTLE_TIME;
+                    self.status = format!(
+                        "Limb margin reached; settling for a {:.2}° scan",
+                        run.scan_span_deg
+                    );
                 }
                 RunPhase::Settling if Instant::now() >= run.settle_until => {
                     let path = scan_path(&run.session_dir, run.scan_index);
@@ -472,13 +519,20 @@ impl AcquireState {
                             )
                         };
                         if cleared {
-                            mount.stop_acquisition_motion();
-                            run.phase = RunPhase::PostRoll;
-                            run.deadline = Instant::now() + POST_ROLL;
+                            // Keep moving AND recording. "Cleared" means the
+                            // photosphere has left the slit, which is where
+                            // prominences start; stopping here clips them.
+                            run.phase = RunPhase::Overshoot;
+                            run.deadline = Instant::now()
+                                + scan_duration_exact(
+                                    run.limb_margin_deg,
+                                    run.rate_multiple,
+                                );
                             self.status = format!(
-                                "Scan {}/{}: far limb cleared; stopping and recording post-roll",
+                                "Scan {}/{}: far limb cleared; recording {:.2}° limb margin",
                                 run.scan_index + 1,
-                                self.scan_count
+                                self.scan_count,
+                                run.limb_margin_deg
                             );
                         }
                     }
@@ -492,6 +546,26 @@ impl AcquireState {
                         run.deadline = Instant::now() + SCAN_TAIL_CHECK;
                         self.status = "Motion span complete; confirming the disc is off-sensor"
                             .into();
+                    }
+                }
+                RunPhase::Overshoot => {
+                    // Either the margin is covered, or the commanded span ran
+                    // out first and there is no more travel to be had.
+                    let span_spent = mount.take_acquisition_nudge_done();
+                    if span_spent || Instant::now() >= run.deadline {
+                        mount.stop_acquisition_motion();
+                        run.phase = RunPhase::PostRoll;
+                        run.deadline = Instant::now() + POST_ROLL;
+                        self.status = format!(
+                            "Scan {}/{}: {}; recording post-roll",
+                            run.scan_index + 1,
+                            self.scan_count,
+                            if span_spent {
+                                "motion span spent during the limb margin"
+                            } else {
+                                "limb margin covered"
+                            }
+                        );
                     }
                 }
                 RunPhase::ScanTailCheck => {
@@ -696,6 +770,7 @@ impl AcquireState {
             rate_code,
             rate_multiple,
             scan_span_deg: configured_span,
+            limb_margin_deg: self.limb_margin_deg.clamp(0.0, 0.30),
             preposition_baseline,
             preposition_last_seq,
             preposition_steps: 0,
@@ -1045,6 +1120,14 @@ impl AcquireState {
                 .text("scan span °")
                 .fixed_decimals(2),
         );
+        ui.add(
+            egui::Slider::new(&mut self.limb_margin_deg, 0.0..=0.30)
+                .text("limb margin °")
+                .fixed_decimals(2),
+        )
+        .on_hover_text(
+            "Extra travel past EACH limb, recorded. The limb search watches              disc brightness, so it reports the far limb the moment the              photosphere leaves the slit — which is where prominences begin.              This carries the sweep past them, and gives the mount room to              come up to speed before the next pass starts. 0.08° is about              0.3 solar radii. Added at both ends, so it lengthens each sweep              by twice this.",
+        );
         self.scan_rate_index = self
             .scan_rate_index
             .min(ACQUISITION_RATES.len().saturating_sub(1));
@@ -1057,14 +1140,18 @@ impl AcquireState {
             });
         ui.add(egui::Slider::new(&mut self.scan_count, 1..=8).text("alternating scans"));
         let (_, _, rate_multiple) = ACQUISITION_RATES[self.scan_rate_index];
-        let duration = scan_duration(self.scan_span_deg, rate_multiple);
+        // Quote what will actually be travelled: the margin is added at both
+        // limbs, so it lengthens the sweep by twice the setting.
+        let total_span = self.scan_span_deg + 2.0 * self.limb_margin_deg;
+        let duration = scan_duration(total_span, rate_multiple);
         let motion_per_exposure = rate_multiple
             * 15.0
             * (focus.exposure_us as f64 / 1_000_000.0);
         ui.label(format!(
-            "{rate_multiple:.2}× sidereal · {:.1} s across {:.2}° · ~{motion_per_exposure:.2}″ per exposure",
+            "{rate_multiple:.2}× sidereal · {:.1} s across {total_span:.2}° ({:.2}° + 2×{:.2}° margin) · ~{motion_per_exposure:.2}″ per exposure",
             duration.as_secs_f64(),
             self.scan_span_deg,
+            self.limb_margin_deg,
         ));
         ui.label(
             egui::RichText::new(
@@ -1339,6 +1426,15 @@ fn scan_direction(first: Direction, index: usize) -> Direction {
     } else {
         first.opposite()
     }
+}
+
+/// Travel time for a leg that is NOT the whole sweep, so it must not pick up
+/// `scan_duration`'s minimum-span clamp — a 0.08 deg margin would otherwise
+/// become a 0.55 deg one.
+fn scan_duration_exact(span_deg: f64, rate_multiple: f64) -> Duration {
+    Duration::from_secs_f64(
+        span_deg.max(0.0) / (rate_multiple.max(0.25) * SIDEREAL_DEG_PER_SEC),
+    )
 }
 
 fn scan_duration(span_deg: f64, rate_multiple: f64) -> Duration {
