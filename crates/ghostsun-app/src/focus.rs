@@ -218,6 +218,13 @@ enum FocusMsg {
         device_clock: bool,
     },
     RecordingError(String),
+    /// The live (outside-recording) hardware ROI was applied or released.
+    LiveRoi {
+        active: bool,
+        /// Band actually accepted by the sensor, in sensor rows.
+        y0: usize,
+        h: usize,
+    },
     Error(String),
 }
 
@@ -237,6 +244,15 @@ enum FocusCmd {
         hw_roi: bool,
     },
     StopSer,
+    /// Apply (or release) the hardware ROI OUTSIDE a recording, so the live
+    /// preview is the real capture band at the real cropped frame rate. The
+    /// recording path is unchanged; this only decides what the sensor reads
+    /// between scans.
+    LiveRoi {
+        capture_height: usize,
+        anchor_y: f64,
+        enable: bool,
+    },
 }
 
 struct SerRequest {
@@ -361,6 +377,10 @@ pub struct FocusState {
     pub recorded_frames: usize,
     pub recording_path: Option<PathBuf>,
     pub recording_status: String,
+    /// A hardware ROI is applied to the sensor outside of any recording, so
+    /// the live preview IS the capture band at the cropped frame rate.
+    pub live_roi_active: bool,
+    pub live_roi_status: String,
     pub dispersion: DispAxis,
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
@@ -437,6 +457,8 @@ impl Default for FocusState {
             recorded_frames: 0,
             recording_path: None,
             recording_status: "not recording".into(),
+            live_roi_active: false,
+            live_roi_status: "full sensor".into(),
             dispersion: DispAxis::Vertical,
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
@@ -566,6 +588,10 @@ impl FocusState {
     }
 
     pub fn stop(&mut self) {
+        // The worker owns the camera handle; when it exits the device is
+        // released and reopens full-frame, so a live ROI cannot survive.
+        self.live_roi_active = false;
+        self.live_roi_status = "full sensor".into();
         if let Some(s) = &self.stop {
             s.store(true, Ordering::SeqCst);
         }
@@ -622,6 +648,14 @@ impl FocusState {
                         | FocusMsg::RecordingStopped { .. }
                         | FocusMsg::RecordingError(_)),
                     ) => recording_event = Some(event),
+                    Ok(FocusMsg::LiveRoi { active, y0, h }) => {
+                        self.live_roi_active = active;
+                        self.live_roi_status = if active {
+                            format!("hardware ROI live · rows {y0}–{} ({h} px)", y0 + h)
+                        } else {
+                            "full sensor".into()
+                        };
+                    }
                     Ok(FocusMsg::Error(e)) => {
                         err = Some(e);
                         break;
@@ -665,7 +699,10 @@ impl FocusState {
                     self.recording = false;
                     self.recording_status = format!("SER recording failed: {error}");
                 }
-                FocusMsg::Opened(_) | FocusMsg::Frame(_) | FocusMsg::Error(_) => unreachable!(),
+                FocusMsg::Opened(_)
+                | FocusMsg::Frame(_)
+                | FocusMsg::LiveRoi { .. }
+                | FocusMsg::Error(_) => unreachable!(),
             }
         }
         if let Some(e) = err {
@@ -869,12 +906,58 @@ impl FocusState {
     /// not render before the preview is started — which is not a disabled
     /// control the user can reason about, it is a missing one.
     pub fn known_frame_height(&self) -> Option<usize> {
-        self.current_frame_height().or_else(|| {
+        let sensor_height = || {
             self.cameras
                 .get(self.selected)
                 .map(|c| c.max_height)
                 .filter(|h| *h >= 32)
+        };
+        // With a live ROI the frames ARE the band, so bounding by them would
+        // ratchet the capture height down to whatever was last applied and
+        // leave no way to grow it again.
+        if self.live_roi_active {
+            return sensor_height().or_else(|| self.current_frame_height());
+        }
+        self.current_frame_height().or_else(sensor_height)
+    }
+
+    /// Apply or release the hardware ROI outside a recording.
+    ///
+    /// The checkbox alone only takes effect once a scan is already running,
+    /// which gives no way to see or verify the capture band beforehand. This
+    /// puts the sensor into the band now, so the preview shows exactly what a
+    /// scan will record, at the frame rate it will record it.
+    pub fn set_live_roi(
+        &mut self,
+        ctx: &egui::Context,
+        capture_height: usize,
+        anchor_y: f64,
+        enable: bool,
+    ) -> Result<(), String> {
+        if self.recording {
+            return Err("stop the recording before changing the sensor ROI".into());
+        }
+        if enable && !anchor_y.is_finite() {
+            return Err("select a valid spectral-line anchor".into());
+        }
+        if enable && !self.streaming {
+            self.start(ctx);
+        }
+        let Some(cmd) = &self.cmd else {
+            return Err("start a camera before applying the ROI".into());
+        };
+        cmd.send(FocusCmd::LiveRoi {
+            capture_height: capture_height.max(2),
+            anchor_y,
+            enable,
         })
+        .map_err(|_| "camera worker is not running".to_owned())?;
+        self.live_roi_status = if enable {
+            "applying hardware ROI…".into()
+        } else {
+            "restoring the full sensor…".into()
+        };
+        Ok(())
     }
 
     pub fn slit_profile_sample(&self) -> Option<(u64, Vec<f32>)> {
@@ -1915,6 +1998,11 @@ impl FocusState {
             .as_ref()
             .map(|update| update.hw_roi_active)
             .unwrap_or(false);
+        // While the sensor is cropped the detected lines are in BAND rows,
+        // not sensor rows, so accepting a click here would silently rewrite
+        // the anchor into the wrong coordinate space. Release the ROI to
+        // pick a different line.
+        let selectable = selectable && !hw_roi_active;
         ui.vertical_centered(|ui| {
             let avail = ui.available_width().max(1.0);
             let aspect = tex.aspect_ratio();
@@ -2664,6 +2752,10 @@ fn worker(
     }
     let mut pending_ser: Option<SerRequest> = None;
     let mut active_ser: Option<ActiveSer> = None;
+    // The band when a live (outside-recording) ROI is applied. It outlives
+    // recordings: a recording that ends must return to the band the user is
+    // working in, not to the full sensor.
+    let mut live_roi: Option<Roi> = None;
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2678,6 +2770,70 @@ fn worker(
                     cam.set_auto_exposure(on).ok();
                 }
                 FocusCmd::Dispersion(h) => disp_h = h,
+                FocusCmd::LiveRoi {
+                    capture_height,
+                    anchor_y,
+                    enable,
+                } => {
+                    // Refuse to touch the sensor mid-recording: the SER's
+                    // frame geometry is fixed at the first frame.
+                    if active_ser.is_some() || pending_ser.is_some() {
+                        let _ = tx.send(FocusMsg::Error(
+                            "the sensor ROI cannot change while recording".into(),
+                        ));
+                    } else if enable {
+                        let (y0, height) =
+                            vertical_crop_bounds(info.max_height, capture_height, anchor_y);
+                        let band = Roi {
+                            x: 0,
+                            y: y0 & !1,
+                            w: info.max_width,
+                            h: (height & !1).max(2),
+                        };
+                        match apply_roi(&mut *cam, band) {
+                            Ok(()) => {
+                                live_roi = Some(band);
+                                let _ = tx.send(FocusMsg::LiveRoi {
+                                    active: true,
+                                    y0: band.y,
+                                    h: band.h,
+                                });
+                            }
+                            Err(roi_error) => {
+                                // A refused ROI must not leave the camera
+                                // stopped — apply_roi stops before it sets.
+                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                    let _ = tx.send(FocusMsg::Error(format!(
+                                        "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
+                                    )));
+                                    return;
+                                }
+                                live_roi = None;
+                                let _ = tx.send(FocusMsg::LiveRoi {
+                                    active: false,
+                                    y0: 0,
+                                    h: info.max_height,
+                                });
+                                let _ = tx.send(FocusMsg::Error(format!(
+                                    "the camera refused the hardware ROI: {roi_error}"
+                                )));
+                            }
+                        }
+                    } else {
+                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                            let _ = tx.send(FocusMsg::Error(format!(
+                                "the full sensor could not be restored: {error}"
+                            )));
+                            return;
+                        }
+                        live_roi = None;
+                        let _ = tx.send(FocusMsg::LiveRoi {
+                            active: false,
+                            y0: 0,
+                            h: info.max_height,
+                        });
+                    }
+                }
                 FocusCmd::StartSer {
                     path,
                     capture_height,
@@ -2688,9 +2844,9 @@ fn worker(
                         let had_hw = active.hw_roi_y0.is_some();
                         finish_ser(active, &tx);
                         if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
                                 let _ = tx.send(FocusMsg::Error(format!(
-                                    "the full sensor could not be restored: {error}"
+                                    "the sensor could not be restored: {error}"
                                 )));
                                 return;
                             }
@@ -2716,7 +2872,9 @@ fn worker(
                         match apply_roi(&mut *cam, band) {
                             Ok(()) => hw_roi_y0 = Some(band.y),
                             Err(roi_error) => {
-                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                if let Err(error) =
+                                    apply_roi(&mut *cam, resting_roi(&info, live_roi))
+                                {
                                     let _ = tx.send(FocusMsg::Error(format!(
                                         "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
                                     )));
@@ -2737,13 +2895,14 @@ fn worker(
                     if let Some(active) = active_ser.take() {
                         let had_hw = active.hw_roi_y0.is_some();
                         let finished = finish_ser_message(active);
-                        // Restore the full sensor BEFORE resuming preview: the
-                        // ROI is scoped strictly to the recording.
+                        // Unwind BEFORE resuming preview. The recording's own
+                        // ROI is scoped to the recording; where that leaves
+                        // the sensor is the user's live band if they set one.
                         if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
                                 let _ = tx.send(finished);
                                 let _ = tx.send(FocusMsg::Error(format!(
-                                    "SER saved, but the full sensor could not be restored: {error}"
+                                    "SER saved, but the sensor could not be restored: {error}"
                                 )));
                                 return;
                             }
@@ -2760,9 +2919,9 @@ fn worker(
                         // No frame ever arrived. If the ROI was already
                         // applied it must still be unwound.
                         if request.hw_roi_y0.is_some() {
-                            if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
                                 let _ = tx.send(FocusMsg::Error(format!(
-                                    "the full sensor could not be restored: {error}"
+                                    "the sensor could not be restored: {error}"
                                 )));
                                 return;
                             }
@@ -2914,10 +3073,11 @@ fn worker(
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
                 let update = Box::new(FocusUpdate {
-                    hw_roi_active: active_ser
-                        .as_ref()
-                        .map(|active| active.hw_roi_y0.is_some())
-                        .unwrap_or(false),
+                    hw_roi_active: live_roi.is_some()
+                        || active_ser
+                            .as_ref()
+                            .map(|active| active.hw_roi_y0.is_some())
+                            .unwrap_or(false),
                     slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
                     n_continuum,
                     limb_width,
@@ -3004,6 +3164,14 @@ fn full_frame_roi(info: &CameraInfo) -> Roi {
         w: info.max_width,
         h: info.max_height,
     }
+}
+
+/// What the sensor should read when nothing is recording: the live band if
+/// the user applied one, otherwise the whole sensor. A recording must unwind
+/// to this, not unconditionally to full frame, or every scan would silently
+/// cancel a live ROI the user had set up.
+fn resting_roi(info: &CameraInfo, live: Option<Roi>) -> Roi {
+    live.unwrap_or_else(|| full_frame_roi(info))
 }
 
 /// Stop → apply ROI → restart. Every backend applies ROI at stream start, so

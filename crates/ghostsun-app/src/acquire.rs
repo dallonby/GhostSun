@@ -915,6 +915,56 @@ impl AcquireState {
             .on_hover_text(
                 "The sensor reads only the capture band, so frame rate is set by                  exposure instead of full-frame readout — measured 23 → 176 fps at                  256 px on a G3M678M. More frames per second means finer scan-axis                  sampling. The full sensor comes back the moment recording stops,                  and if the camera refuses the ROI the recording falls back to the                  software crop.",
             );
+        // Apply the SAME band now, outside recording. Without this the ROI is
+        // unverifiable until a scan has already been taken: the checkbox only
+        // states an intention, and the preview keeps showing the full sensor
+        // at the full-frame rate. Applying it live makes the preview the real
+        // capture band at the real cropped frame rate, so framing, focus and
+        // achieved fps can all be checked before committing to a scan.
+        ui.horizontal_wrapped(|ui| {
+            let busy = self.run.is_some() || focus.recording;
+            if focus.live_roi_active {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Release ROI (full sensor)"))
+                    .on_hover_text("Return the sensor to full frame so the whole                          spectrum is visible and another line can be picked.")
+                    .clicked()
+                {
+                    if let Err(error) = focus.set_live_roi(ctx, self.capture_height, 0.0, false) {
+                        self.status = error.clone();
+                        self.log.push(error);
+                    }
+                }
+            } else if ui
+                .add_enabled(
+                    !busy && self.anchor_y.is_some(),
+                    egui::Button::new("Apply ROI now"),
+                )
+                .on_hover_text(
+                    "Crop the sensor to the capture band immediately, without \
+                     recording. The preview becomes the band at the cropped frame \
+                     rate, so you can confirm framing and fps before a scan. \
+                     Needs a spectral-line anchor; release it to pick another.",
+                )
+                .clicked()
+            {
+                match self.anchor_y {
+                    Some(anchor) => {
+                        if let Err(error) =
+                            focus.set_live_roi(ctx, self.capture_height, anchor, true)
+                        {
+                            self.status = error.clone();
+                            self.log.push(error);
+                        }
+                    }
+                    None => self.status = "select a spectral-line anchor first".into(),
+                }
+            }
+            ui.label(
+                egui::RichText::new(&focus.live_roi_status)
+                    .small()
+                    .color(if focus.live_roi_active { ACCENT } else { ACCENT_DIM }),
+            );
+        });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Output");
