@@ -2,6 +2,7 @@ use ghostsun_core::mathutil;
 use ghostsun_core::metrics;
 use ghostsun_core::output;
 use ghostsun_core::pipeline;
+use ghostsun_core::profile;
 use ghostsun_core::render;
 use ghostsun_core::stack;
 use ghostsun_core::synth;
@@ -150,6 +151,10 @@ enum Cmd {
         /// disable the footprint-filtered warp (F4)
         #[arg(long)]
         no_filtered_warp: bool,
+        /// read the core off the Gaussian fit instead of the learned spectral
+        /// subspace (F17)
+        #[arg(long)]
+        no_kl: bool,
         /// write the Doppler velocity map (F2)
         #[arg(long)]
         velocity: bool,
@@ -253,11 +258,24 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// How many numbers one spectrum actually needs: DFT vs DCT vs KL
+    /// truncation, scored against the scan's own noise floor
+    Specrank {
+        ser: PathBuf,
+        /// half-window in dispersion px (0 = widest the smile allows)
+        #[arg(long, default_value_t = 0)]
+        w: usize,
+    },
     /// Dump the de-smiled mean spectrum profile of a SER scan (CSV)
     Spectrum {
         ser: PathBuf,
         #[arg(long, default_value = "spectrum.csv")]
         out: PathBuf,
+        /// also print the FULL detector width at this many evenly spaced
+        /// slit rows, continuum-divided, to reveal lines that the de-smiled
+        /// common window cannot reach
+        #[arg(long, default_value_t = 0)]
+        rows: usize,
     },
     /// Compare a reconstruction against ground truth (16-bit PNGs)
     Eval {
@@ -395,6 +413,7 @@ fn main() {
         Cmd::Recon {
             ser, out_dir, baseline, shift, window_sigma, rotation, flip_x, flip_y,
             no_jitter, no_transparency, no_transversalium, no_profile, no_filtered_warp,
+            no_kl,
             velocity, colorize, deconv, denoise, no_xreg, no_burst_repair, no_nlm, no_timing,
             a_per_px, wing_offset, shifts, wiener, no_gpu, map_iterations, tune, dispersion,
             composite, line_x, name,
@@ -435,6 +454,9 @@ fn main() {
                 line_center_x: line_x,
                 ..Default::default()
             };
+            if no_kl {
+                opts.tune.kl_k = 0.0;
+            }
             if let Some(spec) = &shifts {
                 let mut series = Vec::new();
                 for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -885,7 +907,131 @@ fn main() {
                 }
             }
         }
-        Cmd::Spectrum { ser, out } => {
+        Cmd::Specrank { ser, w } => {
+            let (reader, transpose, mean_img, geom) = match pipeline::scan_setup(&ser) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("specrank failed: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let rep =
+                match profile::spectral_rank_report(&reader, &geom, &mean_img, transpose, w) {
+                    Some(r) => r,
+                    None => {
+                        eprintln!("specrank: not enough on-disc spectra to analyse");
+                        std::process::exit(1);
+                    }
+                };
+            println!(
+                "window -{}..+{} px ({} samples per spectrum), {} spectra",
+                rep.w_lo, rep.w_hi, rep.n_window, rep.n_samples
+            );
+            println!("line half-width sigma {:.2} px", rep.core_sigma);
+            if rep.anchors.is_empty() {
+                println!("other absorption features in range: none detected");
+            } else {
+                let a: Vec<String> =
+                    rep.anchors.iter().map(|o| format!("{o:+.0}")).collect();
+                println!(
+                    "other absorption features (telluric/blend) at offsets: {} px \
+                     -- the window stops 3 px short of the nearest",
+                    a.join(", ")
+                );
+            }
+            println!("per-sample noise sigma {:.5} of continuum
+", rep.sigma);
+            println!("power spectrum along dispersion (x noise floor):");
+            let n = rep.n_window;
+            for (k, p) in rep.power_over_noise.iter().enumerate() {
+                if k % 2 != 0 && k != rep.k_cut {
+                    continue;
+                }
+                let cyc = k as f64 / n as f64;
+                let bar = "#".repeat(((p.log10().max(0.0)) * 12.0) as usize);
+                let mark = if k == rep.k_cut { "  <- cutoff" } else { "" };
+                println!("  k={k:<3} {cyc:.3} cyc/px  {p:9.1}  {bar}{mark}");
+            }
+            println!(
+                "
+optical cutoff k={} -> a real spectrum lives in {} of {} numbers",
+                rep.k_cut,
+                2 * rep.k_cut + 1,
+                n
+            );
+            print!("
+KL variance explained:");
+            let mut cum = 0.0;
+            for (j, e) in rep.eigen.iter().take(8).enumerate() {
+                cum += e;
+                print!("{}{}: {:.1}% (cum {:.1}%)", if j % 3 == 0 { "
+  " } else { "   " }, j + 1, e * 100.0, cum * 100.0);
+            }
+            println!("
+
+signal lost by keeping the first m coefficients,");
+            println!("in units of the per-sample noise (below 1.00 the reduction is free):");
+            for c in &rep.curves {
+                let at = match c.free_at {
+                    Some(m) => format!("free at m={m} ({:.1}x smaller)", n as f64 / m as f64),
+                    None => "never free in this window".to_string(),
+                };
+                println!("  {} — {}", c.name, at);
+                let cells: Vec<String> = c
+                    .loss
+                    .iter()
+                    .take(14)
+                    .map(|(m, r)| format!("{m}:{r:.2}"))
+                    .collect();
+                println!("      {}", cells.join("  "));
+                let g: Vec<String> = c
+                    .centre_gain
+                    .iter()
+                    .filter(|(m, _)| *m <= 6)
+                    .map(|(m, g)| format!("{m}:{:.2}x", 1.0 / g.max(1e-12).sqrt()))
+                    .collect();
+                println!("      noise reduction at the core: {}", g.join("  "));
+            }
+        }
+        Cmd::Spectrum { ser, out, rows } => {
+            if rows > 0 {
+                match pipeline::scan_setup(&ser) {
+                    Ok((_r, _t, mean_img, geom)) => {
+                        let w = mean_img.w;
+                        println!(
+                            "full detector width {w} px, line centre per row from the smile fit"
+                        );
+                        for i in 0..rows {
+                            let y = geom.y1
+                                + (geom.y2 - geom.y1) * i / rows.saturating_sub(1).max(1);
+                            let y = y.min(mean_img.h - 1);
+                            let c = mathutil::polyval(&geom.coeffs, y as f64);
+                            let raw: Vec<f64> =
+                                mean_img.row(y).iter().map(|&v| v as f64).collect();
+                            let cont = mathutil::robust_loess_quadratic(&raw, 25, 3);
+                            println!(
+                                "\nrow {y}: line centre {c:.1} px, offsets {:.0}..{:.0}",
+                                -c,
+                                w as f64 - 1.0 - c
+                            );
+                            for x in 0..w {
+                                let r = if cont[x] > 1e-9 { raw[x] / cont[x] } else { 1.0 };
+                                let dev = (r - 1.0) * 100.0;
+                                let off = x as f64 - c;
+                                let bar = ((40.0 + dev * 2.0).clamp(0.0, 78.0)) as usize;
+                                let mark = if off.abs() < 1.5 { "CORE" } else { "" };
+                                println!(
+                                    "  {off:+5.0} {dev:+7.2}% {}{}{}",
+                                    " ".repeat(bar),
+                                    if dev < -1.0 { "<" } else { "|" },
+                                    mark
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("spectrum --rows failed: {e}"),
+                }
+            }
             match pipeline::mean_spectrum(&ser) {
                 Ok((offsets, profile)) => {
                     let mut txt = String::from("offset_px,intensity\n");
@@ -1116,6 +1262,7 @@ fn run_bench(dir: &Path, args: &SynthArgs, ablations: bool, sweep: Option<&str>,
         };
         variants.push(("Ghost-bspline".into(), mk(&|o| o.profile_extraction = false)));
         variants.push(("Ghost-no-pca".into(), mk(&|o| o.tune.pca_k = 0.0)));
+        variants.push(("Ghost-no-kl".into(), mk(&|o| o.tune.kl_k = 0.0)));
         variants.push(("Ghost-no-fwarp".into(), mk(&|o| o.filtered_warp = false)));
         variants.push(("Ghost-no-jitter".into(), mk(&|o| o.jitter_correction = false)));
         variants.push(("Ghost-only-fast".into(), mk(&|o| o.jitter_drift = false)));

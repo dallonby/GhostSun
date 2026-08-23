@@ -546,3 +546,136 @@ pub fn fft2_inplace(re: &mut [f64], im: &mut [f64], w: usize, h: usize, inverse:
         }
     }
 }
+
+/// Row `idx` of the orthogonal projector onto the span of `basis`.
+///
+/// The caller wants one number out of a projection — the projected profile's
+/// value at the line centre — so forming the full N x N projector would be
+/// wasteful. Modified Gram-Schmidt orthonormalises the basis (dropping
+/// vectors that are numerically dependent on earlier ones), after which
+/// P = sum_j q_j q_j^T and the requested row is w_i = sum_j q_j[idx] q_j[i].
+/// One dot product of `w` with a sample vector then yields the projection at
+/// `idx`.
+///
+/// The returned weights also state the noise gain of the estimator directly:
+/// for white noise of variance s^2 the projected value has variance
+/// s^2 * sum_i w_i^2, and that sum equals the number of surviving basis
+/// vectors divided by their spread — which is the whole reason for doing
+/// this rather than reading the centre pixel.
+pub fn projector_row(basis: &[Vec<f64>], idx: usize) -> Vec<f64> {
+    let n = basis.first().map(|b| b.len()).unwrap_or(0);
+    if n == 0 || idx >= n {
+        return Vec::new();
+    }
+    let mut q: Vec<Vec<f64>> = Vec::with_capacity(basis.len());
+    for b in basis {
+        if b.len() != n {
+            continue;
+        }
+        let mut v = b.clone();
+        // Two passes of classical Gram-Schmidt: one pass loses orthogonality
+        // badly when the basis is as collinear as a mean profile and its own
+        // leading eigenvector.
+        for _ in 0..2 {
+            for u in q.iter() {
+                let d: f64 = u.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                for (vi, ui) in v.iter_mut().zip(u.iter()) {
+                    *vi -= d * ui;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let scale: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-30);
+        if norm < 1e-8 * scale {
+            continue; // dependent on what we already have
+        }
+        for vi in v.iter_mut() {
+            *vi /= norm;
+        }
+        q.push(v);
+    }
+    let mut w = vec![0.0; n];
+    for u in &q {
+        let c = u[idx];
+        if c == 0.0 {
+            continue;
+        }
+        for (wi, ui) in w.iter_mut().zip(u.iter()) {
+            *wi += c * ui;
+        }
+    }
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projector_onto_the_constant_vector_is_the_mean() {
+        let n = 9;
+        let w = projector_row(&[vec![1.0; n]], 4);
+        for wi in &w {
+            assert!((wi - 1.0 / n as f64).abs() < 1e-12, "{wi}");
+        }
+    }
+
+    #[test]
+    fn a_complete_basis_reproduces_the_sample_exactly() {
+        // n independent vectors span everything, so the projector is the
+        // identity and the row must be a delta at idx.
+        let n = 6;
+        let basis: Vec<Vec<f64>> = (0..n)
+            .map(|k| (0..n).map(|i| ((i * (k + 1)) as f64 * 0.7).sin() + if i == k { 1.0 } else { 0.0 }).collect())
+            .collect();
+        let w = projector_row(&basis, 2);
+        for (i, wi) in w.iter().enumerate() {
+            let want = if i == 2 { 1.0 } else { 0.0 };
+            assert!((wi - want).abs() < 1e-8, "w[{i}] = {wi}");
+        }
+    }
+
+    #[test]
+    fn vectors_inside_the_span_pass_through_untouched() {
+        let n = 21;
+        let b0: Vec<f64> = (0..n).map(|i| 1.0 - 0.6 * (-(((i as f64) - 10.0).powi(2)) / 8.0).exp()).collect();
+        let b1: Vec<f64> = (0..n).map(|i| (((i as f64) - 10.0) / 10.0).powi(2)).collect();
+        let w = projector_row(&[b0.clone(), b1.clone()], 10);
+        let s: Vec<f64> = (0..n).map(|i| 2.5 * b0[i] - 0.75 * b1[i]).collect();
+        let got: f64 = w.iter().zip(s.iter()).map(|(a, b)| a * b).sum();
+        let want = 2.5 * b0[10] - 0.75 * b1[10];
+        assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+    }
+
+    #[test]
+    fn duplicate_basis_vectors_do_not_inflate_the_noise_gain() {
+        // Feeding the same direction twice must not count it twice: the noise
+        // gain sum(w^2) has to stay at the rank, not the vector count.
+        let n = 12;
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3).cos()).collect();
+        let one = projector_row(&[b.clone()], 5);
+        let two = projector_row(&[b.clone(), b.clone(), b], 5);
+        let g1: f64 = one.iter().map(|x| x * x).sum();
+        let g2: f64 = two.iter().map(|x| x * x).sum();
+        assert!((g1 - g2).abs() < 1e-12, "{g1} vs {g2}");
+    }
+
+    #[test]
+    fn noise_gain_falls_as_the_window_widens_at_fixed_rank() {
+        // The whole point of the wide window: same number of basis vectors,
+        // more samples, less noise on the projected centre value.
+        let gain = |n: usize| -> f64 {
+            let basis: Vec<Vec<f64>> = (0..4)
+                .map(|k| {
+                    (0..n)
+                        .map(|i| ((i as f64 - n as f64 / 2.0) * (k + 1) as f64 * 0.05).cos())
+                        .collect()
+                })
+                .collect();
+            projector_row(&basis, n / 2).iter().map(|x| x * x).sum()
+        };
+        let narrow = gain(17);
+        let wide = gain(77);
+        assert!(wide < narrow * 0.6, "narrow {narrow:.4} wide {wide:.4}");
+    }
+}

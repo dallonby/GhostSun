@@ -23,6 +23,8 @@ use std::path::Path;
 pub struct TuneParams {
     pub w_fit: f64,           // profile fit half-window (px)
     pub pca_k: f64,           // residual PCA components
+    pub kl_k: f64,            // F17 spectral-subspace rank (0 = off)
+    pub w_kl: f64,            // F17 half-window (0 = auto from the smile)
     pub mu_range: f64,        // mu search range (px)
     pub depth_gate: f64,      // absorption/emission fallback gate
     pub transp_deadband: f64, // transparency gain deadband
@@ -50,6 +52,8 @@ impl Default for TuneParams {
         TuneParams {
             w_fit: 8.0,
             pca_k: 3.0,
+            kl_k: 3.0,
+            w_kl: 0.0,
             mu_range: 3.0,
             depth_gate: 0.10,
             transp_deadband: 0.012,
@@ -75,6 +79,8 @@ impl TuneParams {
         match name {
             "w_fit" => self.w_fit = v,
             "pca_k" => self.pca_k = v,
+            "kl_k" => self.kl_k = v,
+            "w_kl" => self.w_kl = v,
             "mu_range" => self.mu_range = v,
             "depth_gate" => self.depth_gate = v,
             "transp_deadband" => self.transp_deadband = v,
@@ -438,6 +444,8 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     let ptune = ProfileTune {
         w_fit: opts.tune.w_fit.round().max(4.0) as usize,
         pca_k: opts.tune.pca_k.round().max(0.0) as usize,
+        kl_k: opts.tune.kl_k.round().max(0.0) as usize,
+        w_kl: opts.tune.w_kl.round().max(0.0) as usize,
         mu_range: opts.tune.mu_range,
         depth_gate: opts.tune.depth_gate,
     };
@@ -1366,7 +1374,9 @@ fn correct_transversalium_baseline(disk: &mut Image) {
 /// De-smiled mean spectrum: average of all rows of the mean image, each
 /// resampled on a grid of offsets relative to its fitted line center.
 /// Offsets are relative to the line core (0 = core).
-pub fn mean_spectrum(ser_path: &Path) -> Result<(Vec<i64>, Vec<f64>), String> {
+/// Open a scan and recover the three things every spectral diagnostic needs:
+/// the dispersion orientation, the mean image, and the line geometry.
+pub fn scan_setup(ser_path: &Path) -> Result<(SerReader, bool, Image, linefit::LineGeometry), String> {
     let reader = SerReader::open(ser_path).map_err(|e| format!("SER open: {e}"))?;
     let hdr = &reader.header;
     let n = hdr.frame_count;
@@ -1414,6 +1424,12 @@ pub fn mean_spectrum(ser_path: &Path) -> Result<(Vec<i64>, Vec<f64>), String> {
         mean_img.data[i] = (v / cnt) as f32;
     }
     let geom = linefit::fit_line_geometry(&mean_img, 2).ok_or("line fit failed")?;
+    Ok((reader, transpose, mean_img, geom))
+}
+
+pub fn mean_spectrum(ser_path: &Path) -> Result<(Vec<i64>, Vec<f64>), String> {
+    let (_reader, _transpose, mean_img, geom) = scan_setup(ser_path)?;
+    let w = mean_img.w;
     // offsets covering the full window for all rows
     let mut cmin = f64::MAX;
     let mut cmax = f64::MIN;

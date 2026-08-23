@@ -25,6 +25,7 @@ struct P {
     transpose: u32, bit16: u32, frames: u32, wf: i32,
     n_mu: u32, pca_k: u32, n_spec: u32, pad0: u32,
     shift: f32, mu_range: f32, depth_gate: f32, pad1: f32,
+    kl_lo: i32, kl_hi: i32, kl_on: u32, pad2: u32,
 }
 @group(0) @binding(0) var<storage, read> raw: array<u32>;
 @group(0) @binding(1) var<storage, read> smile: array<f32>;
@@ -35,8 +36,10 @@ struct P {
 @group(0) @binding(6) var<storage, read_write> spec_out: array<atomic<u32>>;
 @group(0) @binding(7) var<uniform> p: P;
 @group(0) @binding(8) var<storage, read> spatial_offset: array<f32>;
+@group(0) @binding(9) var<storage, read> klw: array<f32>; // kl_lo+kl_hi+1 weights
 
 var<workgroup> wg_spec: array<atomic<u32>, 200>;
+var<workgroup> wg_spec_n: array<atomic<u32>, 200>;
 var<workgroup> wg_cnt: atomic<u32>;
 
 fn raw_val_at(f: u32, spec_i: u32, y: u32) -> f32 {
@@ -151,7 +154,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         var base: i32 = 0;
         var n = i32(p.spec_w);
         if (!wide_spectrum_row) {
-            let reach = p.wf + i32(ceil(p.mu_range)) + 16;
+            var reach = p.wf + i32(ceil(p.mu_range)) + 16;
+            if (p.kl_on == 1u) {
+                reach = max(reach, max(p.kl_lo, p.kl_hi) + i32(ceil(p.mu_range)) + 16);
+            }
             base = max(i32(floor(center_abs)) - reach, 0);
             let end = min(i32(ceil(center_abs)) + reach + 1, i32(p.spec_w));
             n = end - base;
@@ -231,8 +237,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         let bspl = beval(n, clamp(center, 1.0, f32(n - 2)));
         let t = clamp((depth - p.depth_gate + 0.03) / 0.06, 0.0, 1.0);
 
+        // F17 subspace core: one dot product of the learned weights with the
+        // mu-centred profile. Mirrors profile::fit_frame's KlMode::Apply.
+        if (p.kl_on == 1u && t > 0.5) {
+            let nk = p.kl_lo + p.kl_hi + 1;
+            var acc = 0.0;
+            for (var k = 0; k < nk; k++) {
+                let x = clamp(mu + f32(k - p.kl_lo), 1.0, f32(n - 2));
+                acc = acc + klw[u32(k)] * beval(n, x);
+            }
+            core_model = acc;
+        }
         // inline PCA residual projection (matches CPU add-back)
-        if (p.pca_k > 0u && t > 0.5 && c > 1.0) {
+        if (p.kl_on == 0u && p.pca_k > 0u && t > 0.5 && c > 1.0) {
             var add = pca[u32(p.wf)]; // mean at the center index
             for (var k = 0u; k < p.pca_k; k++) {
                 var a = 0.0;
@@ -259,12 +276,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         // transparency estimation need, while cutting this work by ~8x.
         // The line-depth gate excludes sky so the continuum bin is also a
         // direct per-frame transparency statistic.
-        if (depth > p.depth_gate && wide_spectrum_row) {
+        if (depth > p.depth_gate && wide_spectrum_row && c > 1.0) {
             atomicAdd(&wg_cnt, 1u);
             for (var k = 0u; k < p.n_spec; k++) {
-                let x = clamp(smile[y] + spec_off[k], 1.0, f32(n - 2));
+                let x = smile[y] + spec_off[k];
+                // Skip, do not clamp: a clamped sample folds the detector edge
+                // into the far wing and invents a feature there.
+                if (x < 4.0 || x > f32(n - 5)) { continue; }
                 let v = u32(clamp(round(beval(n, x)), 0.0, 100000.0));
                 atomicAdd(&wg_spec[k], v);
+                atomicAdd(&wg_spec_n[k], 1u);
             }
         }
 
@@ -278,15 +299,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     // flush shared spectrum to global (per frame): slot layout
     // frame * (n_spec + 1): [count, spec...]
     if (is_on) {
+        let stride = 2u * p.n_spec + 1u;
         for (var k = lid.x; k < p.n_spec; k = k + 64u) {
             let v = atomicLoad(&wg_spec[k]);
-            if (v > 0u) {
-                atomicAdd(&spec_out[f * (p.n_spec + 1u) + 1u + k], v);
-            }
+            if (v > 0u) { atomicAdd(&spec_out[f * stride + 1u + k], v); }
+            let cn = atomicLoad(&wg_spec_n[k]);
+            if (cn > 0u) { atomicAdd(&spec_out[f * stride + 1u + p.n_spec + k], cn); }
         }
         if (lid.x == 0u) {
             let cval = atomicLoad(&wg_cnt);
-            if (cval > 0u) { atomicAdd(&spec_out[f * (p.n_spec + 1u)], cval); }
+            if (cval > 0u) { atomicAdd(&spec_out[f * stride], cval); }
         }
     }
 }
@@ -313,6 +335,7 @@ pub fn extract_profile_gpu(
         return None;
     }
 
+
     // CPU-side prep identical to the CPU path
     let smile: Vec<f64> = (0..slit_h).map(|y| polyval(&geom.coeffs, y as f64)).collect();
     let sigma_row = crate::profile::fit_sigma_rows(mean_img, geom);
@@ -324,25 +347,44 @@ pub fn extract_profile_gpu(
         cmin = cmin.min(c);
         cmax = cmax.max(c);
     }
-    let off_lo = (4.0 - cmin).ceil();
-    let off_hi = (iw - 5.0 - cmax).floor();
-    let spec_offsets: Vec<f64> = {
-        let mut v = Vec::new();
-        let mut o = off_lo;
-        while o <= off_hi {
-            v.push(o);
-            o += 1.0;
-        }
-        v
-    };
-    if spec_offsets.len() > MAX_SPEC_OFF {
+    let _ = (cmin, cmax, iw);
+    let (spec_offsets, spec_cov) = crate::profile::desmiled_offset_grid(mean_img, geom, crate::profile::spec_min_coverage());
+    if spec_offsets.is_empty() || spec_offsets.len() > MAX_SPEC_OFF {
         return None;
     }
+
+    // F17 subspace filter: learned on the CPU (one pass over ~48 frames),
+    // applied on the GPU as a weight vector. Same filter, same numbers.
+    let kl_filter = if tune.kl_k > 0 {
+        let mut med: Vec<f64> = sigma_row
+            .iter()
+            .skip(geom.y1)
+            .take(geom.y2.saturating_sub(geom.y1) + 1)
+            .cloned()
+            .collect();
+        let core_sigma =
+            if med.is_empty() { 2.5 } else { crate::mathutil::median_inplace(&mut med) };
+        let (wl, wr) = if tune.w_kl > 0 {
+            (tune.w_kl, tune.w_kl)
+        } else {
+            crate::profile::auto_kl_window(geom, mean_img, slit_h, tune, core_sigma)
+        };
+        if wl + wr > 2 * tune.w_fit {
+            crate::profile::learn_kl_filter(
+                reader, geom, &smile, &sigma_row, slit_h, transpose, shift, tune,
+                spatial_offsets, wl, wr,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // PCA basis from a CPU subsample (reuses the reference implementation)
     let mut pca_flat: Vec<f32> = vec![0.0; nwin]; // mean (zeros if k=0)
     let mut pca_k = 0usize;
-    if tune.pca_k > 0 {
+    if tune.pca_k > 0 && kl_filter.is_none() {
         let mut samples: Vec<Vec<f64>> = Vec::new();
         let mut t = 0;
         while t < n {
@@ -365,6 +407,7 @@ pub fn extract_profile_gpu(
                     shift,
                     tune,
                     &[],
+                    &crate::profile::KlMode::Off,
                 )
             } else {
                 crate::profile::fit_frame(
@@ -374,6 +417,7 @@ pub fn extract_profile_gpu(
                     shift,
                     tune,
                     &[],
+                    &crate::profile::KlMode::Off,
                 )
             };
             for y in (0..slit_h).step_by(4) {
@@ -432,6 +476,10 @@ pub fn extract_profile_gpu(
         mu_range: f32,
         depth_gate: f32,
         pad1: f32,
+        kl_lo: i32,
+        kl_hi: i32,
+        kl_on: u32,
+        pad2: u32,
     }
 
     use wgpu::util::DeviceExt;
@@ -450,6 +498,11 @@ pub fn extract_profile_gpu(
     let sigma_buf = mk_f32(&sigma_f);
     let off_buf = mk_f32(&off_f);
     let pca_buf = mk_f32(&pca_flat);
+    let kl_flat: Vec<f32> = match &kl_filter {
+        Some(f) => f.weights.iter().map(|&v| v as f32).collect(),
+        None => vec![0.0f32],
+    };
+    let kl_buf = mk_f32(&kl_flat);
 
     let bpp = reader.bytes_per_px();
     let frame_bytes = hdr.width * hdr.height * bpp;
@@ -460,6 +513,7 @@ pub fn extract_profile_gpu(
     let mut mu_img = Image::new(n, slit_h);
     let mut depth = Image::new(n, slit_h);
     let mut frame_spec: Vec<Vec<f32>> = vec![vec![0.0; n_spec]; n];
+    let mut frame_spec_rows: Vec<f32> = vec![0.0; n];
 
     let mut f0 = 0usize;
     while f0 < n {
@@ -491,7 +545,7 @@ pub fn extract_profile_gpu(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let spec_len = fc * (n_spec + 1);
+        let spec_len = fc * (2 * n_spec + 1);
         let spec_buf = d.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (spec_len * 4) as u64,
@@ -515,6 +569,10 @@ pub fn extract_profile_gpu(
             mu_range: tune.mu_range as f32,
             depth_gate: tune.depth_gate as f32,
             pad1: 0.0,
+            kl_lo: kl_filter.as_ref().map(|f| f.w_lo as i32).unwrap_or(0),
+            kl_hi: kl_filter.as_ref().map(|f| f.w_hi as i32).unwrap_or(0),
+            kl_on: kl_filter.is_some() as u32,
+            pad2: 0,
         };
         let par_buf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -547,6 +605,7 @@ pub fn extract_profile_gpu(
                 wgpu::BindGroupEntry { binding: 6, resource: spec_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: par_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: motion_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: kl_buf.as_entire_binding() },
             ],
         });
         let mut enc = d.create_command_encoder(&Default::default());
@@ -584,14 +643,26 @@ pub fn extract_profile_gpu(
                 mu_img.set(t, y, if m < -1.0e30 { f32::NAN } else { m });
                 depth.set(t, y, out_f[o + 2]);
             }
-            let base = fl * (n_spec + 1);
-            let cnt = spec_u[base].max(1) as f32;
+            let base = fl * (2 * n_spec + 1);
+            frame_spec_rows[t] = spec_u[base] as f32;
             for k in 0..n_spec {
-                frame_spec[t][k] = spec_u[base + 1 + k] as f32 / cnt;
+                // per-offset count, because the smile means different rows
+                // reach different offsets
+                let n = spec_u[base + 1 + n_spec + k];
+                frame_spec[t][k] =
+                    if n > 0 { spec_u[base + 1 + k] as f32 / n as f32 } else { 0.0 };
             }
         }
         f0 += fc;
     }
 
-    Some(ProfileMaps { core, mu: mu_img, depth, frame_spec, spec_offsets })
+    Some(ProfileMaps {
+        core,
+        mu: mu_img,
+        depth,
+        frame_spec,
+        spec_offsets,
+        spec_coverage: spec_cov.iter().map(|&v| v as f32).collect(),
+        frame_spec_rows,
+    })
 }

@@ -33,6 +33,12 @@ pub struct ProfileMaps {
     /// anchoring); offsets are relative to the smile position
     pub frame_spec: Vec<Vec<f32>>,
     pub spec_offsets: Vec<f64>,
+    /// fraction of fitted slit rows that can reach each offset (the smile
+    /// puts the far wings on the detector for some rows and not others)
+    pub spec_coverage: Vec<f32>,
+    /// illuminated rows that contributed to each frame's spectrum — the
+    /// signal gate, which the row-normalised spectrum can no longer supply
+    pub frame_spec_rows: Vec<f32>,
 }
 
 pub struct ProfileTune {
@@ -40,12 +46,53 @@ pub struct ProfileTune {
     pub pca_k: usize,    // residual PCA components (default 3; 0 = parametric only)
     pub mu_range: f64,   // mu search range around smile (default 1.5)
     pub depth_gate: f64, // below this depth fall back to B-spline (default 0.10)
+    /// F17 spectral-subspace rank. 0 disables it and leaves the parametric
+    /// core + residual PCA in charge; >0 replaces both with a projection of
+    /// the whole mu-centred profile onto a rank-(kl_k+1) subspace learned
+    /// from this scan.
+    pub kl_k: usize,
+    /// Half-window for that projection, in dispersion px. 0 = auto, i.e. the
+    /// widest window the smile leaves in common to every fitted row.
+    pub w_kl: usize,
 }
 
 impl Default for ProfileTune {
     fn default() -> Self {
-        ProfileTune { w_fit: 8, pca_k: 3, mu_range: 3.0, depth_gate: 0.10 }
+        ProfileTune { w_fit: 8, pca_k: 3, mu_range: 3.0, depth_gate: 0.10, kl_k: 3, w_kl: 0 }
     }
+}
+
+/// A learned spectral matched filter: the row of the orthogonal projector
+/// that reads the line centre.
+///
+/// The subspace is spanned by the scan's own mean normalised profile plus the
+/// top eigenprofiles of the variation about it. Because only the value AT THE
+/// LINE CENTRE is wanted, the whole projection collapses to one weight vector
+/// (see `mathutil::projector_row`) and applying it is a single dot product
+/// over the window — no per-pixel least squares, and the GPU path needs
+/// nothing but the weights.
+#[derive(Clone, Debug)]
+pub struct KlFilter {
+    /// samples kept left and right of the fitted centre; `weights` has
+    /// w_lo + w_hi + 1 entries and the centre sits at index w_lo
+    pub w_lo: usize,
+    pub w_hi: usize,
+    pub weights: Vec<f64>,
+    /// sum of squared weights: the variance multiplier this estimator applies
+    /// to white noise, against 1.0 for reading the centre sample alone
+    pub noise_gain: f64,
+    /// basis vectors that survived orthonormalisation
+    pub rank: usize,
+    /// mean normalised profile, kept for diagnostics
+    pub mean: Vec<f64>,
+}
+
+/// What `fit_frame` should do about the spectral subspace.
+pub(crate) enum KlMode<'a> {
+    Off,
+    /// collect mu-centred, continuum-normalised profiles over (left, right)
+    Learn(usize, usize),
+    Apply(&'a KlFilter),
 }
 
 /// Per-row line width from the mean image, smoothed over rows.
@@ -89,7 +136,12 @@ pub(crate) struct ColumnFit {
     pub(crate) cscale: Vec<f32>,
     /// continuum-weighted de-smiled mean spectrum of this frame
     pub(crate) spec: Vec<f64>,
-    pub(crate) spec_w: f64,
+    /// per-offset accumulated weight: rows differ in which offsets they reach
+    pub(crate) spec_w: Vec<f64>,
+    pub(crate) spec_rows: f64,
+    /// KlMode::Learn only: mu-centred, continuum-normalised profiles
+    /// (2*w_kl+1 per row), the training set for the subspace
+    pub(crate) prof: Vec<f32>,
 }
 
 /// Fit one frame (columns of the output disk). Returns per-row results.
@@ -100,19 +152,29 @@ pub(crate) fn fit_frame(
     shift: f64,
     tune: &ProfileTune,
     spec_offsets: &[f64],
+    kl: &KlMode<'_>,
 ) -> ColumnFit {
     let h = frame.h;
     let w = frame.w;
     let wf = tune.w_fit as isize;
     let nwin = (2 * wf + 1) as usize;
+    // Only one of the two residual buffers is ever populated: the narrow
+    // resid feeds the old PCA add-back, the wide prof trains the subspace.
+    let (kl_lo, kl_hi) = match kl {
+        KlMode::Learn(a, b) => (*a, *b),
+        _ => (0, 0),
+    };
+    let nkl = kl_lo + kl_hi + 1;
     let mut out = ColumnFit {
         core: vec![0.0; h],
         mu: vec![f32::NAN; h],
         depth: vec![0.0; h],
-        resid: vec![0.0; h * nwin],
+        resid: if matches!(kl, KlMode::Off) { vec![0.0; h * nwin] } else { Vec::new() },
         cscale: vec![0.0; h],
         spec: vec![0.0; spec_offsets.len()],
-        spec_w: 0.0,
+        spec_w: vec![0.0; spec_offsets.len()],
+        spec_rows: 0.0,
+        prof: if kl_lo + kl_hi > 0 { vec![0.0; h * nkl] } else { Vec::new() },
     };
     let mut coef = vec![0.0f64; w];
     for y in 0..h {
@@ -193,26 +255,55 @@ pub(crate) fn fit_frame(
         };
 
         let depth = if c > 1e-6 { (d / c).clamp(-1.0, 1.0) } else { 0.0 };
-        let core_model = c - d;
+        let mut core_model = c - d;
         // off-disk fallback: sample at the smile center
         let bspl = bspline_eval(&coef, center.clamp(1.0, (w - 2) as f64));
         let t = ((depth - tune.depth_gate + 0.03) / 0.06).clamp(0.0, 1.0);
+
+        // F17: read the core off the subspace projection of the whole
+        // profile instead of off the two-parameter Gaussian. Same quantity,
+        // same mu, but estimated from every sample in the window at once.
+        if let KlMode::Apply(f) = kl {
+            if t > 0.5 {
+                let wl = f.w_lo as isize;
+                let mut acc = 0.0;
+                for (k, &wt) in f.weights.iter().enumerate() {
+                    let x = (mu + (k as isize - wl) as f64).clamp(1.0, (w - 2) as f64);
+                    acc += wt * bspline_eval(&coef, x);
+                }
+                core_model = acc;
+            }
+        }
         out.core[y] = (t * core_model + (1.0 - t) * bspl).max(0.0) as f32;
         out.mu[y] = if t > 0.5 { mu as f32 } else { f32::NAN };
         out.depth[y] = (depth.max(0.0) * t) as f32;
         out.cscale[y] = c.max(1.0) as f32;
 
-        // de-smiled spectrum accumulation, weighted by continuum level
+        // De-smiled spectrum accumulation. Each row contributes only at the
+        // offsets it actually recorded — clamping instead would fold the
+        // detector edge pixel into the far wings and invent a feature there.
+        //
+        // Values stay in ABSOLUTE units. This spectrum has two consumers with
+        // opposite needs: the anchor/flexure estimator wants a shape and
+        // divides by its own robust continuum anyway, while the transparency
+        // stage reads one offset of it as a per-frame FLUX. Normalising each
+        // row by its fitted continuum here serves the first and silently
+        // destroys the second — it did exactly that, and only on the GPU
+        // path, which is the only caller that uses it for transparency.
         if c > 1.0 {
             for (k, &o) in spec_offsets.iter().enumerate() {
-                let x = (smile[y] + o).clamp(1.0, (w - 2) as f64);
+                let x = smile[y] + o;
+                if x < 4.0 || x > (w - 5) as f64 {
+                    continue;
+                }
                 out.spec[k] += bspline_eval(&coef, x);
+                out.spec_w[k] += 1.0;
             }
-            out.spec_w += 1.0;
+            out.spec_rows += 1.0;
         }
 
         // mu-centered residuals for PCA (normalized by C)
-        if t > 0.5 && c > 1.0 {
+        if matches!(kl, KlMode::Off) && t > 0.5 && c > 1.0 {
             for i in -wf..=wf {
                 let x = (mu + i as f64).clamp(1.0, (w - 2) as f64);
                 let s = bspline_eval(&coef, x);
@@ -221,8 +312,325 @@ pub(crate) fn fit_frame(
                 out.resid[y * nwin + (i + wf) as usize] = ((s - model) / c) as f32;
             }
         }
+
+        // Training sample for the subspace: the mu-centred profile itself,
+        // scaled by the fitted continuum so profiles from bright and dim
+        // parts of the disc are directly comparable. Rows whose window would
+        // run off the detector are left zero and skipped by the caller — a
+        // clamped sample repeats an edge pixel and would teach the basis a
+        // feature that is not in the spectrum.
+        if let KlMode::Learn(a, b) = kl {
+            let (wl, wr) = (*a as isize, *b as isize);
+            if t > 0.5 && c > 1.0 && mu - wl as f64 >= 1.0 && mu + wr as f64 <= (w - 2) as f64 {
+                for i in -wl..=wr {
+                    let sv = bspline_eval(&coef, mu + i as f64);
+                    out.prof[y * nkl + (i + wl) as usize] = (sv / c) as f32;
+                }
+            }
+        }
     }
     out
+}
+
+/// Widest half-window the smile leaves in common to every fitted row.
+///
+/// The smile moves the line by tens of px across the slit, so a window that
+/// fits at the middle row runs off the detector at the ends. Taking the
+/// common window keeps one basis valid for the whole slit and avoids masking
+/// inside the projection.
+pub fn auto_kl_window(
+    geom: &LineGeometry,
+    mean_img: &Image,
+    slit_h: usize,
+    tune: &ProfileTune,
+    core_sigma: f64,
+) -> (usize, usize) {
+    let iw = mean_img.w as f64;
+    let (mut cmin, mut cmax) = (f64::MAX, f64::MIN);
+    for y in geom.y1..=geom.y2.min(slit_h.saturating_sub(1)) {
+        let c = polyval(&geom.coeffs, y as f64);
+        cmin = cmin.min(c);
+        cmax = cmax.max(c);
+    }
+    if !cmin.is_finite() || !cmax.is_finite() {
+        return (tune.w_fit, tune.w_fit);
+    }
+    // The smile moves the line across the sensor, so the two sides run out of
+    // detector at different offsets. Taking the symmetric intersection throws
+    // away the wider side for nothing; keep them separate.
+    let margin = tune.mu_range + 2.0;
+    let mut lo = (cmin - margin - 1.0).floor();
+    let mut hi = (iw - 2.0 - cmax - margin).floor();
+
+    // Stop short of any other absorption feature. A telluric sits at a fixed
+    // WAVELENGTH while the window is centred on the SOLAR line, so it drifts
+    // through the window with Doppler and flexure and contributes variance
+    // that has nothing to do with the chromosphere; inside the subspace it
+    // would both inflate the rank and leak into the core estimate.
+    let (offs, spec) = desmiled_mean_spectrum(mean_img, geom);
+    if !spec.is_empty() {
+        for a in detect_anchor_offsets(&offs, &spec, core_sigma) {
+            // leave a 3 px guard so the line's own flank stays out too
+            if a < 0.0 {
+                lo = lo.min(-a - 3.0);
+            } else {
+                hi = hi.min(a - 3.0);
+            }
+        }
+    }
+    let wf = tune.w_fit as f64;
+    // 64 px is well past the point where a Halpha profile has anything left
+    // to say, and it bounds the per-pixel cost.
+    let clamp = |v: f64| -> usize {
+        if !v.is_finite() || v < wf {
+            tune.w_fit
+        } else {
+            (v as usize).min(64)
+        }
+    };
+    (clamp(lo), clamp(hi))
+}
+
+/// The de-smiled offset grid, and how many of the fitted rows can actually
+/// reach each offset.
+///
+/// The obvious grid is the INTERSECTION over rows -- every offset every row can
+/// see -- and that is what this pipeline used to build. It is badly wrong when
+/// the smile is large: the line centre on a 100 px detector here runs from 40 to
+/// 71 px, so intersecting discards 40 of 100 columns, and any spectral feature
+/// living in the discarded 40 becomes invisible even though EVERY row records
+/// one. Both telluric anchors on the 2026-08-23 optics sit there, which silently
+/// disabled telluric flexure anchoring and the dispersion measurement with it.
+///
+/// So take the UNION instead and carry the coverage. Offsets seen by too few
+/// rows are dropped: they are noisy, and worse, they are contributed by one end
+/// of the slit only, so they sample a different part of the Sun than the rest of
+/// the grid.
+/// Minimum row coverage an offset needs to enter the de-smiled grid.
+/// `GS_SPEC_COV=1.0` restores the old intersection behaviour for bisecting.
+pub fn spec_min_coverage() -> f64 {
+    std::env::var("GS_SPEC_COV").ok().and_then(|v| v.parse().ok()).unwrap_or(0.15)
+}
+
+pub fn desmiled_offset_grid(
+    mean_img: &Image,
+    geom: &LineGeometry,
+    min_coverage: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let w = mean_img.w as f64;
+    let y2 = geom.y2.min(mean_img.h.saturating_sub(1));
+    if y2 <= geom.y1 {
+        return (Vec::new(), Vec::new());
+    }
+    let centres: Vec<f64> =
+        (geom.y1..=y2).map(|y| polyval(&geom.coeffs, y as f64)).collect();
+    let cmin = centres.iter().cloned().fold(f64::MAX, f64::min);
+    let cmax = centres.iter().cloned().fold(f64::MIN, f64::max);
+    if !cmin.is_finite() || !cmax.is_finite() {
+        return (Vec::new(), Vec::new());
+    }
+    let lo = (4.0 - cmax).ceil();
+    let hi = (w - 5.0 - cmin).floor();
+    let mut offsets = Vec::new();
+    let mut coverage = Vec::new();
+    let n = centres.len() as f64;
+    let mut o = lo;
+    while o <= hi {
+        let c = centres.iter().filter(|&&cy| cy + o >= 4.0 && cy + o <= w - 5.0).count() as f64
+            / n;
+        if c >= min_coverage {
+            offsets.push(o);
+            coverage.push(c);
+        }
+        o += 1.0;
+    }
+    (offsets, coverage)
+}
+
+/// De-smiled mean spectrum of a scan's mean image: offsets relative to the
+/// line centre, and the row-flux-weighted mean intensity at each.
+///
+/// Shared by `pipeline::mean_spectrum`, the anchor detector and the subspace
+/// window chooser, so all three describe the same spectrum.
+pub fn desmiled_mean_spectrum(mean_img: &Image, geom: &LineGeometry) -> (Vec<f64>, Vec<f64>) {
+    let w = mean_img.w as f64;
+    let (offsets, _cov) = desmiled_offset_grid(mean_img, geom, spec_min_coverage());
+    if offsets.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut prof = vec![0.0f64; offsets.len()];
+    let mut wsum = vec![0.0f64; offsets.len()];
+    let margin = ((geom.y2 - geom.y1) / 20).max(10);
+    for y in geom.y1 + margin..geom.y2.saturating_sub(margin).min(mean_img.h - 1) {
+        let mut coef: Vec<f64> = mean_img.row(y).iter().map(|&v| v as f64).collect();
+        bspline_prefilter(&mut coef);
+        let c = polyval(&geom.coeffs, y as f64);
+        let rw = mean_img.row(y).iter().map(|&v| v as f64).sum::<f64>();
+        if rw <= 1e-9 {
+            continue;
+        }
+        for (k, &o) in offsets.iter().enumerate() {
+            let x = c + o;
+            if x < 4.0 || x > w - 5.0 {
+                continue; // this row never recorded that wavelength
+            }
+            prof[k] += rw * bspline_eval(&coef, x);
+            wsum[k] += rw;
+        }
+    }
+    for (v, n) in prof.iter_mut().zip(&wsum) {
+        *v /= n.max(1e-9);
+    }
+    (offsets, prof)
+}
+
+/// Offsets, in px from the line core, of absorption features that are NOT the
+/// target line — tellurics and blended weak solar lines.
+///
+/// The user cannot be asked where their H2O line sits: it moves with every
+/// change of camera lens, grating angle and order, so a pixel constant here
+/// would be the same latent optics-change bug as the old fixed wing offset.
+/// The rule is the one the flexure anchoring already uses — a local minimum
+/// at least 1.5% below the robust local continuum, far enough from the core
+/// not to be part of it — so the two can never disagree about what is a line.
+pub fn detect_anchor_offsets(offsets: &[f64], spectrum: &[f64], core_sigma: f64) -> Vec<f64> {
+    let m = spectrum.len();
+    if m < 30 || offsets.len() != m {
+        return Vec::new();
+    }
+    let cont = crate::mathutil::robust_loess_quadratic(spectrum, 25, 3);
+    let ratio: Vec<f64> = spectrum
+        .iter()
+        .zip(&cont)
+        .map(|(v, c)| if *c > 1e-9 { v / c } else { 1.0 })
+        .collect();
+    let core_excl = (4.0 * core_sigma).max(8.0);
+    let mut out = Vec::new();
+    for k in 2..m - 2 {
+        if offsets[k].abs() < core_excl {
+            continue;
+        }
+        if ratio[k] < ratio[k - 1]
+            && ratio[k] < ratio[k + 1]
+            && ratio[k] < ratio[k - 2]
+            && ratio[k] < ratio[k + 2]
+            && ratio[k] < 0.985
+        {
+            out.push(offsets[k]);
+        }
+    }
+    out
+}
+
+/// Mu-centred, continuum-normalised profiles from a subsample of the scan.
+///
+/// Shared by the subspace filter and the `specrank` diagnostic so the two can
+/// never disagree about what they are describing.
+pub(crate) fn collect_kl_samples(
+    reader: &SerReader,
+    geom: &LineGeometry,
+    smile: &[f64],
+    sigma_row: &[f64],
+    slit_h: usize,
+    transpose: bool,
+    shift: f64,
+    tune: &ProfileTune,
+    spatial_offsets: Option<&[f64]>,
+    w_lo: usize,
+    w_hi: usize,
+) -> Vec<Vec<f64>> {
+    let n = reader.header.frame_count;
+    let nkl = w_lo + w_hi + 1;
+    let stride = (n / 48).max(1);
+    let frames: Vec<usize> = (0..n).step_by(stride).collect();
+    let per_frame: Vec<Vec<Vec<f64>>> = frames
+        .par_iter()
+        .map(|&t| {
+            let mut frame = reader.frame(t);
+            if transpose {
+                frame = frame.transpose();
+            }
+            let offset = spatial_offsets.and_then(|v| v.get(t)).copied().unwrap_or(0.0);
+            let fit = if offset.abs() >= 1e-6 {
+                frame = shift_spatial_cubic(&frame, offset);
+                let sm = shift_series_linear(smile, offset);
+                let sg = shift_series_linear(sigma_row, offset);
+                fit_frame(&frame, &sm, &sg, shift, tune, &[], &KlMode::Learn(w_lo, w_hi))
+            } else {
+                fit_frame(&frame, smile, sigma_row, shift, tune, &[], &KlMode::Learn(w_lo, w_hi))
+            };
+            let mut out = Vec::new();
+            for y in (geom.y1..=geom.y2.min(slit_h - 1)).step_by(4) {
+                let v: Vec<f64> = (0..nkl).map(|i| fit.prof[y * nkl + i] as f64).collect();
+                if v.iter().any(|x| *x > 1e-9) {
+                    out.push(v);
+                }
+            }
+            out
+        })
+        .collect();
+    per_frame.into_iter().flatten().collect()
+}
+
+/// Learn the spectral subspace from a subsample of the scan.
+///
+/// Basis = the mean normalised profile plus the top `kl_k` eigenprofiles of
+/// the variation about it. The mean is included as a basis vector rather than
+/// subtracted off, so the fit has a free amplitude and a pixel whose
+/// continuum differs from the scan average is not forced back toward it.
+pub(crate) fn learn_kl_filter(
+    reader: &SerReader,
+    geom: &LineGeometry,
+    smile: &[f64],
+    sigma_row: &[f64],
+    slit_h: usize,
+    transpose: bool,
+    shift: f64,
+    tune: &ProfileTune,
+    spatial_offsets: Option<&[f64]>,
+    w_lo: usize,
+    w_hi: usize,
+) -> Option<KlFilter> {
+    let samples = collect_kl_samples(
+        reader, geom, smile, sigma_row, slit_h, transpose, shift, tune, spatial_offsets, w_lo,
+        w_hi,
+    );
+    let nkl = w_lo + w_hi + 1;
+    if samples.len() < 500 {
+        return None;
+    }
+    let (comps, mean) = pca_topk(&samples, tune.kl_k, 60);
+    if comps.is_empty() {
+        return None;
+    }
+    let mut basis = vec![mean.clone()];
+    basis.extend(comps);
+    let weights = crate::mathutil::projector_row(&basis, w_lo);
+    if weights.len() != nkl {
+        return None;
+    }
+    let noise_gain: f64 = weights.iter().map(|x| x * x).sum();
+    if std::env::var("GS_DEBUG").is_ok() {
+        let mut acc: Vec<String> = Vec::new();
+        for r in 1..=basis.len() {
+            let w = crate::mathutil::projector_row(&basis[..r], w_lo);
+            let g: f64 = w.iter().map(|x| x * x).sum();
+            acc.push(format!("{r}:{:.2}x", 1.0 / g.max(1e-12).sqrt()));
+        }
+        eprintln!(
+            "  kl: {} samples, window {} px, per-rank noise reduction {}",
+            samples.len(),
+            nkl,
+            acc.join("  ")
+        );
+    }
+    // A projector row cannot have a noise gain above 1 (that is the identity,
+    // i.e. reading the centre sample); anything at or above it means the
+    // subspace is as wide as the data and there is nothing to gain.
+    if !(noise_gain.is_finite() && noise_gain > 0.0 && noise_gain < 0.95) {
+        return None;
+    }
+    Some(KlFilter { w_lo, w_hi, weights, noise_gain, rank: basis.len(), mean })
 }
 
 /// Full profile-model extraction of the disk (plus mu/depth maps).
@@ -320,24 +728,53 @@ pub fn extract_profile(
     let sigma_row = fit_sigma_rows(mean_img, geom);
     let nwin = 2 * tune.w_fit + 1;
 
-    // spectral grid (offsets rel. smile) covering the window for all rows
-    let iw = mean_img.w as f64;
-    let (mut cmin, mut cmax) = (f64::MAX, f64::MIN);
-    for y in geom.y1..=geom.y2.min(slit_h - 1) {
-        let c = polyval(&geom.coeffs, y as f64);
-        cmin = cmin.min(c);
-        cmax = cmax.max(c);
-    }
-    let off_lo = (4.0 - cmin).ceil();
-    let off_hi = (iw - 5.0 - cmax).floor();
-    let spec_offsets: Vec<f64> = {
-        let mut v = Vec::new();
-        let mut o = off_lo;
-        while o <= off_hi {
-            v.push(o);
-            o += 1.0;
+    // Spectral grid: the UNION of what the rows can reach, not the
+    // intersection. See desmiled_offset_grid — the intersection hides
+    // telluric anchors whenever the smile is large.
+    let (spec_offsets, spec_cov) = desmiled_offset_grid(mean_img, geom, spec_min_coverage());
+
+    // F17: learn the spectral subspace before the main pass, so the filter
+    // can be applied inline and no per-frame profile buffer is ever kept.
+    let kl_filter = if tune.kl_k > 0 {
+        let mut med: Vec<f64> = sigma_row
+            .iter()
+            .skip(geom.y1)
+            .take(geom.y2.saturating_sub(geom.y1) + 1)
+            .cloned()
+            .collect();
+        let core_sigma =
+            if med.is_empty() { 2.5 } else { crate::mathutil::median_inplace(&mut med) };
+        let (wl, wr) = if tune.w_kl > 0 {
+            (tune.w_kl, tune.w_kl)
+        } else {
+            auto_kl_window(geom, mean_img, slit_h, tune, core_sigma)
+        };
+        if wl + wr > 2 * tune.w_fit {
+            learn_kl_filter(
+                reader, geom, &smile, &sigma_row, slit_h, transpose, shift, tune,
+                spatial_offsets, wl, wr,
+            )
+        } else {
+            None
         }
-        v
+    } else {
+        None
+    };
+    if let Some(f) = &kl_filter {
+        if std::env::var("GS_DEBUG").is_ok() {
+            eprintln!(
+                "  kl: window -{}..+{} px, rank {}, noise gain {:.4} ({:.2}x less noise than the centre sample)",
+                f.w_lo,
+                f.w_hi,
+                f.rank,
+                f.noise_gain,
+                1.0 / f.noise_gain.sqrt()
+            );
+        }
+    }
+    let kl_mode = match &kl_filter {
+        Some(f) => KlMode::Apply(f),
+        None => KlMode::Off,
     };
 
     let fits: Vec<ColumnFit> = (0..n)
@@ -362,9 +799,10 @@ pub fn extract_profile(
                     shift,
                     tune,
                     &spec_offsets,
+                    &kl_mode,
                 )
             } else {
-                fit_frame(&frame, &smile, &sigma_row, shift, tune, &spec_offsets)
+                fit_frame(&frame, &smile, &sigma_row, shift, tune, &spec_offsets, &kl_mode)
             }
         })
         .collect();
@@ -381,7 +819,10 @@ pub fn extract_profile(
     }
 
     // ---- residual PCA denoising (stage B) ----
-    if tune.pca_k > 0 {
+    // Skipped when the subspace filter is in charge: it already reads the
+    // core off the whole profile, and adding a residual model on top would
+    // double-count the same wing information.
+    if tune.pca_k > 0 && kl_filter.is_none() {
         // subsample residual vectors from fitted pixels
         let mut samples: Vec<Vec<f64>> = Vec::new();
         for (t, f) in fits.iter().enumerate() {
@@ -423,12 +864,24 @@ pub fn extract_profile(
     let frame_spec: Vec<Vec<f32>> = fits
         .iter()
         .map(|f| {
-            let w = f.spec_w.max(1e-9);
-            f.spec.iter().map(|&v| (v / w) as f32).collect()
+            f.spec
+                .iter()
+                .zip(&f.spec_w)
+                .map(|(&v, &n)| if n > 0.0 { (v / n) as f32 } else { 0.0 })
+                .collect()
         })
         .collect();
+    let frame_spec_rows: Vec<f32> = fits.iter().map(|f| f.spec_rows as f32).collect();
 
-    ProfileMaps { core, mu, depth, frame_spec, spec_offsets }
+    ProfileMaps {
+        core,
+        mu,
+        depth,
+        frame_spec,
+        spec_offsets,
+        spec_coverage: spec_cov.iter().map(|&v| v as f32).collect(),
+        frame_spec_rows,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -470,24 +923,28 @@ pub fn estimate_flexure_telluric(
         return None;
     }
     // global mean spectrum over frames with signal
-    let weights: Vec<f64> = maps
-        .frame_spec
-        .iter()
-        .map(|sp| sp.iter().map(|&v| v as f64).sum::<f64>())
-        .collect();
+    // Gate on ILLUMINATED ROWS, not on the spectrum's sum: the spectrum is
+    // now row-normalised, so a frame with two lit rows sums the same as a
+    // frame with two thousand and the sum no longer separates them.
+    let weights: Vec<f64> = maps.frame_spec_rows.iter().map(|&v| v as f64).collect();
     let wmax = weights.iter().cloned().fold(f64::MIN, f64::max);
     let good: Vec<usize> = (0..n).filter(|&t| weights[t] > 0.3 * wmax).collect();
     if good.len() < 100 {
         return None;
     }
     let mut mean = vec![0.0f64; m];
+    let mut mw = vec![0.0f64; m];
     for &t in &good {
         for k in 0..m {
-            mean[k] += maps.frame_spec[t][k] as f64;
+            let v = maps.frame_spec[t][k] as f64;
+            if v > 0.0 {
+                mean[k] += v;
+                mw[k] += 1.0;
+            }
         }
     }
-    for v in mean.iter_mut() {
-        *v /= good.len() as f64;
+    for (v, n) in mean.iter_mut().zip(&mw) {
+        *v /= n.max(1e-9);
     }
     // local continuum for depth measurement
     let cont = crate::mathutil::robust_loess_quadratic(&mean, 25, 3);
@@ -1163,4 +1620,269 @@ mod tests {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// specrank: how many numbers does one spectrum actually need?
+//
+// Three candidate bases are compared on the same mu-centred profiles:
+//
+//   DFT  — the obvious "just FFT it" answer. A Doppler shift is a phase ramp,
+//          which is elegant, but the window's two ends sit at different
+//          continuum levels and the transform's implicit periodicity turns
+//          that step into leakage across every frequency.
+//   DCT  — the standard fix for exactly that: an even extension has no step,
+//          so the same low-pass keeps more of the profile per coefficient.
+//   KL   — the scan's own eigenprofiles. Optimal by construction for a given
+//          coefficient count, at the cost of being learned rather than fixed.
+//
+// The figure of merit is not raw reconstruction error, because part of what a
+// truncation discards is NOISE, and discarding that is the point. Each
+// orthonormal coefficient carries sigma^2 of noise, so keeping m of n leaves
+// (n - m) * sigma^2 of noise behind; subtracting it isolates the SIGNAL a
+// truncation actually destroys. Reported in units of the per-sample noise:
+// below 1.0 the reduction costs less than the noise already present.
+// ---------------------------------------------------------------------------
+
+/// One basis's truncation curve.
+pub struct BasisCurve {
+    pub name: &'static str,
+    /// (coefficients kept, signal RMS lost in units of the per-sample noise)
+    pub loss: Vec<(usize, f64)>,
+    /// smallest coefficient count whose signal loss stays under the noise
+    pub free_at: Option<usize>,
+    /// (rank, noise variance multiplier when the CENTRE value is read through
+    /// this truncated basis) — the number that decides whether a wider window
+    /// is worth having, since a basis concentrated on the core gains nothing
+    /// from extra continuum samples
+    pub centre_gain: Vec<(usize, f64)>,
+}
+
+pub struct SpectralRankReport {
+    pub w_lo: usize,
+    pub w_hi: usize,
+    /// fitted line half-width in px, the scale the core exclusion uses
+    pub core_sigma: f64,
+    /// offsets of detected non-target absorption features (tellurics, blends)
+    pub anchors: Vec<f64>,
+    pub n_window: usize,
+    pub n_samples: usize,
+    /// per-sample noise sigma in continuum-normalised units
+    pub sigma: f64,
+    /// mean DFT power per frequency, normalised to the noise plateau
+    pub power_over_noise: Vec<f64>,
+    /// highest frequency index carrying more than 3x the noise plateau
+    pub k_cut: usize,
+    /// KL variance fractions, largest first
+    pub eigen: Vec<f64>,
+    pub curves: Vec<BasisCurve>,
+}
+
+fn orthonormalize(mut basis: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    let n = basis.first().map(|b| b.len()).unwrap_or(0);
+    let mut q: Vec<Vec<f64>> = Vec::new();
+    for v in basis.drain(..) {
+        let mut v = v;
+        if v.len() != n {
+            continue;
+        }
+        for _ in 0..2 {
+            for u in q.iter() {
+                let d: f64 = u.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+                for (vi, ui) in v.iter_mut().zip(u.iter()) {
+                    *vi -= d * ui;
+                }
+            }
+        }
+        let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if nrm < 1e-9 {
+            continue;
+        }
+        for vi in v.iter_mut() {
+            *vi /= nrm;
+        }
+        q.push(v);
+    }
+    q
+}
+
+/// Mean captured energy per orthonormal basis vector, in order.
+fn captured(samples: &[Vec<f64>], basis: &[Vec<f64>]) -> Vec<f64> {
+    let inv = 1.0 / samples.len() as f64;
+    basis
+        .par_iter()
+        .map(|q| {
+            samples
+                .iter()
+                .map(|s| {
+                    let d: f64 = q.iter().zip(s.iter()).map(|(a, b)| a * b).sum();
+                    d * d
+                })
+                .sum::<f64>()
+                * inv
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn curve(
+    name: &'static str,
+    samples: &[Vec<f64>],
+    basis: Vec<Vec<f64>>,
+    total: f64,
+    sigma: f64,
+    n: usize,
+    centre: usize,
+    step: usize,
+) -> BasisCurve {
+    let q = orthonormalize(basis);
+    let cap = captured(samples, &q);
+    let mut centre_gain = Vec::new();
+    {
+        let mut acc = 0.0;
+        for (m, u) in q.iter().enumerate() {
+            acc += u[centre] * u[centre];
+            if m + 1 <= 10 {
+                centre_gain.push((m + 1, acc));
+            }
+        }
+    }
+    let mut loss = Vec::new();
+    let mut free_at = None;
+    let mut acc = 0.0;
+    for (m, c) in cap.iter().enumerate() {
+        acc += c;
+        let kept = m + 1;
+        // residual energy, minus the noise that residual is entitled to
+        let resid = (total - acc).max(0.0);
+        let noise_left = (n - kept.min(n)) as f64 * sigma * sigma;
+        let sig = ((resid - noise_left).max(0.0) / n as f64).sqrt();
+        let rel = sig / sigma;
+        if free_at.is_none() && rel < 1.0 {
+            free_at = Some(kept);
+        }
+        if kept % step == 0 || kept <= 8 || free_at == Some(kept) {
+            loss.push((kept, rel));
+        }
+    }
+    BasisCurve { name, loss, free_at, centre_gain }
+}
+
+/// Compare DFT, DCT and KL truncation on one scan's spectra.
+pub fn spectral_rank_report(
+    reader: &SerReader,
+    geom: &LineGeometry,
+    mean_img: &Image,
+    transpose: bool,
+    w_half_req: usize,
+) -> Option<SpectralRankReport> {
+    let tune = ProfileTune::default();
+    let slit_h = if transpose { reader.header.width } else { reader.header.height };
+    let smile: Vec<f64> = (0..slit_h).map(|y| polyval(&geom.coeffs, y as f64)).collect();
+    let sigma_row = fit_sigma_rows(mean_img, geom);
+    let mut med: Vec<f64> = sigma_row
+        .iter()
+        .skip(geom.y1)
+        .take(geom.y2.saturating_sub(geom.y1) + 1)
+        .cloned()
+        .collect();
+    let core_sigma = if med.is_empty() { 2.5 } else { crate::mathutil::median_inplace(&mut med) };
+    let (offs, spec) = desmiled_mean_spectrum(mean_img, geom);
+    let anchors = detect_anchor_offsets(&offs, &spec, core_sigma);
+    let (w_lo, w_hi) = if w_half_req > 0 {
+        (w_half_req, w_half_req)
+    } else {
+        auto_kl_window(geom, mean_img, slit_h, &tune, core_sigma)
+    };
+    let n = w_lo + w_hi + 1;
+    let samples = collect_kl_samples(
+        reader, geom, &smile, &sigma_row, slit_h, transpose, 0.0, &tune, None, w_lo, w_hi,
+    );
+    if samples.len() < 200 {
+        return None;
+    }
+
+    // --- noise floor and optical cutoff, from the mean DFT power ---
+    let mut power = vec![0.0f64; n / 2 + 1];
+    for s in &samples {
+        let m: f64 = s.iter().sum::<f64>() / n as f64;
+        for (k, p) in power.iter_mut().enumerate() {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, &v) in s.iter().enumerate() {
+                let th = -2.0 * std::f64::consts::PI * (k * i) as f64 / n as f64;
+                re += (v - m) * th.cos();
+                im += (v - m) * th.sin();
+            }
+            *p += re * re + im * im;
+        }
+    }
+    for p in power.iter_mut() {
+        *p /= samples.len() as f64;
+    }
+    let tail: Vec<f64> = power[power.len() * 3 / 4..].to_vec();
+    let mut t2 = tail.clone();
+    let plateau = crate::mathutil::median_inplace(&mut t2).max(1e-30);
+    let sigma = (plateau / n as f64).sqrt();
+    let k_cut = power.iter().rposition(|&p| p > 3.0 * plateau).unwrap_or(0);
+    let power_over_noise: Vec<f64> = power.iter().map(|&p| p / plateau).collect();
+
+    // --- total energy per sample ---
+    let total: f64 =
+        samples.iter().map(|s| s.iter().map(|x| x * x).sum::<f64>()).sum::<f64>()
+            / samples.len() as f64;
+
+    // --- the three bases, each in its natural "keep the first m" order ---
+    let pi = std::f64::consts::PI;
+    let mut dft: Vec<Vec<f64>> = vec![vec![1.0; n]];
+    for k in 1..=n / 2 {
+        dft.push((0..n).map(|i| (2.0 * pi * (k * i) as f64 / n as f64).cos()).collect());
+        if k * 2 != n {
+            dft.push((0..n).map(|i| (2.0 * pi * (k * i) as f64 / n as f64).sin()).collect());
+        }
+    }
+    let dct: Vec<Vec<f64>> = (0..n)
+        .map(|k| {
+            (0..n).map(|i| (pi * (i as f64 + 0.5) * k as f64 / n as f64).cos()).collect()
+        })
+        .collect();
+    let kmax = 16.min(n - 1);
+    let (comps, mean) = pca_topk(&samples, kmax, 80);
+    let eigen_raw: Vec<f64> = {
+        let mut acc = vec![0.0; comps.len()];
+        for s in &samples {
+            for (j, c) in comps.iter().enumerate() {
+                let d: f64 =
+                    c.iter().zip(s.iter()).zip(mean.iter()).map(|((a, b), m)| a * (b - m)).sum();
+                acc[j] += d * d;
+            }
+        }
+        let var: f64 = samples
+            .iter()
+            .map(|s| s.iter().zip(mean.iter()).map(|(a, m)| (a - m) * (a - m)).sum::<f64>())
+            .sum();
+        acc.iter().map(|v| v / var.max(1e-30)).collect()
+    };
+    let mut kl: Vec<Vec<f64>> = vec![mean.clone()];
+    kl.extend(comps);
+
+    let step = (n / 12).max(1);
+    let curves = vec![
+        curve("DFT", &samples, dft, total, sigma, n, w_lo, step),
+        curve("DCT", &samples, dct, total, sigma, n, w_lo, step),
+        curve("KL ", &samples, kl, total, sigma, n, w_lo, 1),
+    ];
+
+    Some(SpectralRankReport {
+        w_lo,
+        w_hi,
+        core_sigma,
+        anchors,
+        n_window: n,
+        n_samples: samples.len(),
+        sigma,
+        power_over_noise,
+        k_cut,
+        eigen: eigen_raw,
+        curves,
+    })
 }
