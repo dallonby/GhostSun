@@ -563,8 +563,34 @@ pub fn fft2_inplace(re: &mut [f64], im: &mut [f64], w: usize, h: usize, inverse:
 /// vectors divided by their spread — which is the whole reason for doing
 /// this rather than reading the centre pixel.
 pub fn projector_row(basis: &[Vec<f64>], idx: usize) -> Vec<f64> {
+    let q = orthonormal_basis(basis);
     let n = basis.first().map(|b| b.len()).unwrap_or(0);
     if n == 0 || idx >= n {
+        return Vec::new();
+    }
+    let mut w = vec![0.0; n];
+    for u in &q {
+        let c = u[idx];
+        if c == 0.0 {
+            continue;
+        }
+        for (wi, ui) in w.iter_mut().zip(u.iter()) {
+            *wi += c * ui;
+        }
+    }
+    w
+}
+
+/// Orthonormalise a basis by twice-repeated Gram-Schmidt, dropping vectors
+/// that are numerically dependent on earlier ones.
+///
+/// Exposed separately from [`projector_row`] because a caller that needs the
+/// projection at MANY indices — reading the line core and both flanks off one
+/// subspace, say — wants the coefficients once rather than a fresh weight
+/// vector per index.
+pub fn orthonormal_basis(basis: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = basis.first().map(|b| b.len()).unwrap_or(0);
+    if n == 0 {
         return Vec::new();
     }
     let mut q: Vec<Vec<f64>> = Vec::with_capacity(basis.len());
@@ -594,17 +620,7 @@ pub fn projector_row(basis: &[Vec<f64>], idx: usize) -> Vec<f64> {
         }
         q.push(v);
     }
-    let mut w = vec![0.0; n];
-    for u in &q {
-        let c = u[idx];
-        if c == 0.0 {
-            continue;
-        }
-        for (wi, ui) in w.iter_mut().zip(u.iter()) {
-            *wi += c * ui;
-        }
-    }
-    w
+    q
 }
 
 #[cfg(test)]

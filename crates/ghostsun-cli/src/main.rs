@@ -770,6 +770,7 @@ fn main() {
                     0.0,
                     &tune,
                     Some(&motion),
+                    &[],
                 );
                 let t_cpu = t0.elapsed().as_secs_f64();
                 let t0 = std::time::Instant::now();

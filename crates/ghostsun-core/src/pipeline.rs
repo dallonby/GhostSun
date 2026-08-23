@@ -521,7 +521,70 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     // Retain its continuum bin so transparency correction does not need a
     // second full extraction of every SER frame.
     let mut profile_continuum_flux: Option<Vec<f64>> = None;
-    let (mut disk, flex, mut velocity_raw): (Image, Vec<f64>, Option<Image>) = if use_profile {
+    // F19: the flank offsets are decided BEFORE extraction so the core and
+    // every flank come off one pass of the same learned subspace. The wing
+    // offset depends only on the mean image and the smile, both of which
+    // already exist here, so there is no ordering problem -- it was simply
+    // computed later than it needed to be.
+    // Wing offset, best source first: an explicit env override (diagnosis),
+    // an explicit Angstrom request, then the profile-derived optimum, then
+    // the historical constant. The constant is a poor last resort -- it was
+    // right at 0.085 A/px and is barely off the core at 0.034 -- so it is
+    // only reached when the line is too shallow to measure a flank.
+    let wing_px = if let Some(v) = std::env::var("GS_WING_OFFSET")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        vlog!(opts, "wing offset: {:.1} px (GS_WING_OFFSET override)", v);
+        v
+    } else if opts.tune.wing_px > 0.0 {
+        vlog!(opts, "wing offset: +-{:.1} px (tune)", opts.tune.wing_px);
+        opts.tune.wing_px
+    } else if let (Some(a), Some(d)) = (opts.wing_offset_a, opts.dispersion_a_per_px) {
+        let px = a / d;
+        vlog!(opts, "wing offset: +-{:.3} A = +-{:.1} px (requested)", a, px);
+        px
+    } else {
+        match profile::optimal_wing_offset(&mean_img, &smile, geom.y1, geom.y2) {
+            Some(wo) => {
+                let in_a = opts
+                    .dispersion_a_per_px
+                    .map(|d| format!(" = +-{:.3} A", wo.px * d))
+                    .unwrap_or_default();
+                vlog!(
+                    opts,
+                    "wing offset: +-{:.1} px{} (auto: blue {:+.0}, red {:+.0}, HWHM {:.0} px)",
+                    wo.px, in_a, wo.blue_px, wo.red_px, wo.hwhm_px
+                );
+                wo.px
+            }
+            None => {
+                vlog!(opts, "wing offset: 6.0 px (line too shallow to measure a flank)");
+                6.0
+            }
+        }
+    };
+    let mut wing_req: Vec<f64> = if use_profile && !opts.baseline {
+        opts.shift_series.clone()
+    } else {
+        Vec::new()
+    };
+    let wing_doppler_idx = if use_profile && !opts.baseline {
+        let i = wing_req.len();
+        wing_req.push(-wing_px);
+        wing_req.push(wing_px);
+        Some(i)
+    } else {
+        None
+    };
+        let _ = &wing_doppler_idx;
+
+    let (mut disk, flex, mut velocity_raw, kl_wings): (
+        Image,
+        Vec<f64>,
+        Option<Image>,
+        Vec<Image>,
+    ) = if use_profile {
         let (maps, on_gpu) = profile::extract_profile_auto(
             &reader,
             &geom,
@@ -531,6 +594,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             &ptune,
             opts.use_gpu,
             pre_extraction_motion.as_deref(),
+            &wing_req,
         );
         vlog!(opts, "extraction [{}]", if on_gpu { "gpu" } else { "cpu" });
         // The optimized GPU spectrum is disk-gated.  The CPU reference keeps
@@ -592,7 +656,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         vlog!(opts, "flexure: max {:.3} px", fmax);
         // F2: velocity map (raw disk coords)
         let vel = profile::velocity_map(&maps, &smile, &flex, v_row.as_deref());
-        (maps.core, flex, Some(vel))
+        (maps.core, flex, Some(vel), maps.wings)
     } else {
         let exopts = ExtractOptions {
             shift: opts.shift,
@@ -608,7 +672,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
             },
             frame_offsets: None,
         };
-        (reconstruct_disk(&reader, &geom, &exopts), vec![0.0; n], None)
+        (reconstruct_disk(&reader, &geom, &exopts), vec![0.0; n], None, Vec::new())
     };
     if regrid_src.is_some() {
         let before = disk.w;
@@ -944,17 +1008,26 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         } else {
             None
         };
-        for &sh in &opts.shift_series {
-            let mut d = regrid(reconstruct_disk(
-                &reader,
-                &geom,
-                &ExtractOptions {
-                    shift: opts.shift + sh,
-                    transpose_input: transpose,
-                    kernel: SpectralKernel::Point,
-                    frame_offsets: flex_off.clone(),
-                },
-            ));
+        for (si, &sh) in opts.shift_series.iter().enumerate() {
+            // F19: read the flank off the SAME learned subspace as the core,
+            // at the index that keeps the WAVELENGTH fixed. Falling back to a
+            // fresh point-sampled extraction would put the products the user
+            // actually wants -- the flanks, where the Halpha texture lives --
+            // on a cruder estimator than the core, which shows the least.
+            let mut d = if let Some(im) = kl_wings.get(si) {
+                regrid(im.clone())
+            } else {
+                regrid(reconstruct_disk(
+                    &reader,
+                    &geom,
+                    &ExtractOptions {
+                        shift: opts.shift + sh,
+                        transpose_input: transpose,
+                        kernel: SpectralKernel::Point,
+                        frame_offsets: flex_off.clone(),
+                    },
+                ))
+            };
             if opts.transparency_correction {
                 flatfield::apply_column_gains(&mut d, &column_gain);
             }
@@ -1161,44 +1234,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     // column gains and transversalium and is maximally shift-sensitive
     // (wing slope), measuring at bisector depths where rotation is clean.
     let wing_doppler: Option<Image> = if use_profile && !opts.baseline {
-        // Wing offset, best source first: an explicit env override (diagnosis),
-        // an explicit Angstrom request, then the profile-derived optimum, then
-        // the historical constant. The constant is a poor last resort -- it was
-        // right at 0.085 A/px and is barely off the core at 0.034 -- so it is
-        // only reached when the line is too shallow to measure a flank.
-        let wing = if let Some(v) = std::env::var("GS_WING_OFFSET")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            vlog!(opts, "wing offset: {:.1} px (GS_WING_OFFSET override)", v);
-            v
-        } else if opts.tune.wing_px > 0.0 {
-            vlog!(opts, "wing offset: +-{:.1} px (tune)", opts.tune.wing_px);
-            opts.tune.wing_px
-        } else if let (Some(a), Some(d)) = (opts.wing_offset_a, opts.dispersion_a_per_px) {
-            let px = a / d;
-            vlog!(opts, "wing offset: +-{:.3} A = +-{:.1} px (requested)", a, px);
-            px
-        } else {
-            match profile::optimal_wing_offset(&mean_img, &smile, geom.y1, geom.y2) {
-                Some(wo) => {
-                    let in_a = opts
-                        .dispersion_a_per_px
-                        .map(|d| format!(" = +-{:.3} A", wo.px * d))
-                        .unwrap_or_default();
-                    vlog!(
-                        opts,
-                        "wing offset: +-{:.1} px{} (auto: blue {:+.0}, red {:+.0}, HWHM {:.0} px)",
-                        wo.px, in_a, wo.blue_px, wo.red_px, wo.hwhm_px
-                    );
-                    wo.px
-                }
-                None => {
-                    vlog!(opts, "wing offset: 6.0 px (line too shallow to measure a flank)");
-                    6.0
-                }
-            }
-        };
+        let wing = wing_px;
         let offsets: Option<Vec<f64>> = if std::env::var("GS_WING_NOFLEX").is_ok() {
             None // INTI-condition: wings extracted without flexure correction
         } else if flex.iter().any(|f| f.abs() > 0.0) {
@@ -1214,8 +1250,12 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 frame_offsets: offsets.clone(),
             }))
         };
-        let blue = mk(-wing);
-        let red = mk(wing);
+        let (blue, red) = match wing_doppler_idx {
+            Some(i) if kl_wings.len() > i + 1 && std::env::var("GS_WING_POINT").is_err() => {
+                (regrid(kl_wings[i].clone()), regrid(kl_wings[i + 1].clone()))
+            }
+            _ => (mk(-wing), mk(wing)),
+        };
         let ithresh = crate::mathutil::percentile_f32(&blue.data, 80.0) * 0.25;
         let mut wd = Image::new(blue.w, blue.h);
         for i in 0..wd.data.len() {

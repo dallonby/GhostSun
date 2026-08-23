@@ -36,6 +36,10 @@ pub struct ProfileMaps {
     /// fraction of fitted slit rows that can reach each offset (the smile
     /// puts the far wings on the detector for some rows and not others)
     pub spec_coverage: Vec<f32>,
+    /// F19: subspace readout at each requested rest-frame wing offset, in the
+    /// same raw-disk coordinates as `core`. Empty when none were requested or
+    /// the subspace filter is off.
+    pub wings: Vec<Image>,
     /// illuminated rows that contributed to each frame's spectrum — the
     /// signal gate, which the row-normalised spectrum can no longer supply
     pub frame_spec_rows: Vec<f32>,
@@ -85,6 +89,48 @@ pub struct KlFilter {
     pub rank: usize,
     /// mean normalised profile, kept for diagnostics
     pub mean: Vec<f64>,
+    /// orthonormal basis, for reading the projection at indices other than
+    /// the line centre (the flanks)
+    pub q: Vec<Vec<f64>>,
+}
+
+impl KlFilter {
+    /// Weights that read the projected profile at a real-valued offset from
+    /// the fitted line centre, linearly interpolating between basis samples.
+    ///
+    /// THE OFFSET MUST BE COMPUTED FROM A FIXED WAVELENGTH, NOT CHOSEN AS A
+    /// CONSTANT. Reading the flank at a constant offset from `mu` would make
+    /// it Doppler-IMMUNE, which destroys precisely the signal the flanks
+    /// exist for: the Halpha surface texture is the intensity change at a
+    /// FIXED wavelength as the line shifts underneath it. The caller passes
+    /// (rest position - mu) so the wavelength stays fixed and only the
+    /// estimator changes.
+    pub fn weights_at(&self, off: f64) -> Option<Vec<f64>> {
+        let n = self.weights.len();
+        let x = self.w_lo as f64 + off;
+        if !(x >= 0.0 && x <= (n - 1) as f64) {
+            return None;
+        }
+        let i0 = x.floor() as usize;
+        let i1 = (i0 + 1).min(n - 1);
+        let f = x - i0 as f64;
+        let mut w = vec![0.0; n];
+        for u in &self.q {
+            let c = u[i0] * (1.0 - f) + u[i1] * f;
+            if c == 0.0 {
+                continue;
+            }
+            for (wi, ui) in w.iter_mut().zip(u.iter()) {
+                *wi += c * ui;
+            }
+        }
+        Some(w)
+    }
+
+    /// Variance multiplier this estimator applies to white noise at `off`.
+    pub fn noise_gain_at(&self, off: f64) -> f64 {
+        self.weights_at(off).map(|w| w.iter().map(|x| x * x).sum()).unwrap_or(1.0)
+    }
 }
 
 /// What `fit_frame` should do about the spectral subspace.
@@ -92,7 +138,9 @@ pub(crate) enum KlMode<'a> {
     Off,
     /// collect mu-centred, continuum-normalised profiles over (left, right)
     Learn(usize, usize),
-    Apply(&'a KlFilter),
+    /// Apply the filter, and additionally emit the projected intensity at
+    /// these REST-FRAME offsets in px from the primary sampling position.
+    Apply(&'a KlFilter, &'a [f64]),
 }
 
 /// Per-row line width from the mean image, smoothed over rows.
@@ -142,6 +190,9 @@ pub(crate) struct ColumnFit {
     /// KlMode::Learn only: mu-centred, continuum-normalised profiles
     /// (2*w_kl+1 per row), the training set for the subspace
     pub(crate) prof: Vec<f32>,
+    /// KlMode::Apply only: subspace readout at each requested rest-frame
+    /// offset, n_wings * h
+    pub(crate) wing: Vec<f32>,
 }
 
 /// Fit one frame (columns of the output disk). Returns per-row results.
@@ -175,6 +226,10 @@ pub(crate) fn fit_frame(
         spec_w: vec![0.0; spec_offsets.len()],
         spec_rows: 0.0,
         prof: if kl_lo + kl_hi > 0 { vec![0.0; h * nkl] } else { Vec::new() },
+        wing: match kl {
+            KlMode::Apply(_, ws) if !ws.is_empty() => vec![0.0; ws.len() * h],
+            _ => Vec::new(),
+        },
     };
     let mut coef = vec![0.0f64; w];
     for y in 0..h {
@@ -263,15 +318,54 @@ pub(crate) fn fit_frame(
         // F17: read the core off the subspace projection of the whole
         // profile instead of off the two-parameter Gaussian. Same quantity,
         // same mu, but estimated from every sample in the window at once.
-        if let KlMode::Apply(f) = kl {
+        if let KlMode::Apply(f, wings) = kl {
             if t > 0.5 {
                 let wl = f.w_lo as isize;
-                let mut acc = 0.0;
-                for (k, &wt) in f.weights.iter().enumerate() {
+                let nk = f.weights.len();
+                // Sample the mu-centred profile ONCE, then project it onto
+                // the basis. Every readout — core and each flank — is then
+                // K+1 multiplies instead of a fresh pass over the window.
+                let mut prof = vec![0.0f64; nk];
+                for (k, p) in prof.iter_mut().enumerate() {
                     let x = (mu + (k as isize - wl) as f64).clamp(1.0, (w - 2) as f64);
-                    acc += wt * bspline_eval(&coef, x);
+                    *p = bspline_eval(&coef, x);
                 }
-                core_model = acc;
+                let cj: Vec<f64> = f
+                    .q
+                    .iter()
+                    .map(|u| u.iter().zip(prof.iter()).map(|(a, b)| a * b).sum())
+                    .collect();
+                let read = |idx: f64| -> f64 {
+                    let i0 = idx.floor().clamp(0.0, (nk - 1) as f64) as usize;
+                    let i1 = (i0 + 1).min(nk - 1);
+                    let fr = (idx - i0 as f64).clamp(0.0, 1.0);
+                    f.q
+                        .iter()
+                        .zip(cj.iter())
+                        .map(|(u, c)| c * (u[i0] * (1.0 - fr) + u[i1] * fr))
+                        .sum()
+                };
+                core_model = read(f.w_lo as f64);
+                // Flanks at FIXED WAVELENGTH. The index is measured from the
+                // rest position (center + o), not from mu, so a Doppler shift
+                // moves the line under a stationary sampling point and the
+                // flank intensity responds — which is the entire signal. A
+                // constant offset from mu would be Doppler-immune and flat.
+                for (j, &o) in wings.iter().enumerate() {
+                    let idx = f.w_lo as f64 + (center + o - mu);
+                    let v = if idx >= 0.0 && idx <= (nk - 1) as f64 {
+                        read(idx)
+                    } else {
+                        bspline_eval(&coef, (center + o).clamp(1.0, (w - 2) as f64))
+                    };
+                    out.wing[j * h + y] = v.max(0.0) as f32;
+                }
+            } else {
+                for (j, &o) in wings.iter().enumerate() {
+                    out.wing[j * h + y] =
+                        bspline_eval(&coef, (center + o).clamp(1.0, (w - 2) as f64)).max(0.0)
+                            as f32;
+                }
             }
         }
         out.core[y] = (t * core_model + (1.0 - t) * bspl).max(0.0) as f32;
@@ -630,7 +724,8 @@ pub(crate) fn learn_kl_filter(
     if !(noise_gain.is_finite() && noise_gain > 0.0 && noise_gain < 0.95) {
         return None;
     }
-    Some(KlFilter { w_lo, w_hi, weights, noise_gain, rank: basis.len(), mean })
+    let q = crate::mathutil::orthonormal_basis(&basis);
+    Some(KlFilter { w_lo, w_hi, weights, noise_gain, rank: q.len(), mean, q })
 }
 
 /// Full profile-model extraction of the disk (plus mu/depth maps).
@@ -644,8 +739,12 @@ pub fn extract_profile_auto(
     tune: &ProfileTune,
     use_gpu: bool,
     spatial_offsets: Option<&[f64]>,
+    wing_offsets: &[f64],
 ) -> (ProfileMaps, bool) {
-    if use_gpu {
+    // The GPU kernel emits the core only. When flanks are requested the CPU
+    // reference carries the whole job rather than the flanks silently going
+    // through a different estimator than the core.
+    if use_gpu && wing_offsets.is_empty() {
         if let Some(maps) =
             crate::gpu_extract::extract_profile_gpu(
                 reader,
@@ -669,6 +768,7 @@ pub fn extract_profile_auto(
             shift,
             tune,
             spatial_offsets,
+            wing_offsets,
         ),
         false,
     )
@@ -721,6 +821,7 @@ pub fn extract_profile(
     shift: f64,
     tune: &ProfileTune,
     spatial_offsets: Option<&[f64]>,
+    wing_offsets: &[f64],
 ) -> ProfileMaps {
     let n = reader.header.frame_count;
     let slit_h = if transpose { reader.header.width } else { reader.header.height };
@@ -773,7 +874,7 @@ pub fn extract_profile(
         }
     }
     let kl_mode = match &kl_filter {
-        Some(f) => KlMode::Apply(f),
+        Some(f) => KlMode::Apply(f, wing_offsets),
         None => KlMode::Off,
     };
 
@@ -872,6 +973,19 @@ pub fn extract_profile(
         })
         .collect();
     let frame_spec_rows: Vec<f32> = fits.iter().map(|f| f.spec_rows as f32).collect();
+    let mut wings: Vec<Image> = Vec::new();
+    if kl_filter.is_some() && !wing_offsets.is_empty() && fits.iter().all(|f| !f.wing.is_empty())
+    {
+        for j in 0..wing_offsets.len() {
+            let mut im = Image::new(n, slit_h);
+            for (t, f) in fits.iter().enumerate() {
+                for y in 0..slit_h {
+                    im.set(t, y, f.wing[j * slit_h + y]);
+                }
+            }
+            wings.push(im);
+        }
+    }
 
     ProfileMaps {
         core,
@@ -880,6 +994,7 @@ pub fn extract_profile(
         frame_spec,
         spec_offsets,
         spec_coverage: spec_cov.iter().map(|&v| v as f32).collect(),
+        wings,
         frame_spec_rows,
     }
 }

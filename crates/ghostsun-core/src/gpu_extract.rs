@@ -663,6 +663,7 @@ pub fn extract_profile_gpu(
         frame_spec,
         spec_offsets,
         spec_coverage: spec_cov.iter().map(|&v| v as f32).collect(),
+        wings: Vec::new(),
         frame_spec_rows,
     })
 }
