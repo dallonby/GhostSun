@@ -652,13 +652,39 @@ impl Camera for ToupcamCam {
         if let Some(r) = self.pending_roi.take() {
             // Offsets/sizes align to 2 px; 0×0 means full frame.
             let a = |v: usize| (v & !1) as c_uint;
-            unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) };
+            // The ROI is CLEARED with all-zero arguments. Asking for the whole
+            // sensor by its explicit dimensions is a different request and is
+            // not reliably honoured: releasing a live ROI that way left the
+            // stream wedged, sometimes until the camera was replugged.
+            let wants_full = r.x == 0
+                && r.y == 0
+                && (r.w == 0 || r.w >= self.info.max_width)
+                && (r.h == 0 || r.h >= self.info.max_height);
+            let hr = if wants_full {
+                unsafe { (self.api.put_roi)(self.h, 0, 0, 0, 0) }
+            } else {
+                unsafe { (self.api.put_roi)(self.h, a(r.x), a(r.y), a(r.w), a(r.h)) }
+            };
+            // Previously discarded, so a refused ROI started the stream on a
+            // geometry nobody had agreed on instead of failing where callers
+            // can fall back.
+            if hr < 0 {
+                return Err(CameraError::Sdk(format!(
+                    "put_Roi({}, {}, {}, {}) failed (hr {hr})",
+                    r.x, r.y, r.w, r.h
+                )));
+            }
         }
         // Re-assert bit depth in case an earlier start left the SDK elsewhere.
         let opt = if self.bit_depth == 8 { 0 } else { 1 };
         unsafe {
             (self.api.put_option)(self.h, OPTION_BITDEPTH, opt);
         }
+        // Drop frame-ready notifications queued for the PREVIOUS geometry.
+        // The callback fires per frame regardless of who is listening, so a
+        // stale one makes the first pull after a resize read a frame whose
+        // size no longer matches the buffer.
+        while self.rx.try_recv().is_ok() {}
         let hr =
             unsafe { (self.api.start_pull)(self.h, Some(on_event), self.signal as *mut c_void) };
         if hr < 0 {
