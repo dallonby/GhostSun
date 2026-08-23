@@ -138,10 +138,6 @@ struct Calibration {
 
 pub struct AcquireState {
     capture_height: usize,
-    /// Read only the capture band from the sensor while recording. Measured on
-    /// the G3M678M: 23 fps full-frame → 176 fps at 256 rows, and frame rate is
-    /// scan-axis sampling density. Restored the moment recording stops.
-    use_hw_roi: bool,
     anchor_y: Option<f64>,
     output_dir: PathBuf,
     scan_span_deg: f64,
@@ -177,7 +173,6 @@ impl Default for AcquireState {
             // needs at a fifth of the file size of the old 1024 default
             // (a 900-frame scan: ~1.3 GB rather than ~6.6 GB).
             capture_height: 256,
-            use_hw_roi: true,
             anchor_y: None,
             output_dir,
             scan_span_deg: 0.80,
@@ -452,7 +447,6 @@ impl AcquireState {
                         path,
                         self.capture_height,
                         self.anchor_y.ok_or("spectral anchor was lost")?,
-                        self.use_hw_roi,
                     )?;
                     run.phase = RunPhase::AwaitRecorder;
                     run.deadline = Instant::now() + Duration::from_secs(8);
@@ -986,10 +980,13 @@ impl AcquireState {
              Bounded by the selected camera's advertised height until the \
              preview is running and the real frame size is known."
         });
-        ui.checkbox(&mut self.use_hw_roi, "hardware ROI while recording")
-            .on_hover_text(
-                "The sensor reads only the capture band, so frame rate is set by                  exposure instead of full-frame readout — measured 23 → 176 fps at                  256 px on a G3M678M. More frames per second means finer scan-axis                  sampling. The full sensor comes back the moment recording stops,                  and if the camera refuses the ROI the recording falls back to the                  software crop.",
-            );
+        ui.label(
+            egui::RichText::new(
+                "A scan records whatever the sensor is currently reading. Use                  Apply ROI now for the cropped, high-frame-rate band; leave it                  released to record the full sensor and crop in software. The                  geometry is never changed during a scan.",
+            )
+            .small()
+            .weak(),
+        );
         // Apply the SAME band now, outside recording. Without this the ROI is
         // unverifiable until a scan has already been taken: the checkbox only
         // states an intention, and the preview keeps showing the full sensor

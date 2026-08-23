@@ -2301,9 +2301,6 @@ impl MountState {
                                         path,
                                         self.capture_height,
                                         anchor_y,
-                                        // Manual captures benefit identically, and
-                                        // the worker restores the full sensor on stop.
-                                        true,
                                     ) {
                                         focus.recording_status = error;
                                     }

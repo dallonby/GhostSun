@@ -54,6 +54,7 @@ pub fn init() -> PathBuf {
     path
 }
 
+#[allow(dead_code)]
 pub fn path() -> Option<&'static Path> {
     PATH.get().map(|p| p.as_path())
 }
