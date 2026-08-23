@@ -65,7 +65,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoint, PlotPoints, Points, Text, VLine};
 use ghostsun_camera::{enumerate_all, open, Backend, CameraInfo, Roi};
 use ghostsun_core::linefit::fit_lines_1d;
 use ghostsun_core::lines::{calibrate, geometric_dispersion, identify, Calibration, LabeledLine};
-use ghostsun_core::ser::{FrameTime, SerRecorder};
+use ghostsun_core::ser::{AsyncSerRecorder, FrameTime};
 
 use crate::focusmetrics::{self, LuckyBuf, StructureSplit};
 use crate::vcurve::{self, NullPoint, ParabolaFit, VCurve};
@@ -216,6 +216,8 @@ enum FocusMsg {
         hw_roi: bool,
         /// Per-frame times were written from the camera clock, not host stamps.
         device_clock: bool,
+        /// Frames the writer could not accept — the scan has gaps.
+        dropped: usize,
     },
     RecordingError(String),
     /// Non-fatal status the user needs to see (e.g. a stalled stream), which
@@ -270,7 +272,7 @@ struct ActiveSer {
     path: PathBuf,
     y0: usize,
     height: usize,
-    recorder: SerRecorder,
+    recorder: AsyncSerRecorder,
     hw_roi_y0: Option<usize>,
     /// First-frame time, for the achieved-fps report.
     started: Instant,
@@ -694,7 +696,7 @@ impl FocusState {
                     self.recorded_frames = frames;
                     self.recording_status = format!("recording · {frames} frames");
                 }
-                FocusMsg::RecordingStopped { path, frames, fps, hw_roi, device_clock } => {
+                FocusMsg::RecordingStopped { path, frames, fps, hw_roi, device_clock, dropped } => {
                     self.recording = false;
                     self.recorded_frames = frames;
                     self.recording_path = Some(path);
@@ -702,10 +704,15 @@ impl FocusState {
                     // The clock behind the per-frame timestamps decides how
                     // precisely reconstruction can place each column.
                     let clock = if device_clock { " · camera clock" } else { " · host clock" };
-                    self.recording_status = if fps > 0.0 {
-                        format!("saved {frames} frames · {fps:.1} fps{mode}{clock}")
+                    let lost = if dropped > 0 {
+                        format!(" · {dropped} DROPPED (disk too slow)")
                     } else {
-                        format!("saved {frames} frames{mode}{clock}")
+                        String::new()
+                    };
+                    self.recording_status = if fps > 0.0 {
+                        format!("saved {frames} frames · {fps:.1} fps{mode}{clock}{lost}")
+                    } else {
+                        format!("saved {frames} frames{mode}{clock}{lost}")
                     };
                 }
                 FocusMsg::RecordingError(error) => {
@@ -2988,6 +2995,7 @@ fn worker(
                             fps: 0.0,
                             hw_roi: false,
                             device_clock: false,
+                            dropped: 0,
                         });
                     }
                 }
@@ -3018,12 +3026,16 @@ fn worker(
                             request.anchor_y,
                         ),
                     };
-                    match SerRecorder::create(
+                    // 64 frames of slack between the capture loop and the
+                    // disk. Writing synchronously here starves the SDK's
+                    // real-time buffer and it discards frames silently.
+                    match AsyncSerRecorder::create(
                         &request.path,
                         frame.width,
                         height,
                         &info.name,
                         "Spectroheliograph",
+                        64,
                     ) {
                         Ok(recorder) => {
                             let _ = tx.send(FocusMsg::RecordingStarted {
@@ -3061,14 +3073,19 @@ fn worker(
                             host: frame.host_time,
                             device_us: frame.device_time_us,
                         };
-                        match active.recorder.write_frame(&frame.data[start..end], ftime) {
-                            Ok(()) => {
-                                let frames = active.recorder.frame_count();
-                                if frames == 1 || frames % 10 == 0 {
-                                    let _ = tx.send(FocusMsg::RecordingProgress(frames));
-                                }
+                        if active.recorder.write_frame(&frame.data[start..end], ftime) {
+                            let frames = active.recorder.frame_count();
+                            if frames == 1 || frames % 10 == 0 {
+                                let _ = tx.send(FocusMsg::RecordingProgress(frames));
                             }
-                            Err(error) => recording_failed = Some(error.to_string()),
+                        } else if active.recorder.dropped() == 1 {
+                            // Say it once, the moment it starts: a scan with
+                            // gaps is worth knowing about while it is still
+                            // possible to slow the camera down.
+                            let _ = tx.send(FocusMsg::Error(format!(
+                                "disk cannot keep up at this frame rate — frames are being dropped. \
+                                 Lower the frame rate (longer exposure) or shrink the capture band."
+                            )));
                         }
                     }
                 }
@@ -3214,6 +3231,7 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
     let path = active.path;
     let elapsed = active.started.elapsed().as_secs_f64();
     let hw_roi = active.hw_roi_y0.is_some();
+    let dropped = active.recorder.dropped();
     match active.recorder.finish() {
         Ok(summary) => {
             let frames = summary.frames;
@@ -3234,6 +3252,7 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
                 fps,
                 hw_roi,
                 device_clock: summary.device_clock,
+                dropped,
             }
         }
         Err(error) => FocusMsg::RecordingError(error.to_string()),

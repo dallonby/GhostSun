@@ -634,3 +634,135 @@ mod tests {
         assert!((ticks_to_unix_seconds(ticks) - (unix as f64 + 0.25)).abs() < 1e-6);
     }
 }
+
+/// A [`SerRecorder`] driven from a background thread, so disk writes never
+/// block the capture loop.
+///
+/// This matters more than it sounds. The capture thread must keep pulling, or
+/// the vendor SDK — in real-time mode — discards whatever arrives while it is
+/// busy. Writing ~900 KB synchronously per frame at several hundred frames a
+/// second puts hundreds of MB/s of blocking I/O directly in that path, and the
+/// dropped frames are silent. A real session recorded at 612 fps kept only
+/// 49% of its frames this way, every surviving interval an exact multiple of
+/// the true 1.634 ms cadence.
+///
+/// Frames are handed to a writer thread through a bounded queue. Bounded, not
+/// unbounded: if the disk genuinely cannot keep up, memory must not grow
+/// without limit, and the overflow is COUNTED and reported rather than lost
+/// quietly.
+pub struct AsyncSerRecorder {
+    tx: Option<std::sync::mpsc::SyncSender<(Vec<u16>, FrameTime)>>,
+    handle: Option<std::thread::JoinHandle<io::Result<SerSummary>>>,
+    queued: usize,
+    dropped: usize,
+    depth: usize,
+}
+
+impl AsyncSerRecorder {
+    /// `depth` frames of slack absorb write-latency spikes; 64 frames of a
+    /// 3840x120 16-bit band is about 59 MB.
+    pub fn create(
+        path: &Path,
+        width: usize,
+        height: usize,
+        instrument: &str,
+        telescope: &str,
+        depth: usize,
+    ) -> io::Result<Self> {
+        let mut rec = SerRecorder::create(path, width, height, instrument, telescope)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u16>, FrameTime)>(depth.max(2));
+        let handle = std::thread::spawn(move || -> io::Result<SerSummary> {
+            while let Ok((px, t)) = rx.recv() {
+                rec.write_frame(&px, t)?;
+            }
+            rec.finish()
+        });
+        Ok(AsyncSerRecorder {
+            tx: Some(tx),
+            handle: Some(handle),
+            queued: 0,
+            dropped: 0,
+            depth: depth.max(2),
+        })
+    }
+
+    /// Queue a frame. Returns `false` when the queue was full and the frame
+    /// had to be dropped — the caller should surface that, because it means
+    /// the disk cannot sustain the frame rate and the scan will have gaps.
+    pub fn write_frame(&mut self, pixels: &[u16], time: FrameTime) -> bool {
+        let Some(tx) = &self.tx else { return false };
+        match tx.try_send((pixels.to_vec(), time)) {
+            Ok(()) => {
+                self.queued += 1;
+                true
+            }
+            Err(_) => {
+                self.dropped += 1;
+                false
+            }
+        }
+    }
+
+    /// Frames accepted for writing.
+    pub fn frame_count(&self) -> usize {
+        self.queued
+    }
+
+    /// Frames refused because the writer could not keep up.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Close the queue and wait for the writer to flush and finalise.
+    pub fn finish(mut self) -> io::Result<SerSummary> {
+        drop(self.tx.take());
+        match self.handle.take() {
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("SER writer thread panicked"))),
+            None => Err(io::Error::other("SER writer already finished")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+
+    #[test]
+    fn async_recorder_writes_every_queued_frame_and_reports_overflow() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("ghostsun-async-{}-{unique}.ser", std::process::id()));
+        let (w, h) = (64usize, 8usize);
+        let mut rec = AsyncSerRecorder::create(&path, w, h, "test", "test", 8).unwrap();
+        let base = SystemTime::now();
+        let mut accepted = 0usize;
+        for i in 0..200 {
+            let px = vec![i as u16; w * h];
+            let t = FrameTime {
+                host: base + std::time::Duration::from_micros(i as u64 * 1000),
+                device_us: Some(i as u64 * 1000),
+            };
+            if rec.write_frame(&px, t) {
+                accepted += 1;
+            }
+        }
+        let dropped = rec.dropped();
+        let summary = rec.finish().unwrap();
+        // Whatever was accepted must all be on disk, and accounted for.
+        assert_eq!(summary.frames, accepted, "every accepted frame written");
+        assert_eq!(accepted + dropped, 200, "no frame unaccounted for");
+        let reader = SerReader::open(&path).unwrap();
+        assert_eq!(reader.header.frame_count, accepted);
+        assert_eq!(reader.timestamps.as_ref().unwrap().len(), accepted);
+        // Frame content must survive the hand-off in order.
+        let f0 = reader.frame(0);
+        assert!(f0.data.iter().all(|&v| v == 0.0), "first frame intact");
+        std::fs::remove_file(path).unwrap();
+    }
+}
