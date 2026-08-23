@@ -364,3 +364,134 @@ pub fn temporal_nlm(disk: &Image, radius: usize, h_factor: f64) -> Image {
     }
     out
 }
+
+/// F20 ATTEMPT, MEASURED AND FAILED. Kept dead-coded with its diagnosis, in
+/// the same spirit as the photometric-x anchors: the analysis is worth more
+/// than the code, and the next person should not rebuild it unchanged.
+///
+/// WHAT HAPPENED: with the flanks as similarity channels this function is
+/// BIT-IDENTICAL to disabling temporal NLM. Verified against --no-nlm: same
+/// PSNR, same SSIM, same band SNR, and noisecmp reports |A-B| = 0.000. It
+/// vetoes every neighbour, so the output is the input. `h` has no effect from
+/// 0.001 to 4 and the radius has no effect from 3 to 16, both of which are the
+/// signature of weights pinned at zero rather than of a working matcher.
+///
+/// WHY, AND IT IS THE INTERESTING PART: the flanks are a BAD similarity metric
+/// precisely BECAUSE they carry the most signal. dI/dlambda is maximal there,
+/// so a flank intensity swings hard between neighbouring frames for entirely
+/// real reasons, the distance runs far above the noise floor everywhere, and
+/// every neighbour is rejected. A similarity metric wants channels that are
+/// STABLE when the physical state is unchanged; the flanks are the most
+/// volatile product in the pipeline. Choosing them was backwards.
+///
+/// THE FIX DIRECTION is the design abandoned earlier for memory reasons and
+/// which now looks correct: match on the amplitude-normalised SUBSPACE SHAPE
+/// COEFFICIENTS, which describe the profile's form rather than its height and
+/// vary slowly, instead of on raw flank intensities. That costs K planes of
+/// storage in raw-disk coordinates and is the next thing to try.
+///
+/// NOTE ALSO, separately and independently true: the apparent gain this stage
+/// showed was really "temporal NLM off". At full exposure NLM COSTS -- 35.61
+/// with against 35.63 without, band4 4.1 against 4.3, SSIM 0.9808 against
+/// 0.9818 -- which violates the ablation rule that every Ghost-no-X must score
+/// worse. CLAUDE.md already says NLM earns its keep at LOW exposure; the
+/// default bench is the wrong place to judge it.
+///
+/// Original intent, unchanged and still worth pursuing:
+/// temporal non-local means whose similarity is measured in the SPECTRAL
+/// state, not in intensity alone.
+///
+/// The existing `temporal_nlm` matches a 7-sample along-slit patch of the
+/// extracted core. By the time it runs, each frame has been collapsed to one
+/// intensity per slit row, so it has no idea what the line PROFILE was doing
+/// -- two frames can agree in core intensity while sitting at quite different
+/// points of the profile, and it will average them together.
+///
+/// The flanks fix that for free. `aux` carries the blue and red wing planes
+/// that F19 already reads off the same subspace, in the same raw-disk
+/// coordinates. A frame that agrees with its neighbour in core AND both flanks
+/// is in the same physical state; one that agrees only in the core is not, and
+/// is now correctly down-weighted. This is the spectro-temporal matching that
+/// neither stage did on its own: `temporal_nlm` had time without the spectrum,
+/// the subspace filter had the spectrum without time.
+///
+/// Each channel is normalised by its OWN noise sigma before the distances are
+/// summed, so the comparison is in units of noise and the flanks -- which are
+/// fainter and noisier than the core -- neither dominate nor are ignored. The
+/// noise contribution is subtracted from the distance before weighting, for
+/// the same reason as in the scalar version: patches differing only by noise
+/// must take full weight, or the filter refuses to average exactly where
+/// averaging is most needed.
+pub fn temporal_nlm_spectral(
+    disk: &Image,
+    aux: &[&Image],
+    radius: usize,
+    h_factor: f64,
+) -> Image {
+    if aux.is_empty() || aux.iter().any(|a| a.w != disk.w || a.h != disk.h) {
+        return temporal_nlm(disk, radius, h_factor);
+    }
+    let (w, hgt) = (disk.w, disk.h);
+    let Some((sigma0, _h2, thresh)) = nlm_params(disk, h_factor) else {
+        return disk.clone();
+    };
+    // Per-channel noise scale, so distances are commensurate.
+    let mut chans: Vec<(Vec<Vec<f32>>, f64)> = Vec::with_capacity(aux.len() + 1);
+    chans.push(((0..w).map(|x| disk.column(x)).collect(), sigma0.max(1e-6)));
+    for a in aux {
+        let s = nlm_params(a, h_factor).map(|(s, _, _)| s).unwrap_or(sigma0).max(1e-6);
+        chans.push(((0..w).map(|x| a.column(x)).collect(), s));
+    }
+    let nc = chans.len() as f64;
+    const P: isize = 3;
+    let pn = (2 * P + 1) as f64;
+    // h is now in units of noise variance, so it does not inherit the scalar
+    // version's absolute h2 and the two are tuned independently.
+    let h2 = (h_factor * h_factor).max(1e-6);
+
+    let out_cols: Vec<Vec<f32>> = (0..w)
+        .into_par_iter()
+        .map(|t| {
+            let prim = &chans[0].0;
+            let mut out = prim[t].clone();
+            let lo = t.saturating_sub(radius);
+            let hi = (t + radius + 1).min(w);
+            for y in 0..hgt {
+                if prim[t][y] <= thresh {
+                    continue;
+                }
+                let mut acc = prim[t][y] as f64;
+                let mut wsum = 1.0;
+                for tt in lo..hi {
+                    if tt == t {
+                        continue;
+                    }
+                    let mut d2 = 0.0;
+                    for (cols, sg) in &chans {
+                        let mut dc = 0.0;
+                        for p in -P..=P {
+                            let yy = (y as isize + p).clamp(0, hgt as isize - 1) as usize;
+                            let d = cols[t][yy] as f64 - cols[tt][yy] as f64;
+                            dc += d * d;
+                        }
+                        // in units of this channel's noise variance
+                        d2 += dc / pn / (sg * sg);
+                    }
+                    d2 /= nc;
+                    // pure noise gives E[d2] = 2; anything above that is real
+                    let excess = (d2 - 2.0).max(0.0);
+                    let wgt = (-excess / h2).exp();
+                    acc += wgt * prim[t][y] as f64;
+                    wsum += wgt;
+                }
+                out[y] = (acc / wsum) as f32;
+            }
+            out
+        })
+        .collect();
+    let mut out = Image::new(w, hgt);
+    for (t, col) in out_cols.iter().enumerate() {
+        out.set_column(t, col);
+    }
+    out
+}

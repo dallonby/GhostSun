@@ -24,6 +24,10 @@ pub struct TuneParams {
     pub w_fit: f64,           // profile fit half-window (px)
     pub pca_k: f64,           // residual PCA components
     pub kl_k: f64,            // F17 spectral-subspace rank (0 = off)
+    /// F20 spectro-temporal NLM: h in units of noise sigma. 0 = off, and off
+    /// is correct -- MEASURED AS A NO-OP, see quality::temporal_nlm_spectral
+    /// for why. Retained so the finding is reproducible, not for use.
+    pub nlm_spec: f64,
     pub w_kl: f64,            // F17 half-window (0 = auto from the smile)
     pub mu_range: f64,        // mu search range (px)
     pub depth_gate: f64,      // absorption/emission fallback gate
@@ -54,6 +58,7 @@ impl Default for TuneParams {
             pca_k: 3.0,
             kl_k: 3.0,
             w_kl: 0.0,
+            nlm_spec: 0.0,
             mu_range: 3.0,
             depth_gate: 0.10,
             transp_deadband: 0.012,
@@ -80,6 +85,7 @@ impl TuneParams {
             "w_fit" => self.w_fit = v,
             "pca_k" => self.pca_k = v,
             "kl_k" => self.kl_k = v,
+            "nlm_spec" => self.nlm_spec = v,
             "w_kl" => self.w_kl = v,
             "mu_range" => self.mu_range = v,
             "depth_gate" => self.depth_gate = v,
@@ -868,8 +874,29 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         if opts.temporal_nlm {
             stage!("pre-NLM stages");
             let radius = opts.tune.nlm_radius.round().max(1.0) as usize;
+            // F20: the flanks, brought onto the core's grid and through the
+            // same geometric corrections, so the patch comparison lines up row
+            // for row. Photometric corrections are skipped deliberately: this
+            // is a SIMILARITY metric, and a per-column gain cancels in the
+            // difference between two columns at the same row.
+            let nlm_aux: Vec<Image> = match wing_doppler_idx {
+                Some(i) if opts.tune.nlm_spec > 0.0 && kl_wings.len() > i + 1 => [i, i + 1]
+                    .iter()
+                    .map(|&k| {
+                        let mut d = regrid(kl_wings[k].clone());
+                        if jitter_applied.iter().any(|v| v.abs() > 1e-6) {
+                            d = jitter::apply_shifts(&d, &jitter_applied);
+                        }
+                        if xreg_applied.iter().any(|v| v.abs() > 1e-6) {
+                            d = jitter::apply_x_offsets(&d, &xreg_applied);
+                        }
+                        d
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             let mut done_gpu = false;
-            if opts.use_gpu {
+            if opts.use_gpu && nlm_aux.is_empty() {
                 if let Some((sigma, h2, thresh)) = quality::nlm_params(&disk, opts.tune.nlm_h) {
                     if let Some(out) = crate::gpu::temporal_nlm(&disk, radius, h2, sigma, thresh) {
                         disk = out;
@@ -878,7 +905,18 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
                 }
             }
             if !done_gpu {
-                disk = quality::temporal_nlm(&disk, radius, opts.tune.nlm_h);
+                disk = if nlm_aux.is_empty() {
+                    quality::temporal_nlm(&disk, radius, opts.tune.nlm_h)
+                } else {
+                    let refs: Vec<&Image> = nlm_aux.iter().collect();
+                    vlog!(
+                        opts,
+                        "spectro-temporal NLM: {} spectral channel(s), h {:.2} sigma",
+                        refs.len() + 1,
+                        opts.tune.nlm_spec
+                    );
+                    quality::temporal_nlm_spectral(&disk, &refs, radius, opts.tune.nlm_spec)
+                };
             }
             vlog!(
                 opts,
