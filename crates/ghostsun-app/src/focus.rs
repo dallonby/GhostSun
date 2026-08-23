@@ -2756,6 +2756,10 @@ fn worker(
     // recordings: a recording that ends must return to the band the user is
     // working in, not to the full sensor.
     let mut live_roi: Option<Roi> = None;
+    // What the sensor is actually reading right now. The camera opens full
+    // frame, and every change goes through ensure_roi so a redundant or
+    // band-to-band transition can never stall the stream.
+    let mut current_roi: Roi = full_frame_roi(&info);
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2790,7 +2794,7 @@ fn worker(
                             w: info.max_width,
                             h: (height & !1).max(2),
                         };
-                        match apply_roi(&mut *cam, band) {
+                        match ensure_roi(&mut *cam, &info, &mut current_roi, band) {
                             Ok(()) => {
                                 live_roi = Some(band);
                                 let _ = tx.send(FocusMsg::LiveRoi {
@@ -2808,6 +2812,7 @@ fn worker(
                                     )));
                                     return;
                                 }
+                                current_roi = full_frame_roi(&info);
                                 live_roi = None;
                                 let _ = tx.send(FocusMsg::LiveRoi {
                                     active: false,
@@ -2820,7 +2825,8 @@ fn worker(
                             }
                         }
                     } else {
-                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                        let full = full_frame_roi(&info);
+                        if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, full) {
                             let _ = tx.send(FocusMsg::Error(format!(
                                 "the full sensor could not be restored: {error}"
                             )));
@@ -2844,7 +2850,9 @@ fn worker(
                         let had_hw = active.hw_roi_y0.is_some();
                         finish_ser(active, &tx);
                         if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
+                            let rest = resting_roi(&info, live_roi);
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            {
                                 let _ = tx.send(FocusMsg::Error(format!(
                                     "the sensor could not be restored: {error}"
                                 )));
@@ -2869,11 +2877,15 @@ fn worker(
                             w: info.max_width,
                             h: (height & !1).max(2),
                         };
-                        match apply_roi(&mut *cam, band) {
+                        // Usually a no-op: if the user already applied this
+                        // band live, the sensor is reading it and the stream
+                        // must NOT be cycled just to say so again.
+                        match ensure_roi(&mut *cam, &info, &mut current_roi, band) {
                             Ok(()) => hw_roi_y0 = Some(band.y),
                             Err(roi_error) => {
+                                let rest = resting_roi(&info, live_roi);
                                 if let Err(error) =
-                                    apply_roi(&mut *cam, resting_roi(&info, live_roi))
+                                    ensure_roi(&mut *cam, &info, &mut current_roi, rest)
                                 {
                                     let _ = tx.send(FocusMsg::Error(format!(
                                         "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
@@ -2899,7 +2911,9 @@ fn worker(
                         // ROI is scoped to the recording; where that leaves
                         // the sensor is the user's live band if they set one.
                         if had_hw {
-                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
+                            let rest = resting_roi(&info, live_roi);
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            {
                                 let _ = tx.send(finished);
                                 let _ = tx.send(FocusMsg::Error(format!(
                                     "SER saved, but the sensor could not be restored: {error}"
@@ -2919,7 +2933,9 @@ fn worker(
                         // No frame ever arrived. If the ROI was already
                         // applied it must still be unwound.
                         if request.hw_roi_y0.is_some() {
-                            if let Err(error) = apply_roi(&mut *cam, resting_roi(&info, live_roi)) {
+                            let rest = resting_roi(&info, live_roi);
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            {
                                 let _ = tx.send(FocusMsg::Error(format!(
                                     "the sensor could not be restored: {error}"
                                 )));
@@ -3183,6 +3199,54 @@ fn apply_roi(cam: &mut dyn ghostsun_camera::Camera, roi: Roi) -> Result<(), Stri
     cam.start().map_err(|error| error.to_string())
 }
 
+fn roi_eq(a: Roi, b: Roi) -> bool {
+    a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h
+}
+
+/// Move the sensor to `target`, tracking what is currently applied.
+///
+/// Two rules the raw `apply_roi` cannot enforce on its own, both learned from
+/// a camera that hung when a scan started on an already-cropped sensor:
+///
+/// 1. A redundant stop/set/start is not free — it is a real risk of a stalled
+///    stream for no gain. If the sensor already reads `target`, do nothing.
+/// 2. ROI offsets are full-sensor coordinates, but a band set while another
+///    band is applied is not reliably interpreted that way. Normalise through
+///    full frame before setting a different band.
+fn ensure_roi(
+    cam: &mut dyn ghostsun_camera::Camera,
+    info: &CameraInfo,
+    current: &mut Roi,
+    target: Roi,
+) -> Result<(), String> {
+    for step in roi_transition(*current, target, full_frame_roi(info)) {
+        apply_roi(cam, step)?;
+        *current = step;
+    }
+    Ok(())
+}
+
+/// The ROIs to apply, in order, to get from `current` to `target`.
+///
+/// Empty when the sensor already reads the target — the case that matters,
+/// since a scan starting on a band the user already applied live would
+/// otherwise cycle the stream for nothing and could stall it.
+fn roi_transition(current: Roi, target: Roi, full: Roi) -> Vec<Roi> {
+    if roi_eq(current, target) {
+        return Vec::new();
+    }
+    if roi_eq(current, full) {
+        return vec![target];
+    }
+    if roi_eq(target, full) {
+        return vec![full];
+    }
+    // Band to a DIFFERENT band: normalise through full frame, because ROI
+    // offsets are full-sensor coordinates and are not reliably interpreted
+    // as such while another band is applied.
+    vec![full, target]
+}
+
 fn vertical_crop_bounds(
     frame_height: usize,
     requested_height: usize,
@@ -3276,6 +3340,50 @@ pub fn full_roi(info: &CameraInfo) -> Roi {
         y: 0,
         w: info.max_width,
         h: info.max_height,
+    }
+}
+
+#[cfg(test)]
+mod roi_tests {
+    use super::*;
+
+    fn full() -> Roi {
+        Roi { x: 0, y: 0, w: 3840, h: 2160 }
+    }
+    fn band(y: usize, h: usize) -> Roi {
+        Roi { x: 0, y, w: 3840, h }
+    }
+    fn same(got: &[Roi], want: &[Roi]) -> bool {
+        got.len() == want.len() && got.iter().zip(want).all(|(a, b)| roi_eq(*a, *b))
+    }
+
+    /// The regression: with a band already applied live, starting a scan asks
+    /// for the SAME band. Re-applying it cycles stop/set/start on a healthy
+    /// stream, which hung the camera mid-acquisition ("SER recorder did not
+    /// start"). An unchanged ROI must produce no camera calls at all.
+    #[test]
+    fn re_applying_the_same_band_touches_the_camera_not_at_all() {
+        assert!(roi_transition(band(1026, 120), band(1026, 120), full()).is_empty());
+        assert!(roi_transition(full(), full(), full()).is_empty());
+    }
+
+    #[test]
+    fn band_to_band_normalises_through_full_frame() {
+        // ROI offsets are full-sensor coordinates; setting a band while
+        // another is applied cannot be trusted to mean that.
+        assert!(same(
+            &roi_transition(band(1026, 120), band(400, 256), full()),
+            &[full(), band(400, 256)]
+        ));
+    }
+
+    #[test]
+    fn single_step_from_or_to_full_frame() {
+        assert!(same(
+            &roi_transition(full(), band(400, 256), full()),
+            &[band(400, 256)]
+        ));
+        assert!(same(&roi_transition(band(400, 256), full(), full()), &[full()]));
     }
 }
 
