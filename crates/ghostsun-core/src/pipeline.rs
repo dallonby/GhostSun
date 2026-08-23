@@ -626,9 +626,15 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
         let est = crate::momfbd::estimate_frame_blur(&disk, 12);
         vlog!(
             opts,
-            "seeing: {} frame(s) measured, per-frame blur spread {:.3} px^2",
+            "seeing: {} frame(s) measured, per-frame blur spread {:.3} px^2, acf {}",
             est.n_measured,
-            est.spread
+            est.spread,
+            est.acf
+                .iter()
+                .enumerate()
+                .map(|(i, v)| format!("{}:{:.2}", i + 1, v))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         est.dsigma2
     };

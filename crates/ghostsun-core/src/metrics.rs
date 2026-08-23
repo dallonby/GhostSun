@@ -676,3 +676,223 @@ fn ssim_masked(a: &Image, b: &Image, mask: &[bool]) -> f64 {
     }
     total / cnt.max(1.0)
 }
+
+// ---------------------------------------------------------------------------
+// Scale-resolved comparison of two reconstructions of the SAME scan.
+//
+// For a stage that changes the spatial PSF this comparison would be
+// meaningless — CLAUDE.md records three separate occasions where a metric
+// improved because the measurement got easier rather than the instrument
+// getting better. It is legitimate here only because the F17 subspace filter
+// acts along the DISPERSION axis: the spatial PSF is identical in both
+// images, so a difference in pixel-scale variance is a real difference in
+// noise rather than a change of resolution.
+//
+// The load-bearing number is not the variance drop, which any smoother can
+// produce. It is STRUCT_CORR: the correlation between where the two images
+// differ and where the image has structure. Noise removal is spread evenly
+// over the disc and scores near zero. Structure removal concentrates on
+// filaments, plage and network and scores high. A filter that quietly eats
+// signal cannot hide from this even though it flatters every variance metric.
+// ---------------------------------------------------------------------------
+
+pub struct BandStat {
+    pub lo: f64,
+    pub hi: f64,
+    /// rms of the band, as a percentage of the mean disc level
+    pub rms_a: f64,
+    pub rms_b: f64,
+    /// rms of what changed between them, same units
+    pub rms_diff: f64,
+    /// correlation of |difference| with the image's own structure envelope
+    pub struct_corr: f64,
+}
+
+pub struct ScaleReport {
+    pub bands: Vec<BandStat>,
+    pub mean_level: f64,
+    pub n_pixels: usize,
+}
+
+fn band_of(img: &Image, lo: f64, hi: f64) -> Image {
+    let a = if lo <= 0.0 {
+        img.clone()
+    } else {
+        crate::mathutil::gaussian_blur_2d(img, lo, lo)
+    };
+    let b = crate::mathutil::gaussian_blur_2d(img, hi, hi);
+    let mut o = Image::new(img.w, img.h);
+    for i in 0..img.data.len() {
+        o.data[i] = a.data[i] - b.data[i];
+    }
+    o
+}
+
+/// Compare two reconstructions of one scan, band by band.
+pub fn compare_scales(a: &Image, b: &Image) -> Option<ScaleReport> {
+    // Two runs of the same scan produce slightly different canvases and disc
+    // centres. Resample B onto A's grid via the fitted discs first, or a
+    // sub-pixel registration error would be charged to whatever stage is
+    // under test.
+    let (da, _) = fit_disk_polar(a, &coarse_disk(a)?)?;
+    let (db, _) = fit_disk_polar(b, &coarse_disk(b)?)?;
+    let scale = db.r / da.r;
+    let mut b2 = Image::new(a.w, a.h);
+    for y in 0..a.h {
+        for x in 0..a.w {
+            let sx = db.xc + (x as f64 - da.xc) * scale;
+            let sy = db.yc + (y as f64 - da.yc) * scale;
+            let (x0, y0) = (sx.floor(), sy.floor());
+            if x0 < 0.0 || y0 < 0.0 || x0 + 1.0 >= b.w as f64 || y0 + 1.0 >= b.h as f64 {
+                continue;
+            }
+            let (ix, iy) = (x0 as usize, y0 as usize);
+            let (fx, fy) = ((sx - x0) as f32, (sy - y0) as f32);
+            let v = b.at(ix, iy) * (1.0 - fx) * (1.0 - fy)
+                + b.at(ix + 1, iy) * fx * (1.0 - fy)
+                + b.at(ix, iy + 1) * (1.0 - fx) * fy
+                + b.at(ix + 1, iy + 1) * fx * fy;
+            b2.set(x, y, v);
+        }
+    }
+    let b = &b2;
+    let disk = da;
+    // Disc interior only, and clear of the limb: the limb is a genuine sharp
+    // edge and would dominate every band it appears in.
+    let mask: Vec<bool> = (0..a.h)
+        .flat_map(|y| {
+            (0..a.w).map(move |x| {
+                let dx = x as f64 - disk.xc;
+                let dy = y as f64 - disk.yc;
+                (dx * dx + dy * dy).sqrt() < 0.90 * disk.r
+            })
+        })
+        .collect();
+    let n_pixels = mask.iter().filter(|m| **m).count();
+    if n_pixels < 1000 {
+        return None;
+    }
+    let mean_level: f64 = mask
+        .iter()
+        .zip(b.data.iter())
+        .filter(|(m, _)| **m)
+        .map(|(_, v)| *v as f64)
+        .sum::<f64>()
+        / n_pixels as f64;
+    if mean_level <= 0.0 {
+        return None;
+    }
+
+    let scales = [(0.0, 1.5), (1.5, 3.0), (3.0, 6.0), (6.0, 12.0), (12.0, 24.0)];
+    let bands = scales
+        .iter()
+        .map(|&(lo, hi)| {
+            let ba = band_of(a, lo, hi);
+            let bb = band_of(b, lo, hi);
+            let rms = |img: &Image| -> f64 {
+                let s: f64 = mask
+                    .iter()
+                    .zip(img.data.iter())
+                    .filter(|(m, _)| **m)
+                    .map(|(_, v)| (*v as f64) * (*v as f64))
+                    .sum();
+                (s / n_pixels as f64).sqrt() / mean_level * 100.0
+            };
+            // What changed, and where.
+            let mut d = Image::new(a.w, a.h);
+            let mut absd = Image::new(a.w, a.h);
+            let mut absb = Image::new(a.w, a.h);
+            for i in 0..a.data.len() {
+                d.data[i] = ba.data[i] - bb.data[i];
+                absd.data[i] = d.data[i].abs();
+                absb.data[i] = bb.data[i].abs();
+            }
+            // Envelopes: how much difference, and how much structure, in each
+            // neighbourhood. Smoothing well past the band turns both into
+            // local amplitudes rather than signed oscillations.
+            let env_d = crate::mathutil::gaussian_blur_2d(&absd, hi * 3.0, hi * 3.0);
+            let env_b = crate::mathutil::gaussian_blur_2d(&absb, hi * 3.0, hi * 3.0);
+            let idx: Vec<usize> = (0..mask.len()).filter(|&i| mask[i]).collect();
+            let md = idx.iter().map(|&i| env_d.data[i] as f64).sum::<f64>() / n_pixels as f64;
+            let mb = idx.iter().map(|&i| env_b.data[i] as f64).sum::<f64>() / n_pixels as f64;
+            let (mut num, mut p, mut q) = (0.0, 0.0, 0.0);
+            for &i in &idx {
+                let u = env_d.data[i] as f64 - md;
+                let v = env_b.data[i] as f64 - mb;
+                num += u * v;
+                p += u * u;
+                q += v * v;
+            }
+            BandStat {
+                lo,
+                hi,
+                rms_a: rms(&ba),
+                rms_b: rms(&bb),
+                rms_diff: rms(&d),
+                struct_corr: num / (p * q).sqrt().max(1e-12),
+            }
+        })
+        .collect();
+    Some(ScaleReport { bands, mean_level, n_pixels })
+}
+
+/// Radially averaged power spectrum over a square patch of the disc interior.
+///
+/// The pixel-difference comparison above is only valid when two images share a
+/// geometry solution. When they do NOT — and two runs of this pipeline
+/// generally do not, since any change to extraction perturbs the limb fit and
+/// therefore the warp — a few tenths of a percent of differential shear moves
+/// pixels by more than the effect under test, and every difference metric
+/// reports the warp. A power spectrum is nearly blind to that: a 0.1% affine
+/// barely redistributes power, while a change in noise moves the
+/// high-frequency plateau directly. Compare here, not there.
+pub fn disc_power_spectrum(img: &Image, side: usize) -> Option<(Vec<f64>, f64)> {
+    let (d, _) = fit_disk_polar(img, &coarse_disk(img)?)?;
+    let n = side.next_power_of_two().min(2048);
+    if (n as f64) > 1.2 * d.r {
+        return None;
+    }
+    let x0 = (d.xc - n as f64 / 2.0).round() as isize;
+    let y0 = (d.yc - n as f64 / 2.0).round() as isize;
+    if x0 < 0 || y0 < 0 || x0 as usize + n > img.w || y0 as usize + n > img.h {
+        return None;
+    }
+    let mut re = vec![0.0f64; n * n];
+    let mut im = vec![0.0f64; n * n];
+    let mut mean = 0.0;
+    for j in 0..n {
+        for i in 0..n {
+            mean += img.at(x0 as usize + i, y0 as usize + j) as f64;
+        }
+    }
+    mean /= (n * n) as f64;
+    for j in 0..n {
+        let wj = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * j as f64 / (n - 1) as f64).cos();
+        for i in 0..n {
+            let wi = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos();
+            re[j * n + i] = (img.at(x0 as usize + i, y0 as usize + j) as f64 - mean) * wi * wj;
+        }
+    }
+    crate::mathutil::fft2_inplace(&mut re, &mut im, n, n, false);
+    let half = n / 2;
+    let mut acc = vec![0.0f64; half];
+    let mut cnt = vec![0.0f64; half];
+    for j in 0..n {
+        let fy = if j < half { j as f64 } else { j as f64 - n as f64 };
+        for i in 0..n {
+            let fx = if i < half { i as f64 } else { i as f64 - n as f64 };
+            let r = (fx * fx + fy * fy).sqrt();
+            let k = r.round() as usize;
+            if k < half {
+                acc[k] += re[j * n + i] * re[j * n + i] + im[j * n + i] * im[j * n + i];
+                cnt[k] += 1.0;
+            }
+        }
+    }
+    let psd: Vec<f64> = acc
+        .iter()
+        .zip(&cnt)
+        .map(|(a, c)| if *c > 0.0 { a / c / mean / mean } else { 0.0 })
+        .collect();
+    Some((psd, n as f64))
+}

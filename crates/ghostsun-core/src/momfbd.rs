@@ -40,6 +40,13 @@ pub struct BlurEstimate {
     pub n_measured: usize,
     /// robust spread of dsigma2, a one-number "how variable was the seeing"
     pub spread: f64,
+    /// Autocorrelation of dsigma2 at lags 1..8 frames. THIS IS THE TEST THAT
+    /// NEEDS NO GROUND TRUTH: atmospheric seeing is coherent over tens of
+    /// milliseconds, so a real measurement decays smoothly over several
+    /// frames, while an estimator that is merely reading photon noise gives
+    /// white output and drops to ~0 at lag 1. On real data this separates
+    /// "measuring seeing" from "measuring nothing" without any truth vector.
+    pub acf: Vec<f64>,
 }
 
 /// Longest power of two not exceeding `n`.
@@ -194,7 +201,12 @@ pub fn estimate_frame_blur(core: &Image, half_window: usize) -> BlurEstimate {
     let mut ok: Vec<f64> = dsig.iter().cloned().filter(|v| v.is_finite()).collect();
     let n_measured = ok.len();
     if n_measured == 0 {
-        return BlurEstimate { dsigma2: vec![0.0; n], n_measured: 0, spread: 0.0 };
+        return BlurEstimate {
+            dsigma2: vec![0.0; n],
+            n_measured: 0,
+            spread: 0.0,
+            acf: Vec::new(),
+        };
     }
     let med = median_inplace(&mut ok);
     let mut ad: Vec<f64> = dsig
@@ -203,8 +215,29 @@ pub fn estimate_frame_blur(core: &Image, half_window: usize) -> BlurEstimate {
         .map(|v| (v - med).abs())
         .collect();
     let spread = 1.4826 * median_inplace(&mut ad);
-    let dsigma2 = dsig.iter().map(|v| if v.is_finite() { v - med } else { 0.0 }).collect();
-    BlurEstimate { dsigma2, n_measured, spread }
+    let dsigma2: Vec<f64> =
+        dsig.iter().map(|v| if v.is_finite() { v - med } else { 0.0 }).collect();
+    let valid: Vec<bool> = dsig.iter().map(|v| v.is_finite()).collect();
+    let var: f64 = dsigma2
+        .iter()
+        .zip(&valid)
+        .filter(|(_, &v)| v)
+        .map(|(d, _)| d * d)
+        .sum::<f64>()
+        / n_measured as f64;
+    let acf: Vec<f64> = (1..=8)
+        .map(|lag| {
+            let (mut acc, mut cnt) = (0.0, 0.0);
+            for i in 0..n.saturating_sub(lag) {
+                if valid[i] && valid[i + lag] {
+                    acc += dsigma2[i] * dsigma2[i + lag];
+                    cnt += 1.0;
+                }
+            }
+            if cnt < 20.0 || var <= 0.0 { f64::NAN } else { acc / cnt / var }
+        })
+        .collect();
+    BlurEstimate { dsigma2, n_measured, spread, acf }
 }
 
 #[cfg(test)]

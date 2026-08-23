@@ -265,6 +265,28 @@ enum Cmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Scale-resolved comparison of two reconstructions of one scan: what
+    /// changed, at which scales, and whether it correlates with structure
+    Noisecmp { a: PathBuf, b: PathBuf },
+    /// Write a registered, IDENTICALLY-scaled pair of crops from two
+    /// reconstructions of the same scan, for blinking A against B
+    Blink {
+        a: PathBuf,
+        b: PathBuf,
+        #[arg(long, default_value = "blink")]
+        out_dir: PathBuf,
+        /// crop size in px at 1:1 (0 = whole disc, downsampled to --max-px)
+        #[arg(long, default_value_t = 0)]
+        size: usize,
+        /// crop centre offset from disc centre, in fractions of the radius
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        dx: f64,
+        #[arg(long, default_value_t = 0.0, allow_negative_numbers = true)]
+        dy: f64,
+        /// longest output edge; larger inputs are box-averaged down
+        #[arg(long, default_value_t = 1100)]
+        max_px: usize,
+    },
     /// How many numbers one spectrum actually needs: DFT vs DCT vs KL
     /// truncation, scored against the scan's own noise floor
     Specrank {
@@ -913,6 +935,127 @@ fn main() {
                     }
                 }
             }
+        }
+        Cmd::Noisecmp { a, b } => {
+            let ia = output::read_fits_f32(&a).unwrap();
+            let ib = output::read_fits_f32(&b).unwrap();
+            match metrics::compare_scales(&ia, &ib) {
+                Some(r) => {
+                    println!(
+                        "disc interior {} px, mean level {:.0}\n",
+                        r.n_pixels, r.mean_level
+                    );
+                    println!("  scale (px)     A rms%   B rms%   |A-B| rms%   struct corr");
+                    for b in &r.bands {
+                        println!(
+                            "  {:>5.1}-{:<5.1}   {:6.3}   {:6.3}      {:6.3}        {:+.3}",
+                            b.lo, b.hi, b.rms_a, b.rms_b, b.rms_diff, b.struct_corr
+                        );
+                    }
+                    println!(
+                        "\nstruct corr near 0 = what changed is spread evenly over the disc; high\nmeans it concentrates where the image has structure. ONLY meaningful when A\nand B share a geometry solution -- see the power spectrum below otherwise."
+                    );
+                }
+                None => eprintln!("noisecmp: disc fit failed"),
+            }
+            match (
+                metrics::disc_power_spectrum(&ia, 1024),
+                metrics::disc_power_spectrum(&ib, 1024),
+            ) {
+                (Some((pa, n)), Some((pb, _))) => {
+                    println!("\nradially averaged power spectrum, {n:.0} px patch at disc centre");
+                    println!("  scale (px)        A            B         A/B");
+                    for &k in &[4usize, 8, 16, 32, 64, 128, 256, 512, 900] {
+                        if k >= pa.len() {
+                            continue;
+                        }
+                        let sc = n / k as f64;
+                        println!(
+                            "  {sc:8.1}     {:.3e}   {:.3e}    {:6.3}",
+                            pa[k],
+                            pb[k],
+                            pa[k] / pb[k].max(1e-30)
+                        );
+                    }
+                    println!(
+                        "\nA/B below 1 at the finest scales = A carries less pixel-scale power.\nThe subspace filter acts along DISPERSION and cannot change the spatial PSF,\nso a drop confined to the noise band is noise removal, not blurring."
+                    );
+                }
+                _ => eprintln!("power spectrum: patch did not fit inside the disc"),
+            }
+        }
+        Cmd::Blink { a, b, out_dir, size, dx, dy, max_px } => {
+            let ia = output::read_fits_f32(&a).unwrap();
+            let ib = output::read_fits_f32(&b).unwrap();
+            // Register on the fitted disc, not on the array: the two runs
+            // produce slightly different canvases and centres, and a blink of
+            // two images that differ by half a pixel of registration shows
+            // registration, not the thing under test.
+            let fit = |im: &ghostsun_core::image2d::Image| {
+                metrics::coarse_disk(im).and_then(|i| metrics::fit_disk_polar(im, &i))
+            };
+            let (da, _) = fit(&ia).expect("disc fit A");
+            let (db, _) = fit(&ib).expect("disc fit B");
+            let r = da.r.min(db.r);
+            let half = if size > 0 { size / 2 } else { (r * 1.06) as usize };
+            let cxa = da.xc + dx * r;
+            let cya = da.yc + dy * r;
+            let cxb = db.xc + dx * r;
+            let cyb = db.yc + dy * r;
+            let n = 2 * half;
+            let step = ((n + max_px - 1) / max_px).max(1);
+            let out_n = n / step;
+            // ONE scaling for both images, from their combined pixels, so a
+            // blink shows structure rather than a brightness step.
+            let mut all: Vec<f32> = Vec::with_capacity(2 * out_n * out_n);
+            let sample = |im: &ghostsun_core::image2d::Image, cx: f64, cy: f64, i: usize, j: usize| -> f32 {
+                let mut acc = 0.0f32;
+                let mut cnt = 0.0f32;
+                for sy in 0..step {
+                    for sx in 0..step {
+                        let x = cx - half as f64 + (i * step + sx) as f64;
+                        let y = cy - half as f64 + (j * step + sy) as f64;
+                        if x >= 0.0 && y >= 0.0 && (x as usize) < im.w && (y as usize) < im.h {
+                            acc += im.at(x as usize, y as usize);
+                            cnt += 1.0;
+                        }
+                    }
+                }
+                if cnt > 0.0 { acc / cnt } else { 0.0 }
+            };
+            let mut pa = vec![0.0f32; out_n * out_n];
+            let mut pb = vec![0.0f32; out_n * out_n];
+            for j in 0..out_n {
+                for i in 0..out_n {
+                    pa[j * out_n + i] = sample(&ia, cxa, cya, i, j);
+                    pb[j * out_n + i] = sample(&ib, cxb, cyb, i, j);
+                }
+            }
+            all.extend_from_slice(&pa);
+            all.extend_from_slice(&pb);
+            all.sort_by(|x, y| x.total_cmp(y));
+            let lo = all[all.len() / 200];
+            let hi = all[all.len() - 1 - all.len() / 200];
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let to_rgb = |p: &[f32]| -> Vec<u8> {
+                let mut v = Vec::with_capacity(p.len() * 3);
+                for &x in p {
+                    let t = (((x - lo) / (hi - lo).max(1e-9)).clamp(0.0, 1.0)).powf(0.75);
+                    let g = (t * 255.0) as u8;
+                    v.extend_from_slice(&[g, g, g]);
+                }
+                v
+            };
+            let pa_path = out_dir.join("blink_a.png");
+            let pb_path = out_dir.join("blink_b.png");
+            output::write_png_rgb(&pa_path, out_n, out_n, &to_rgb(&pa)).unwrap();
+            output::write_png_rgb(&pb_path, out_n, out_n, &to_rgb(&pb)).unwrap();
+            println!(
+                "{}x{} px at 1:{} from {:.0} px crops, shared scale [{lo:.1}, {hi:.1}]",
+                out_n, out_n, step, n as f64
+            );
+            println!("  A {} <- {}", pa_path.display(), a.display());
+            println!("  B {} <- {}", pb_path.display(), b.display());
         }
         Cmd::Specrank { ser, w } => {
             let (reader, transpose, mean_img, geom) = match pipeline::scan_setup(&ser) {
