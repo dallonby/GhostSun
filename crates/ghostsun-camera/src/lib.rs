@@ -220,6 +220,15 @@ pub trait Camera: Send {
     fn next_preview_frame(&mut self, timeout_ms: u32) -> Result<Frame> {
         self.next_frame(timeout_ms)
     }
+    /// Release the device and acquire a fresh handle, preserving settings the
+    /// caller re-applies afterwards (exposure, gain, ROI, bit depth).
+    ///
+    /// For backends where changing geometry on a live handle is unsafe, this
+    /// is how a ROI change is made. Default: nothing, so backends that
+    /// tolerate a stop/set/start keep it.
+    fn reopen(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Re-establish latency-first preview after a lossless recording session.
     /// Most SDKs need no explicit transition; backends with distinct buffering
     /// modes can restart or clear their stream here.

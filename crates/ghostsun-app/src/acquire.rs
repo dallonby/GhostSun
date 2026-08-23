@@ -922,7 +922,7 @@ impl AcquireState {
         // capture band at the real cropped frame rate, so framing, focus and
         // achieved fps can all be checked before committing to a scan.
         ui.horizontal_wrapped(|ui| {
-            let busy = self.run.is_some() || focus.recording;
+            let busy = self.run.is_some() || focus.recording || focus.live_roi_pending;
             if focus.live_roi_active {
                 if ui
                     .add_enabled(!busy, egui::Button::new("Release ROI (full sensor)"))

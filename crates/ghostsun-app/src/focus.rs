@@ -384,6 +384,10 @@ pub struct FocusState {
     /// the live preview IS the capture band at the cropped frame rate.
     pub live_roi_active: bool,
     pub live_roi_status: String,
+    /// A geometry change is in flight. Each one replaces the device handle,
+    /// so a second request before the first lands is both pointless and, on
+    /// these cameras, actively harmful.
+    pub live_roi_pending: bool,
     pub dispersion: DispAxis,
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
@@ -462,6 +466,7 @@ impl Default for FocusState {
             recording_status: "not recording".into(),
             live_roi_active: false,
             live_roi_status: "full sensor".into(),
+            live_roi_pending: false,
             dispersion: DispAxis::Vertical,
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
@@ -594,6 +599,7 @@ impl FocusState {
         // The worker owns the camera handle; when it exits the device is
         // released and reopens full-frame, so a live ROI cannot survive.
         self.live_roi_active = false;
+        self.live_roi_pending = false;
         self.live_roi_status = "full sensor".into();
         if let Some(s) = &self.stop {
             s.store(true, Ordering::SeqCst);
@@ -656,6 +662,7 @@ impl FocusState {
                     }
                     Ok(FocusMsg::LiveRoi { active, y0, h }) => {
                         self.live_roi_active = active;
+                        self.live_roi_pending = false;
                         self.live_roi_status = if active {
                             format!("hardware ROI live · rows {y0}–{} ({h} px)", y0 + h)
                         } else {
@@ -944,6 +951,9 @@ impl FocusState {
         if self.recording {
             return Err("stop the recording before changing the sensor ROI".into());
         }
+        if self.live_roi_pending {
+            return Err("the previous ROI change is still in progress".into());
+        }
         if enable && !anchor_y.is_finite() {
             return Err("select a valid spectral-line anchor".into());
         }
@@ -959,6 +969,7 @@ impl FocusState {
             enable,
         })
         .map_err(|_| "camera worker is not running".to_owned())?;
+        self.live_roi_pending = true;
         self.live_roi_status = if enable {
             "applying hardware ROI…".into()
         } else {
@@ -2777,17 +2788,25 @@ fn worker(
     // Consecutive 1 s frame timeouts, so a stalled stream is reported rather
     // than spun on in silence.
     let mut stalled: u32 = 0;
+    // A geometry change replaces the device handle, and a fresh handle has
+    // none of these — track the live values so they can be re-applied.
+    let mut cur_exp = exposure_us;
+    let mut cur_gain = gain;
+    let mut cur_auto = auto_exposure;
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 FocusCmd::Exposure(e) => {
+                    cur_exp = e;
                     cam.set_exposure_us(e).ok();
                 }
                 FocusCmd::Gain(g) => {
+                    cur_gain = g;
                     cam.set_gain(g).ok();
                 }
                 FocusCmd::AutoExposure(on) => {
+                    cur_auto = on;
                     cam.set_auto_exposure(on).ok();
                 }
                 FocusCmd::Dispersion(h) => disp_h = h,
@@ -2815,7 +2834,7 @@ fn worker(
                             w: info.max_width,
                             h: (height & !1).max(2),
                         };
-                        match ensure_roi(&mut *cam, &info, &mut current_roi, band) {
+                        match ensure_roi(&mut *cam, &info, &mut current_roi, band, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto }) {
                             Ok(()) => {
                                 live_roi = Some(band);
                                 let _ = tx.send(FocusMsg::LiveRoi {
@@ -2827,7 +2846,7 @@ fn worker(
                             Err(roi_error) => {
                                 // A refused ROI must not leave the camera
                                 // stopped — apply_roi stops before it sets.
-                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                                if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info), CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto }) {
                                     let _ = tx.send(FocusMsg::Error(format!(
                                         "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
                                     )));
@@ -2847,7 +2866,7 @@ fn worker(
                         }
                     } else {
                         let full = full_frame_roi(&info);
-                        if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, full) {
+                        if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, full, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto }) {
                             let _ = tx.send(FocusMsg::Error(format!(
                                 "the full sensor could not be restored: {error}"
                             )));
@@ -2872,7 +2891,7 @@ fn worker(
                         finish_ser(active, &tx);
                         if had_hw {
                             let rest = resting_roi(&info, live_roi);
-                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto })
                             {
                                 let _ = tx.send(FocusMsg::Error(format!(
                                     "the sensor could not be restored: {error}"
@@ -2901,12 +2920,12 @@ fn worker(
                         // Usually a no-op: if the user already applied this
                         // band live, the sensor is reading it and the stream
                         // must NOT be cycled just to say so again.
-                        match ensure_roi(&mut *cam, &info, &mut current_roi, band) {
+                        match ensure_roi(&mut *cam, &info, &mut current_roi, band, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto }) {
                             Ok(()) => hw_roi_y0 = Some(band.y),
                             Err(roi_error) => {
                                 let rest = resting_roi(&info, live_roi);
                                 if let Err(error) =
-                                    ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                                    ensure_roi(&mut *cam, &info, &mut current_roi, rest, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto })
                                 {
                                     let _ = tx.send(FocusMsg::Error(format!(
                                         "hardware ROI failed ({roi_error}) and the camera did not recover: {error}"
@@ -2933,7 +2952,7 @@ fn worker(
                         // the sensor is the user's live band if they set one.
                         if had_hw {
                             let rest = resting_roi(&info, live_roi);
-                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto })
                             {
                                 let _ = tx.send(finished);
                                 let _ = tx.send(FocusMsg::Error(format!(
@@ -2955,7 +2974,7 @@ fn worker(
                         // applied it must still be unwound.
                         if request.hw_roi_y0.is_some() {
                             let rest = resting_roi(&info, live_roi);
-                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest)
+                            if let Err(error) = ensure_roi(&mut *cam, &info, &mut current_roi, rest, CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto })
                             {
                                 let _ = tx.send(FocusMsg::Error(format!(
                                     "the sensor could not be restored: {error}"
@@ -3060,7 +3079,7 @@ fn worker(
                         .unwrap_or(false);
                     let _ = tx.send(FocusMsg::RecordingError(error));
                     if had_hw {
-                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info)) {
+                        if let Err(error) = apply_roi(&mut *cam, full_frame_roi(&info), CamSettings { exposure_us: cur_exp, gain: cur_gain, auto_exposure: cur_auto }) {
                             let _ = tx.send(FocusMsg::Error(format!(
                                 "the full sensor could not be restored: {error}"
                             )));
@@ -3241,16 +3260,48 @@ fn resting_roi(info: &CameraInfo, live: Option<Roi>) -> Roi {
 /// Stop → apply ROI → restart. Every backend applies ROI at stream start, so
 /// the cycle is mandatory. A failure leaves the camera stopped; callers must
 /// treat it as fatal for the session unless a full-frame restore succeeds.
-fn apply_roi(cam: &mut dyn ghostsun_camera::Camera, roi: Roi) -> Result<(), String> {
+/// Camera settings a fresh handle does not remember.
+#[derive(Clone, Copy)]
+struct CamSettings {
+    exposure_us: u32,
+    gain: u16,
+    auto_exposure: bool,
+}
+
+/// Change the sensor geometry by acquiring a NEW device handle.
+///
+/// The obvious implementation — stop, set the ROI, start again on the open
+/// handle — is the one thing these cameras will not survive: `toupcam::open`
+/// already warns that restarting the pull stream wedges them, and on real
+/// hardware a single ROI apply killed frame delivery outright and left the
+/// device dead across a close/open, needing a replug. So the stream is never
+/// restarted; the handle is replaced, and every setting is re-applied to it.
+fn apply_roi(
+    cam: &mut dyn ghostsun_camera::Camera,
+    roi: Roi,
+    settings: CamSettings,
+) -> Result<(), String> {
     let t0 = Instant::now();
     crate::applog!(
-        "roi: stop -> set {}x{}+{}+{} -> start",
+        "roi: reopen -> set {}x{}+{}+{} -> start (exposure {} us, gain {}, auto {})",
         roi.w,
         roi.h,
         roi.x,
-        roi.y
+        roi.y,
+        settings.exposure_us,
+        settings.gain,
+        settings.auto_exposure
     );
     cam.stop();
+    if let Err(error) = cam.reopen() {
+        crate::applog!("roi: reopen FAILED: {error}");
+        return Err(error.to_string());
+    }
+    // Order matters: the ROI is installed last, immediately before the stream
+    // starts, so nothing that reconfigures the readout can discard it.
+    cam.set_exposure_us(settings.exposure_us).ok();
+    cam.set_gain(settings.gain).ok();
+    cam.set_auto_exposure(settings.auto_exposure).ok();
     if let Err(error) = cam.set_roi(roi) {
         crate::applog!("roi: set_roi FAILED: {error}");
         return Err(error.to_string());
@@ -3286,6 +3337,7 @@ fn ensure_roi(
     info: &CameraInfo,
     current: &mut Roi,
     target: Roi,
+    settings: CamSettings,
 ) -> Result<(), String> {
     let steps = roi_transition(*current, target, full_frame_roi(info));
     crate::applog!(
@@ -3301,7 +3353,7 @@ fn ensure_roi(
         steps.len()
     );
     for step in steps {
-        apply_roi(cam, step)?;
+        apply_roi(cam, step, settings)?;
         *current = step;
     }
     Ok(())

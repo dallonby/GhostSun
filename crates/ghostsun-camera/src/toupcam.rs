@@ -340,9 +340,8 @@ pub fn enumerate() -> Vec<CameraInfo> {
     out
 }
 
-pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
-    let api = Api::load()?;
-    let index: c_uint = info.id.parse().map_err(|_| CameraError::NotFound)?;
+/// Open a handle and apply the options that hold for a whole USB session.
+fn open_handle(api: &Api, index: c_uint) -> crate::Result<HToupcam> {
     let h = unsafe { (api.open_by_index)(index) };
     if h.is_null() {
         return Err(CameraError::Sdk("Toupcam_OpenByIndex returned null".into()));
@@ -368,6 +367,13 @@ pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
             put_real_time(h, 1);
         }
     }
+    Ok(h)
+}
+
+pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
+    let api = Api::load()?;
+    let index: c_uint = info.id.parse().map_err(|_| CameraError::NotFound)?;
+    let h = open_handle(&api, index)?;
     // Replace the enumerate-time gain guess with the device's real range
     // (e.g. IMX678-class models allow far more than 1000%).
     let mut info = info.clone();
@@ -719,6 +725,44 @@ impl Camera for ToupcamCam {
         let host_time = self.wait_for_image(timeout_ms)?;
         let (w, h, t) = self.pull_into_buffer()?;
         Ok(self.frame_from_buffer(w, h, host_time, &t))
+    }
+
+    /// Close the device and acquire a fresh handle.
+    ///
+    /// Changing the ROI needs the stream stopped, and stopping/restarting the
+    /// pull stream on a live handle is exactly what wedges these cameras —
+    /// the same failure `open` already warns about for alternating scans.
+    /// Observed: one ROI apply killed frame delivery outright, and the device
+    /// stayed dead across a full close/open, needing a physical replug. So a
+    /// geometry change goes through a genuinely new handle instead.
+    fn reopen(&mut self) -> crate::Result<()> {
+        let index: c_uint = self.info.id.parse().map_err(|_| CameraError::NotFound)?;
+        self.stop();
+        if !self.h.is_null() {
+            unsafe { (self.api.close)(self.h) };
+            self.h = std::ptr::null_mut();
+        }
+        // Free the callback context only after Close, so no in-flight callback
+        // can reference it.
+        if !self.signal.is_null() {
+            unsafe { drop(Box::from_raw(self.signal)) };
+            self.signal = std::ptr::null_mut();
+        }
+        // Let the driver release the endpoint before it is claimed again.
+        std::thread::sleep(Duration::from_millis(250));
+        let h = open_handle(&self.api, index)?;
+        // A fresh channel as well: notifications from the old handle refer to
+        // a geometry that no longer exists.
+        let (tx, rx) = channel();
+        self.signal = Box::into_raw(Box::new(Signal { tx }));
+        self.rx = rx;
+        self.h = h;
+        self.width = 0;
+        self.height = 0;
+        self.pending_roi = None;
+        self.started = false;
+        self.buf.clear();
+        Ok(())
     }
 
     fn resume_preview(&mut self) -> crate::Result<()> {
