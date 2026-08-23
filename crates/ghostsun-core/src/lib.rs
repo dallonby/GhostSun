@@ -15,6 +15,7 @@ pub mod linefit;
 pub mod lines;
 pub mod mathutil;
 pub mod metrics;
+pub mod momfbd;
 pub mod output;
 pub mod orientation;
 pub mod pipeline;

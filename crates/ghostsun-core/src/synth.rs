@@ -43,6 +43,12 @@ pub struct SynthParams {
     pub flexure_px: f64,
     /// seeing blur sigma in sun px; 0 = off (also enables slit boxcar)
     pub psf_seeing_px: f64,
+    /// Frame-to-frame variation of the seeing PSF, as a fraction of
+    /// `psf_seeing_px`, following an AR(1) process. Real seeing is not a
+    /// constant blur: it fluctuates on a timescale of tens of milliseconds,
+    /// which is precisely the redundancy multi-frame deconvolution and lucky
+    /// weighting exploit. With this at 0 neither has anything to work with.
+    pub psf_var: f64,
     /// number of sequential scans to emit (multi-scan stacking tests)
     pub n_scans: usize,
     /// signal level multiplier (low-SNR tests)
@@ -92,6 +98,7 @@ impl Default for SynthParams {
             dispersion_kms_per_px: 5.0,
             flexure_px: 0.0,
             psf_seeing_px: 0.0,
+            psf_var: 0.0,
             n_scans: 1,
             dither_px: 0.0,
             exposure: 1.0,
@@ -336,15 +343,28 @@ impl SunModel {
 
 /// Sampling stencil (offsets + weights) modeling seeing (2-D Gaussian) and
 /// the slit boxcar along the scan direction. Identity when both are zero.
-fn psf_stencil(seeing_sigma: f64, slit_px: f64) -> Vec<(f64, f64, f64)> {
+/// PSF quadrature points.
+///
+/// `fine` selects a properly sampled Gaussian (7x7 at 0.5 sigma) instead of
+/// the historic 3x3 at +-1 sigma. The coarse one is NOT a low-pass filter: three
+/// taps at -sigma, 0, +sigma with weights 0.274/0.452/0.274 have transfer
+/// function 0.452 + 0.548 cos(2 pi f sigma), which crosses ZERO near f sigma =
+/// 0.42 and returns to FULL transmission at f = 1/sigma. It attenuates the
+/// right amount in the second moment, which is all the geometric stages ever
+/// asked of it, but any estimator that reads the shape of the transfer
+/// function sees a comb rather than a blur. Keep the coarse default so every
+/// existing benchmark number stays bit-identical, and take the fine one
+/// wherever the PSF's spectrum is the thing under test.
+fn psf_stencil_opt(seeing_sigma: f64, slit_px: f64, fine: bool) -> Vec<(f64, f64, f64)> {
     let mut pts: Vec<(f64, f64, f64)> = Vec::new();
     let seeing: Vec<(f64, f64, f64)> = if seeing_sigma > 0.0 {
         let mut s = Vec::new();
-        let step = seeing_sigma; // 3x3 quadrature at +-1 sigma spacing
-        for j in -1i32..=1 {
-            for i in -1i32..=1 {
-                let w = (-0.5 * ((i * i + j * j) as f64)).exp();
-                s.push((i as f64 * step, j as f64 * step, w));
+        let (r, step) = if fine { (3i32, 0.5) } else { (1i32, 1.0) };
+        let step = seeing_sigma * step;
+        for j in -r..=r {
+            for i in -r..=r {
+                let d2 = (i * i + j * j) as f64 * if fine { 0.25 } else { 1.0 };
+                s.push((i as f64 * step, j as f64 * step, (-0.5 * d2).exp()));
             }
         }
         s
@@ -368,6 +388,10 @@ fn psf_stencil(seeing_sigma: f64, slit_px: f64) -> Vec<(f64, f64, f64)> {
     pts
 }
 
+fn psf_stencil(seeing_sigma: f64, slit_px: f64) -> Vec<(f64, f64, f64)> {
+    psf_stencil_opt(seeing_sigma, slit_px, false)
+}
+
 // ---------------------------------------------------------------------------
 // Scan simulation
 // ---------------------------------------------------------------------------
@@ -383,12 +407,15 @@ pub struct SynthTruth {
     /// frames degraded by a seeing burst
     pub burst_mask: Vec<bool>,
     pub psf_seeing_px: f64,
+    /// per-frame seeing sigma actually applied — the truth any PSF
+    /// estimator has to be scored against
+    pub psf_per_frame: Vec<f64>,
     pub n_scans: usize,
 }
 
 pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> std::io::Result<SynthTruth> {
     let p = params;
-    let stencil = psf_stencil(
+    let stencil_const = psf_stencil(
         p.psf_seeing_px,
         if p.psf_seeing_px > 0.0 { p.scan_step } else { 0.0 },
     );
@@ -486,6 +513,26 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
             jx = 0.90 * jx + p.jitter_x_sigma * (1.0f64 - 0.90f64 * 0.90).sqrt() * n01.sample(&mut rng);
             jitter_x[t] = if p.clean { 0.0 } else { jx };
         }
+        // Continuous per-frame seeing. AR(1) in log sigma so the blur stays
+        // positive and its excursions are multiplicative, which is how
+        // atmospheric seeing actually behaves; correlation 0.85 gives a few
+        // frames of memory at typical cadences.
+        let mut psf_per_frame = vec![p.psf_seeing_px; p.n_frames];
+        if p.psf_var > 0.0 && p.psf_seeing_px > 0.0 && !p.clean {
+            // Seeing must decorrelate FASTER than the object drifts past the
+            // slit or no reference frame can separate the two. GS_PSF_RHO
+            // exists to vary that ratio deliberately when testing estimators.
+            let rho: f64 = std::env::var("GS_PSF_RHO")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.85);
+            let mut ls = 0.0f64;
+            for v in psf_per_frame.iter_mut() {
+                ls = rho * ls + p.psf_var * (1.0 - rho * rho).sqrt() * n01.sample(&mut rng);
+                *v = p.psf_seeing_px * ls.exp();
+            }
+        }
+
         // seeing bursts: runs of 2-8 frames with strong blur + displacement
         let mut burst_mask = vec![false; p.n_frames];
         let mut burst_blur = vec![0.0f64; p.n_frames];
@@ -557,6 +604,11 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
         let mut frame_ticks: Vec<i64> = Vec::with_capacity(schedule.len());
         for &(t, scan_pos, stamp_pos) in &schedule {
             let mut frame = vec![0u16; p.spec_w * p.slit_h];
+            let stencil = if p.psf_var > 0.0 && p.psf_seeing_px > 0.0 && !p.clean {
+                psf_stencil_opt(psf_per_frame[t], p.scan_step, true)
+            } else {
+                stencil_const.clone()
+            };
             // Truth vectors are indexed by slot; the sun's position by time.
             let x_scan = (scan_pos - t_center) * p.scan_step + jitter_x[t];
             frame_ticks.push(crate::ser::synth_frame_ticks_at(stamp_pos));
@@ -660,6 +712,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
                 jitter_x: jitter_x.clone(),
                 burst_mask: burst_mask.clone(),
                 psf_seeing_px: p.psf_seeing_px,
+                psf_per_frame: psf_per_frame.clone(),
                 n_scans: p.n_scans.max(1),
             });
         }
@@ -673,7 +726,7 @@ pub fn generate(params: &SynthParams, out_ser: &Path, out_truth_png: &Path) -> s
     crate::output::write_png16(out_truth_png, &gt, Some((0.0, gt.max())))?;
     let dir = out_truth_png.parent().unwrap_or(Path::new("."));
     if p.psf_seeing_px > 0.0 {
-        let gtb = model.render_ground_truth(gt_size, &stencil);
+        let gtb = model.render_ground_truth(gt_size, &stencil_const);
         crate::output::write_png16(&dir.join("ground_truth_blurred.png"), &gtb, Some((0.0, gtb.max())))?;
     }
     if p.doppler {

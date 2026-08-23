@@ -48,6 +48,12 @@ struct SynthArgs {
     /// seeing PSF sigma in px (0 = off; also enables slit boxcar)
     #[arg(long, default_value_t = 0.0)]
     psf: f64,
+
+    /// frame-to-frame seeing variation, as a fraction of --psf (AR(1) in log
+    /// sigma). This is the redundancy multi-frame deconvolution and lucky
+    /// weighting live on; at 0 there is nothing for either to exploit.
+    #[arg(long, default_value_t = 0.0)]
+    psf_var: f64,
     /// number of sequential scans (multi-scan stacking tests)
     #[arg(long, default_value_t = 1)]
     scans: usize,
@@ -96,6 +102,7 @@ impl SynthArgs {
             doppler_ns: self.doppler_ns,
             flexure_px: self.flexure,
             psf_seeing_px: self.psf,
+            psf_var: self.psf_var,
             n_scans: self.scans,
             dither_px: self.dither,
             exposure: self.exposure,
@@ -1518,6 +1525,72 @@ fn diagnostics(rep: &pipeline::ReconReport, truth: &synth::SynthTruth, dir: &Pat
         dt += b * b;
     }
     println!("  [diag] transparency corr: {:.3}", num / (de * dt).sqrt().max(1e-12));
+
+    // F18: per-frame seeing. Truth is the sigma actually applied to each
+    // frame; the estimator only claims RELATIVE sigma^2, so score it as a
+    // correlation against truth sigma^2 rather than an RMS in px.
+    let nb = rep.frame_blur.len().min(truth.psf_per_frame.len());
+    if nb > 50 {
+        let tv: Vec<f64> = (0..nb).map(|i| truth.psf_per_frame[i].powi(2)).collect();
+        let spread = {
+            let m = tv.iter().sum::<f64>() / nb as f64;
+            (tv.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / nb as f64).sqrt()
+        };
+        if spread > 1e-6 {
+            let ev = &rep.frame_blur[..nb];
+            let me = ev.iter().sum::<f64>() / nb as f64;
+            let mt = tv.iter().sum::<f64>() / nb as f64;
+            let (mut n2, mut d1, mut d2) = (0.0, 0.0, 0.0);
+            for i in 0..nb {
+                n2 += (ev[i] - me) * (tv[i] - mt);
+                d1 += (ev[i] - me).powi(2);
+                d2 += (tv[i] - mt).powi(2);
+            }
+            // Negative control: the NAIVE sharpness proxy — raw high-frequency
+            // energy per column, the very thing the F15 stacking bug used. If
+            // the control correlates and the estimator does not, the estimator
+            // is broken; if NEITHER correlates, the blur never reached the
+            // extracted disc and the synth, not the estimator, is at fault.
+            let rd = &rep.raw_disk;
+            let ctrl: Vec<f64> = (0..nb.min(rd.w))
+                .map(|t| {
+                    let col: Vec<f64> = (0..rd.h).map(|y| rd.at(t, y) as f64).collect();
+                    let pk = col.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
+                    let (mut e, mut c) = (0.0, 0.0);
+                    for y in 2..rd.h - 2 {
+                        if col[y] > 0.5 * pk {
+                            let l = col[y - 1] - 2.0 * col[y] + col[y + 1];
+                            e += l * l;
+                            c += 1.0;
+                        }
+                    }
+                    if c > 10.0 { (e / c).sqrt() / pk } else { f64::NAN }
+                })
+                .collect();
+            let corr = |a: &[f64], b: &[f64]| -> f64 {
+                let idx: Vec<usize> =
+                    (0..a.len().min(b.len())).filter(|&i| a[i].is_finite() && b[i].is_finite()).collect();
+                if idx.len() < 20 {
+                    return f64::NAN;
+                }
+                let ma = idx.iter().map(|&i| a[i]).sum::<f64>() / idx.len() as f64;
+                let mb = idx.iter().map(|&i| b[i]).sum::<f64>() / idx.len() as f64;
+                let (mut n, mut p, mut q) = (0.0, 0.0, 0.0);
+                for &i in &idx {
+                    n += (a[i] - ma) * (b[i] - mb);
+                    p += (a[i] - ma).powi(2);
+                    q += (b[i] - mb).powi(2);
+                }
+                n / (p * q).sqrt().max(1e-12)
+            };
+            println!(
+                "  [diag] seeing corr: {:.3} (naive HF control {:.3}; true sigma^2 spread {:.3} px^2)",
+                n2 / (d1 * d2).sqrt().max(1e-12),
+                corr(&ctrl, &tv),
+                spread
+            );
+        }
+    }
 
     // dump for offline inspection
     let mut out = String::from("col,gain_est,transp_true,jit_applied,jit_true\n");

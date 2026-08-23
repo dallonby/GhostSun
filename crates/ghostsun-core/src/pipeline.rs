@@ -233,6 +233,9 @@ pub struct ReconReport {
     pub jitter_applied: Vec<f64>,
     /// F9.2: per-column scan-direction offset removed (frames)
     pub xreg_applied: Vec<f64>,
+    /// F18: per-frame along-slit blur relative to the scan median (px^2).
+    /// Positive = that frame was seeing-blurred worse than typical.
+    pub frame_blur: Vec<f64>,
     /// F11: burst-flagged columns
     pub burst_flags: Vec<bool>,
     /// F14: extra wavelength products, `(offset px from core, image)`, on the
@@ -616,6 +619,19 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
     }
     let raw_disk = disk.clone();
     vlog!(opts, "raw disk: {}x{}", disk.w, disk.h);
+    // F18: measure the per-frame seeing before any correction stage touches
+    // the disk — jitter registration and NLM both alter the along-slit
+    // spectrum this reads, so measuring afterwards would measure the pipeline.
+    let frame_blur = {
+        let est = crate::momfbd::estimate_frame_blur(&disk, 12);
+        vlog!(
+            opts,
+            "seeing: {} frame(s) measured, per-frame blur spread {:.3} px^2",
+            est.n_measured,
+            est.spread
+        );
+        est.dsigma2
+    };
     stage!("extraction");
 
     // ---- photometric & registration corrections ----
@@ -1284,6 +1300,7 @@ pub fn reconstruct(ser_path: &Path, opts: &ReconOptions) -> Result<ReconReport, 
 
     vlog!(opts, "[t] TOTAL: {:.2}s", t_start.elapsed().as_secs_f64());
     Ok(ReconReport {
+        frame_blur,
         output,
         demix_before,
         raw_disk,
