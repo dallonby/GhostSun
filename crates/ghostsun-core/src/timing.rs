@@ -64,6 +64,13 @@ pub struct ScanTiming {
     /// Width of the uniform time grid covering the scan. Equals the frame
     /// count when nothing was dropped.
     pub grid_w: usize,
+    /// Camera frame period (s) when the intervals prove one exists, i.e. when
+    /// they are quantised onto integer multiples of something SHORTER than the
+    /// typical interval. `None` for a genuinely free-running camera.
+    pub base_period: Option<f64>,
+    /// Fraction of the frames the camera produced that reached the file, when
+    /// `base_period` is known. Below 1.0 means SILENT frame loss.
+    pub capture_fraction: Option<f64>,
     /// UTC (.NET ticks) of the first and last frame.
     pub first_utc_ticks: i64,
     pub last_utc_ticks: i64,
@@ -191,6 +198,39 @@ impl ScanTiming {
         // Grid columns with no frame in them: dropped frames, plus the slack
         // that gaps open up. Counted from the grid, not per-interval, because
         // a single 60 ms stall is many missing columns.
+        // UNIFORM frame loss is invisible to everything above. If the app keeps
+        // only every Nth frame, every surviving interval is N periods long, the
+        // median becomes the "typical cadence", and the grid looks flawless --
+        // a real session reported ZERO gaps while 90% of frames were being lost
+        // to a slow disk. What gives it away is QUANTISATION: the intervals sit
+        // on integer multiples of a base period much shorter than the typical
+        // one, with a few short intervals surviving where the app briefly kept
+        // up. A free-running camera gives a continuous spread instead and must
+        // not be flagged.
+        let (base_period, capture_fraction) = {
+            let mut short = diffs.clone();
+            short.sort_by(|a, b| a.total_cmp(b));
+            // 2nd percentile, so one spurious timestamp cannot define the base.
+            let cand = short[(short.len() / 50).min(short.len() - 1)];
+            if cand > 0.0 && interval / cand >= 1.8 {
+                let mut resid: Vec<f64> = diffs
+                    .iter()
+                    .map(|d| {
+                        let r = d / cand;
+                        (r - r.round()).abs() * cand
+                    })
+                    .collect();
+                if median_inplace(&mut resid) < 0.15 * cand {
+                    let produced = (span / cand).round().max(1.0);
+                    (Some(cand), Some(n as f64 / produced))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
         let dropped = grid_w.saturating_sub(n);
         Some(ScanTiming {
             seconds,
@@ -203,6 +243,8 @@ impl ScanTiming {
             drift_max,
             dropped,
             grid_w,
+            base_period,
+            capture_fraction,
             first_utc_ticks: ticks[0],
             last_utc_ticks: ticks[n - 1],
         })
@@ -280,7 +322,7 @@ impl ScanTiming {
     /// One-line summary for the reconstruction log.
     pub fn summary(&self) -> String {
         format!(
-            "{:.2} fps ({:.1} s, {} frames), cadence jitter {:.1}% rms, drift {:.2} col rms / {:.2} max, {} empty column(s) -> grid {}",
+            "{:.2} fps ({:.1} s, {} frames), cadence jitter {:.1}% rms, drift {:.2} col rms / {:.2} max, {} empty column(s) -> grid {}{}",
             self.fps(),
             self.duration(),
             self.position.len(),
@@ -288,7 +330,16 @@ impl ScanTiming {
             self.drift_rms,
             self.drift_max,
             self.dropped,
-            self.grid_w
+            self.grid_w,
+            match (self.base_period, self.capture_fraction) {
+                (Some(b), Some(f)) if f < 0.95 => format!(
+                    "\n  [!] the camera ran at {:.0} fps and only {:.0}% of its frames were captured -- \
+                     the recorder or the disk could not keep up",
+                    1.0 / b,
+                    100.0 * f
+                ),
+                _ => String::new(),
+            }
         )
     }
 }
