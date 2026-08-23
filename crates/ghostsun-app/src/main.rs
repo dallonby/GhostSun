@@ -6,6 +6,7 @@
 )]
 
 mod acquire;
+mod applog;
 mod focus;
 mod focusmetrics;
 mod gong;
@@ -24,6 +25,9 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 140, 40);
 const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(160, 84, 20);
 
 fn main() -> eframe::Result {
+    let log = applog::init();
+    applog!("=== GhostSun {} starting ===", env!("CARGO_PKG_VERSION"));
+    applog!("log file: {}", log.display());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 940.0])

@@ -649,6 +649,14 @@ impl Camera for ToupcamCam {
     }
 
     fn start(&mut self) -> crate::Result<()> {
+        // Bit depth FIRST. It reconfigures the readout, and doing it after the
+        // ROI risks discarding the geometry we just set — the ordering was the
+        // other way round and ROI changes were intermittently wedging the
+        // stream badly enough to need a replug.
+        let opt = if self.bit_depth == 8 { 0 } else { 1 };
+        unsafe {
+            (self.api.put_option)(self.h, OPTION_BITDEPTH, opt);
+        }
         if let Some(r) = self.pending_roi.take() {
             // Offsets/sizes align to 2 px; 0×0 means full frame.
             let a = |v: usize| (v & !1) as c_uint;
@@ -674,11 +682,6 @@ impl Camera for ToupcamCam {
                     r.x, r.y, r.w, r.h
                 )));
             }
-        }
-        // Re-assert bit depth in case an earlier start left the SDK elsewhere.
-        let opt = if self.bit_depth == 8 { 0 } else { 1 };
-        unsafe {
-            (self.api.put_option)(self.h, OPTION_BITDEPTH, opt);
         }
         // Drop frame-ready notifications queued for the PREVIOUS geometry.
         // The callback fires per frame regardless of who is listening, so a

@@ -218,6 +218,9 @@ enum FocusMsg {
         device_clock: bool,
     },
     RecordingError(String),
+    /// Non-fatal status the user needs to see (e.g. a stalled stream), which
+    /// would otherwise only exist in the log file.
+    Note(String),
     /// The live (outside-recording) hardware ROI was applied or released.
     LiveRoi {
         active: bool,
@@ -648,6 +651,9 @@ impl FocusState {
                         | FocusMsg::RecordingStopped { .. }
                         | FocusMsg::RecordingError(_)),
                     ) => recording_event = Some(event),
+                    Ok(FocusMsg::Note(note)) => {
+                        self.status = note;
+                    }
                     Ok(FocusMsg::LiveRoi { active, y0, h }) => {
                         self.live_roi_active = active;
                         self.live_roi_status = if active {
@@ -701,6 +707,7 @@ impl FocusState {
                 }
                 FocusMsg::Opened(_)
                 | FocusMsg::Frame(_)
+                | FocusMsg::Note(_)
                 | FocusMsg::LiveRoi { .. }
                 | FocusMsg::Error(_) => unreachable!(),
             }
@@ -2742,11 +2749,18 @@ fn worker(
             return;
         }
     };
+    crate::applog!(
+        "camera: opened {} ({}x{}) exposure={exposure_us}us gain={gain}",
+        info.name,
+        info.max_width,
+        info.max_height
+    );
     let _ = tx.send(FocusMsg::Opened(cam.info().clone()));
     cam.set_exposure_us(exposure_us).ok();
     cam.set_gain(gain).ok();
     cam.set_auto_exposure(auto_exposure).ok();
     if let Err(e) = cam.start() {
+        crate::applog!("camera: initial start FAILED: {e}");
         let _ = tx.send(FocusMsg::Error(e.to_string()));
         return;
     }
@@ -2760,6 +2774,9 @@ fn worker(
     // frame, and every change goes through ensure_roi so a redundant or
     // band-to-band transition can never stall the stream.
     let mut current_roi: Roi = full_frame_roi(&info);
+    // Consecutive 1 s frame timeouts, so a stalled stream is reported rather
+    // than spun on in silence.
+    let mut stalled: u32 = 0;
 
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -2779,6 +2796,10 @@ fn worker(
                     anchor_y,
                     enable,
                 } => {
+                    crate::applog!(
+                        "live-roi: request enable={enable} height={capture_height} anchor={anchor_y:.1} recording={}",
+                        active_ser.is_some() || pending_ser.is_some()
+                    );
                     // Refuse to touch the sensor mid-recording: the SER's
                     // frame geometry is fixed at the first frame.
                     if active_ser.is_some() || pending_ser.is_some() {
@@ -2964,6 +2985,10 @@ fn worker(
         };
         match next {
             Ok(frame) => {
+                if stalled > 0 {
+                    crate::applog!("camera: frames resumed after {stalled}s");
+                    stalled = 0;
+                }
                 if let Some(request) = pending_ser.take() {
                     let (y0, height) = match request.hw_roi_y0 {
                         // The camera already delivers only the band.
@@ -3123,8 +3148,30 @@ fn worker(
                     ctx.request_repaint();
                 }
             }
-            Err(ghostsun_camera::CameraError::Timeout) => continue,
+            Err(ghostsun_camera::CameraError::Timeout) => {
+                // Swallowing these silently is what made a stalled stream look
+                // like a frozen UI with an empty log. The stream legitimately
+                // pauses for a beat around a geometry change, so say nothing
+                // for the first one and escalate from there.
+                stalled += 1;
+                if stalled == 2 || stalled == 5 || stalled % 15 == 0 {
+                    crate::applog!(
+                        "camera: no frame for {stalled}s (roi {}x{}+{}+{}, exposure {:?} us)",
+                        current_roi.w,
+                        current_roi.h,
+                        current_roi.x,
+                        current_roi.y,
+                        cam.current_exposure_us()
+                    );
+                    let _ = tx.send(FocusMsg::Note(format!(
+                        "no frames for {stalled}s — the camera stream has stalled"
+                    )));
+                    ctx.request_repaint();
+                }
+                continue;
+            }
             Err(e) => {
+                crate::applog!("camera: fatal stream error: {e}");
                 if let Some(active) = active_ser.take() {
                     finish_ser(active, &tx);
                 }
@@ -3136,6 +3183,7 @@ fn worker(
     if let Some(active) = active_ser.take() {
         finish_ser(active, &tx);
     }
+    crate::applog!("camera: worker exiting, closing device");
     cam.stop();
 }
 
@@ -3194,9 +3242,29 @@ fn resting_roi(info: &CameraInfo, live: Option<Roi>) -> Roi {
 /// the cycle is mandatory. A failure leaves the camera stopped; callers must
 /// treat it as fatal for the session unless a full-frame restore succeeds.
 fn apply_roi(cam: &mut dyn ghostsun_camera::Camera, roi: Roi) -> Result<(), String> {
+    let t0 = Instant::now();
+    crate::applog!(
+        "roi: stop -> set {}x{}+{}+{} -> start",
+        roi.w,
+        roi.h,
+        roi.x,
+        roi.y
+    );
     cam.stop();
-    cam.set_roi(roi).map_err(|error| error.to_string())?;
-    cam.start().map_err(|error| error.to_string())
+    if let Err(error) = cam.set_roi(roi) {
+        crate::applog!("roi: set_roi FAILED: {error}");
+        return Err(error.to_string());
+    }
+    match cam.start() {
+        Ok(()) => {
+            crate::applog!("roi: started in {} ms", t0.elapsed().as_millis());
+            Ok(())
+        }
+        Err(error) => {
+            crate::applog!("roi: start FAILED after {} ms: {error}", t0.elapsed().as_millis());
+            Err(error.to_string())
+        }
+    }
 }
 
 fn roi_eq(a: Roi, b: Roi) -> bool {
@@ -3219,7 +3287,20 @@ fn ensure_roi(
     current: &mut Roi,
     target: Roi,
 ) -> Result<(), String> {
-    for step in roi_transition(*current, target, full_frame_roi(info)) {
+    let steps = roi_transition(*current, target, full_frame_roi(info));
+    crate::applog!(
+        "roi: {}x{}+{}+{} -> {}x{}+{}+{} ({} step(s))",
+        current.w,
+        current.h,
+        current.x,
+        current.y,
+        target.w,
+        target.h,
+        target.x,
+        target.y,
+        steps.len()
+    );
+    for step in steps {
         apply_roi(cam, step)?;
         *current = step;
     }
