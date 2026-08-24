@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use ghostsun_core::image2d::Image;
 use ghostsun_core::{metrics, pipeline, ser};
@@ -23,6 +24,16 @@ const ACCENT_DIM: egui::Color32 = egui::Color32::from_rgb(120, 90, 30);
 /// view, small enough that a folder of thirty scans is not a texture problem.
 const PREVIEW_PX: usize = 384;
 const TILE_PX: f32 = 190.0;
+
+/// Where a scan has got to in the quick pass.
+#[derive(Clone)]
+enum TileState {
+    Queued,
+    /// Running, carrying the pipeline's latest stage line.
+    Working(String),
+    Ready,
+    Failed(String),
+}
 
 /// One scan, and what the quick pass learned about it.
 struct Tile {
@@ -37,11 +48,18 @@ struct Tile {
     sharpness: Option<f64>,
     gray: Option<(Vec<u8>, usize, usize)>,
     tex: Option<egui::TextureHandle>,
-    error: Option<String>,
+    state: TileState,
     selected: bool,
 }
 
 enum PreviewMsg {
+    Started {
+        index: usize,
+    },
+    Step {
+        index: usize,
+        line: String,
+    },
     Preview {
         index: usize,
         gray: Vec<u8>,
@@ -71,6 +89,10 @@ pub struct ProcessState {
     preview_tx: Sender<PreviewMsg>,
     previewing: bool,
     previewed: usize,
+    /// Seconds each finished scan took, so the remaining wait can be quoted
+    /// from measurement rather than guessed.
+    per_file: Vec<f64>,
+    file_started: Option<Instant>,
     cancel: Arc<AtomicBool>,
     stack_rx: Receiver<ProcessMessage>,
     stack_tx: Sender<ProcessMessage>,
@@ -95,6 +117,8 @@ impl Default for ProcessState {
             preview_tx,
             previewing: false,
             previewed: 0,
+            per_file: Vec::new(),
+            file_started: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stack_rx,
             stack_tx,
@@ -111,6 +135,17 @@ impl ProcessState {
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<AcquireOutput> {
         while let Ok(message) = self.preview_rx.try_recv() {
             match message {
+                PreviewMsg::Started { index } => {
+                    self.file_started = Some(Instant::now());
+                    if let Some(tile) = self.tiles.get_mut(index) {
+                        tile.state = TileState::Working("starting".into());
+                    }
+                }
+                PreviewMsg::Step { index, line } => {
+                    if let Some(tile) = self.tiles.get_mut(index) {
+                        tile.state = TileState::Working(line);
+                    }
+                }
                 PreviewMsg::Preview {
                     index,
                     gray,
@@ -121,22 +156,19 @@ impl ProcessState {
                     if let Some(tile) = self.tiles.get_mut(index) {
                         tile.gray = Some((gray, w, h));
                         tile.sharpness = sharpness;
+                        tile.state = TileState::Ready;
                     }
-                    self.previewed += 1;
-                    self.status = format!(
-                        "Quick look: {}/{} scans",
-                        self.previewed,
-                        self.tiles.len()
-                    );
+                    self.finish_one();
                 }
                 PreviewMsg::Failed { index, error } => {
                     if let Some(tile) = self.tiles.get_mut(index) {
-                        tile.error = Some(error);
+                        tile.state = TileState::Failed(error);
                     }
-                    self.previewed += 1;
+                    self.finish_one();
                 }
                 PreviewMsg::Done => {
                     self.previewing = false;
+                    self.file_started = None;
                     self.resort();
                     self.pretick();
                     self.status = format!(
@@ -171,6 +203,45 @@ impl ProcessState {
             ctx.request_repaint();
         }
         finished
+    }
+
+    /// One scan done: bank how long it took, and restate the wait.
+    fn finish_one(&mut self) {
+        if let Some(start) = self.file_started.take() {
+            self.per_file.push(start.elapsed().as_secs_f64());
+        }
+        self.previewed += 1;
+        self.status = match self.remaining_estimate() {
+            Some(text) => format!(
+                "Quick look: {}/{} scans · about {text} left",
+                self.previewed,
+                self.tiles.len()
+            ),
+            None => format!("Quick look: {}/{} scans", self.previewed, self.tiles.len()),
+        };
+    }
+
+    /// Time left, from the mean of the scans already done.
+    ///
+    /// `None` until at least one has finished: an estimate from no samples is
+    /// worse than no estimate.
+    fn remaining_estimate(&self) -> Option<String> {
+        if self.per_file.is_empty() {
+            return None;
+        }
+        let left = self.tiles.len().saturating_sub(self.previewed);
+        if left == 0 {
+            return None;
+        }
+        let mean = self.per_file.iter().sum::<f64>() / self.per_file.len() as f64;
+        Some(human_duration(mean * left as f64))
+    }
+
+    fn progress_fraction(&self) -> f32 {
+        if self.tiles.is_empty() {
+            return 0.0;
+        }
+        self.previewed as f32 / self.tiles.len() as f32
     }
 
     fn selected_count(&self) -> usize {
@@ -226,6 +297,8 @@ impl ProcessState {
         self.enlarged = None;
         self.user_picked = false;
         self.previewed = 0;
+        self.per_file.clear();
+        self.file_started = None;
 
         let sessions = discover_sessions(&root);
 
@@ -252,7 +325,7 @@ impl ProcessState {
                     sharpness: None,
                     gray: None,
                     tex: None,
-                    error: None,
+                    state: TileState::Queued,
                     selected: false,
                 });
             }
@@ -282,9 +355,12 @@ impl ProcessState {
                 if cancel.load(Ordering::SeqCst) {
                     break;
                 }
+                let _ = tx.send(PreviewMsg::Started { index });
+                repaint.request_repaint();
                 // Caught: one malformed SER must not take the whole review with it.
+                let job_tx = tx.clone();
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    quick_preview(&path, reverse)
+                    quick_preview(&path, reverse, index, job_tx)
                 }));
                 let message = match outcome {
                     Ok(Ok((gray, w, h, sharpness))) => PreviewMsg::Preview {
@@ -424,6 +500,25 @@ impl ProcessState {
             }
         });
 
+        if self.previewing {
+            ui.add_space(4.0);
+            let done = self.previewed;
+            let total = self.tiles.len();
+            let label = match self.remaining_estimate() {
+                Some(left) => format!("{done}/{total} · about {left} left"),
+                None => format!("{done}/{total}"),
+            };
+            ui.add(
+                egui::ProgressBar::new(self.progress_fraction())
+                    .text(label)
+                    .fill(ACCENT_DIM),
+            )
+            .on_hover_text(
+                "Each scan gets a stripped-down reconstruction. The estimate is \
+                 the mean of the ones already done, so it settles after a few.",
+            );
+        }
+
         ui.add_space(6.0);
         let selected = self.selected_count();
         ui.horizontal(|ui| {
@@ -518,15 +613,41 @@ impl ProcessState {
                                             image_size,
                                             egui::Sense::click(),
                                         );
+                                        let (caption, colour) = match &tile.state {
+                                            TileState::Queued => (
+                                                "queued".to_owned(),
+                                                ui.visuals().weak_text_color(),
+                                            ),
+                                            TileState::Working(step) => {
+                                                (step.clone(), ACCENT)
+                                            }
+                                            TileState::Failed(_) => (
+                                                "failed".to_owned(),
+                                                egui::Color32::from_rgb(255, 120, 120),
+                                            ),
+                                            TileState::Ready => (
+                                                "…".to_owned(),
+                                                ui.visuals().weak_text_color(),
+                                            ),
+                                        };
+                                        if matches!(tile.state, TileState::Working(_)) {
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_max(
+                                                    rect.left_top(),
+                                                    egui::pos2(rect.right(), rect.top() + 3.0),
+                                                ),
+                                                0.0,
+                                                ACCENT,
+                                            );
+                                        }
+                                        // Stage names get long; wrap rather than
+                                        // spill outside the tile.
                                         ui.painter().text(
                                             rect.center(),
                                             egui::Align2::CENTER_CENTER,
-                                            match &tile.error {
-                                                Some(_) => "failed",
-                                                None => "…",
-                                            },
-                                            egui::FontId::proportional(13.0),
-                                            ui.visuals().weak_text_color(),
+                                            ellipsize(&caption, 22),
+                                            egui::FontId::proportional(12.0),
+                                            colour,
                                         );
                                     }
                                 }
@@ -565,12 +686,13 @@ impl ProcessState {
                                     .small()
                                     .color(if tile.sharpness.is_some() { ACCENT } else { ui.visuals().weak_text_color() }),
                                 );
-                                if let Some(error) = &tile.error {
+                                if let TileState::Failed(error) = &tile.state {
                                     ui.label(
-                                        egui::RichText::new(error)
+                                        egui::RichText::new(ellipsize(error, 40))
                                             .small()
                                             .color(egui::Color32::from_rgb(255, 120, 120)),
-                                    );
+                                    )
+                                    .on_hover_text(error.clone());
                                 }
                             });
                         });
@@ -732,8 +854,24 @@ fn quick_options(reverse: bool) -> pipeline::ReconOptions {
 fn quick_preview(
     path: &Path,
     reverse: bool,
+    index: usize,
+    tx: Sender<PreviewMsg>,
 ) -> Result<(Vec<u8>, usize, usize, Option<f64>), String> {
-    let report = pipeline::reconstruct(path, &quick_options(reverse))?;
+    let mut options = quick_options(reverse);
+    // Route the pipeline's stage lines onto the tile, so a scan that takes a
+    // while says what it is doing rather than sitting on an ellipsis.
+    let step_tx = tx.clone();
+    options.progress = Some(Arc::new(move |line: &str| {
+        let _ = step_tx.send(PreviewMsg::Step {
+            index,
+            line: line.to_owned(),
+        });
+    }));
+    let report = pipeline::reconstruct(path, &options)?;
+    let _ = tx.send(PreviewMsg::Step {
+        index,
+        line: "measuring the limb".into(),
+    });
     let image = report.output.image;
     // Limb edge width: a direct read on the seeing, and the number the tiles
     // are ranked by.
@@ -742,6 +880,26 @@ fn quick_preview(
         .filter(|s| s.is_finite() && *s > 0.0);
     let (gray, w, h) = to_thumbnail(&image, PREVIEW_PX);
     Ok((gray, w, h, sharpness))
+}
+
+/// Trim to `max` characters, so a long pipeline stage name cannot push a tile
+/// out of shape.
+fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// "2m 10s" / "45s", for a wait the user is deciding whether to sit through.
+fn human_duration(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
 }
 
 /// Downsample to `max_side` and stretch to 8-bit for display.
@@ -846,7 +1004,7 @@ mod tests {
             sharpness,
             gray: Some((vec![0], 1, 1)),
             tex: None,
-            error: None,
+            state: TileState::Ready,
             selected: false,
         }
     }
@@ -888,6 +1046,54 @@ mod tests {
         state.user_picked = true;
         state.pretick();
         assert!(state.tiles[0].selected, "the automatic pick must not stomp a choice");
+    }
+
+    #[test]
+    fn no_estimate_is_offered_before_anything_has_finished() {
+        // A figure derived from zero samples is worse than none.
+        let mut state = ProcessState::default();
+        state.tiles = vec![tile(None, "a"), tile(None, "b")];
+        assert!(state.remaining_estimate().is_none());
+    }
+
+    #[test]
+    fn the_estimate_uses_the_mean_of_finished_scans() {
+        let mut state = ProcessState::default();
+        state.tiles = vec![tile(None, "a"), tile(None, "b"), tile(None, "c")];
+        state.per_file = vec![10.0, 20.0];
+        state.previewed = 2;
+        // mean 15 s, one left.
+        assert_eq!(state.remaining_estimate().as_deref(), Some("15s"));
+    }
+
+    #[test]
+    fn the_estimate_stops_once_the_pass_is_done() {
+        let mut state = ProcessState::default();
+        state.tiles = vec![tile(None, "a")];
+        state.per_file = vec![5.0];
+        state.previewed = 1;
+        assert!(state.remaining_estimate().is_none());
+        assert_eq!(state.progress_fraction(), 1.0);
+    }
+
+    #[test]
+    fn durations_read_in_minutes_when_long() {
+        assert_eq!(human_duration(9.4), "9s");
+        assert_eq!(human_duration(130.0), "2m 10s");
+        assert_eq!(human_duration(-3.0), "0s");
+    }
+
+    #[test]
+    fn long_stage_names_are_trimmed_to_fit_a_tile() {
+        assert_eq!(ellipsize("short", 22), "short");
+        let long = ellipsize("a stage name far too long for one tile", 10);
+        assert_eq!(long.chars().count(), 10);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn progress_is_zero_with_nothing_loaded() {
+        assert_eq!(ProcessState::default().progress_fraction(), 0.0);
     }
 
     #[test]
