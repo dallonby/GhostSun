@@ -218,6 +218,12 @@ enum WorkerCommand {
         ra_hours: f64,
         dec_deg: f64,
     },
+    /// Select the SOLAR tracking rate (`:TS#`).
+    ///
+    /// Asserted before a scan rather than assumed: the rate was only ever set
+    /// on the Sun-GoTo path, so centring the Sun any other way left the mount
+    /// on whatever rate it powered up with.
+    SetSolarRate,
     Shutdown,
 }
 
@@ -1931,6 +1937,14 @@ impl MountState {
         Ok(())
     }
 
+    /// Assert the solar tracking rate on the mount.
+    ///
+    /// Fire-and-forget: the LX200 dialect has no reliable "read the tracking
+    /// rate" query, so the rate is SET before each run instead of checked.
+    pub fn request_solar_tracking_rate(&mut self) {
+        let _ = self.tx.send(WorkerCommand::SetSolarRate);
+    }
+
     pub fn take_acquisition_nudge_done(&mut self) -> bool {
         std::mem::take(&mut self.acquisition_nudge_done)
     }
@@ -3235,10 +3249,30 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                     }
                 }
             }
+            Ok(WorkerCommand::SetSolarRate) => {
+                if let Some(opened) = port.as_deref_mut() {
+                    match blind(opened, ":TS#") {
+                        Ok(()) => {
+                            let _ = tx.send(WorkerMessage::Notice(
+                                "Solar tracking rate selected".into(),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(WorkerMessage::Error(error));
+                        }
+                    }
+                }
+            }
             Ok(WorkerCommand::SetTracking(enable)) => {
                 if let Some(opened) = port.as_deref_mut() {
                     // ZWO AM-series LX200 dialect: :Te# enable tracking, :Td# disable.
-                    // Rate is left as-is (jog rate / solar rate from Sun GoTo).
+                    // GhostSun is a solar instrument, so enabling tracking selects
+                    // the SOLAR rate: leaving it as-is meant the Sun was tracked at
+                    // the sidereal rate and drifted whenever it had not arrived via
+                    // a Sun GoTo.
+                    if enable {
+                        let _ = blind(opened, ":TS#");
+                    }
                     let cmd = if enable { ":Te#" } else { ":Td#" };
                     match blind(opened, cmd) {
                         Ok(()) => {
@@ -3324,7 +3358,13 @@ fn worker_loop(rx: Receiver<WorkerCommand>, tx: Sender<WorkerMessage>) {
                     }
                     .and_then(|_| {
                         if ensure_tracking {
-                            blind(opened, ":Te#")
+                            // Solar rate BEFORE re-enabling tracking. `:Te#`
+                            // alone never selected one, so a mount sitting on
+                            // the sidereal rate resumed 0.041 arcsec/s fast
+                            // after every nudge — ~2.5 arcmin per hour, a
+                            // twelfth of the disc, walking the slit off the
+                            // feature mid-scan.
+                            blind(opened, ":TS#").and_then(|_| blind(opened, ":Te#"))
                         } else {
                             Ok(())
                         }

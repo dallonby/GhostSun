@@ -51,11 +51,24 @@ const RECENTER_CHECK_TIMEOUT: Duration = Duration::from_millis(1800);
 ///
 /// The limb search watches DISC brightness, so it reports "clear" the moment
 /// the photosphere leaves — which is where prominences begin, not where they
-/// end. Stopping there clips them. It also leaves the mount starting the next
-/// sweep from rest exactly where data begins, with no room to come up to
-/// speed. 0.08 deg is about 0.3 solar radii, past all but the tallest
-/// prominences.
-const LIMB_MARGIN_DEFAULT_DEG: f64 = 0.08;
+/// end. Stopping there clips them. 0.03 deg is about 0.11 solar radii, which
+/// clears typical prominences; raise it when a tall one is on the limb.
+///
+/// Coming up to rate is NOT paid for out of this any more — `RUN_UP_MARGINS`
+/// backs off a separate allowance — so this is free to be only as large as the
+/// prominences on the day require.
+const LIMB_MARGIN_DEFAULT_DEG: f64 = 0.03;
+/// Limb margins of run-up backed off before the sweep starts.
+///
+/// The sweep begins from rest, and the mount cannot be at rate instantly: the
+/// commanded reversal has to take up gear backlash before the axis moves at
+/// all, and only then does it come up to the science rate. Backing off ONE
+/// margin spent that whole allowance accelerating over the very data the
+/// margin exists to protect, so the pre-limb frames were smeared and unevenly
+/// spaced. Backing off two means the first is burnt on backlash and spin-up
+/// and the second — the margin proper, and the disc after it — is recorded at
+/// a settled, constant rate.
+const RUN_UP_MARGINS: f64 = 2.0;
 
 pub struct AcquireOutput {
     pub image: Image,
@@ -63,7 +76,7 @@ pub struct AcquireOutput {
     pub source_ser: PathBuf,
 }
 
-enum ProcessMessage {
+pub(crate) enum ProcessMessage {
     Log(String),
     Done(AcquireOutput),
     Failed(String),
@@ -73,8 +86,10 @@ enum ProcessMessage {
 enum RunPhase {
     PrepositionMoving,
     PrepositionSampling,
-    /// Travelling the limb margin past the near limb before the sweep starts.
+    /// Travelling the run-up margins past the near limb before the sweep starts.
     PrepositionMargin,
+    /// Between sweeps: backing off the extra run-up the reverse pass needs.
+    InterScanMargin,
     Settling,
     AwaitRecorder,
     PreRoll,
@@ -86,7 +101,34 @@ enum RunPhase {
     WaitingForRecorder,
     Recentering,
     RecenterCheck,
-    Processing,
+    /// Sweeps done and files closed. The run is dropped on the next poll.
+    ///
+    /// Reconstruction is NOT a phase of a run any more: it is a separate job,
+    /// so the mount and camera are free for the next scan the moment the last
+    /// sweep lands.
+    Complete,
+}
+
+impl RunPhase {
+    /// Plain wording for a status line; the enum names are internal.
+    fn describe(self) -> &'static str {
+        match self {
+            RunPhase::PrepositionMoving | RunPhase::PrepositionSampling => {
+                "seeking the first limb"
+            }
+            RunPhase::PrepositionMargin | RunPhase::InterScanMargin => "backing off the run-up",
+            RunPhase::Settling => "settling",
+            RunPhase::AwaitRecorder => "opening the SER file",
+            RunPhase::PreRoll => "recording pre-roll",
+            RunPhase::Scanning => "sweeping across the disc",
+            RunPhase::Overshoot => "recording past the far limb",
+            RunPhase::ScanTailCheck => "confirming the far limb",
+            RunPhase::PostRoll => "recording post-roll",
+            RunPhase::WaitingForRecorder => "finalising the SER file",
+            RunPhase::Recentering | RunPhase::RecenterCheck => "re-centring the disc",
+            RunPhase::Complete => "finishing",
+        }
+    }
 }
 
 struct ScanRun {
@@ -129,6 +171,13 @@ enum CalPhase {
     SettleFinal(Instant),
 }
 
+/// A completed run's files, kept so reconstruction can happen on its own time.
+#[derive(Clone)]
+struct Session {
+    dir: PathBuf,
+    files: Vec<(PathBuf, bool)>,
+}
+
 struct Calibration {
     baseline_seq: u64,
     baseline: Vec<f32>,
@@ -151,9 +200,17 @@ pub struct AcquireState {
     meridian_ack_side: i8,
     off_axis_confirmed: bool,
     confirm_start_open: bool,
+    confirm_stop_open: bool,
     off_axis_deg: Option<f64>,
     calibration: Option<Calibration>,
     run: Option<ScanRun>,
+    /// Reconstruct as soon as a run ends. Off: capture is the scarce thing.
+    auto_process: bool,
+    /// The most recent completed run, so it can be reconstructed later.
+    last_session: Option<Session>,
+    /// When reconstruction began, so the wait can be quoted rather than left
+    /// looking like a hang.
+    processing_since: Option<Instant>,
     status: String,
     log: Vec<String>,
     process_tx: Sender<ProcessMessage>,
@@ -163,9 +220,15 @@ pub struct AcquireState {
 impl Default for AcquireState {
     fn default() -> Self {
         let (process_tx, process_rx) = channel();
-        let output_dir = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("GhostSun Captures");
+        // The folder the user last chose, if that volume is still mounted.
+        // Falling back to the working directory put captures wherever the app
+        // happened to be launched from — which for a packaged build is not a
+        // place anyone chose, and changed from one version to the next.
+        let output_dir = crate::storage::load_capture_dir().unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("GhostSun Captures")
+        });
         Self {
             // ~200 px around the line is the user's working crop: the Halpha
             // core is ~10-30 px and the pipeline's continuum offset and
@@ -186,9 +249,13 @@ impl Default for AcquireState {
             meridian_ack_side: 0,
             off_axis_confirmed: false,
             confirm_start_open: false,
+            confirm_stop_open: false,
             off_axis_deg: None,
             calibration: None,
             run: None,
+            auto_process: false,
+            last_session: None,
+            processing_since: None,
             status: "Ready for setup".into(),
             log: Vec::new(),
             process_tx,
@@ -204,11 +271,60 @@ impl AcquireState {
         }
     }
 
+    /// Is a scan or calibration actually under way?
+    ///
+    /// A run parked in `Complete`, or a reconstruction, is NOT live: neither
+    /// holds the mount or the camera, so neither is worth warning about.
+    pub fn run_is_live(&self) -> bool {
+        self.calibration.is_some()
+            || self
+                .run
+                .as_ref()
+                .map(|run| run.phase != RunPhase::Complete)
+                .unwrap_or(false)
+    }
+
+    /// What stopping now would cost, phrased for a confirmation.
+    pub fn stop_consequences(&self) -> String {
+        if self.calibration.is_some() {
+            return "Scan-axis calibration is part-way through; stopping discards it and the \
+                    mount stays where it is."
+                .into();
+        }
+        let Some(run) = self.run.as_ref() else {
+            return String::new();
+        };
+        let saved = run.files.len();
+        format!(
+            "Scan {} of {} is {}. Stopping halts the mount and closes the current SER — the \
+             partial scan stays on disk and is still readable — and cancels the {} remaining. \
+             {}",
+            run.scan_index + 1,
+            self.scan_count,
+            run.phase.describe(),
+            self.scan_count.saturating_sub(run.scan_index),
+            if saved > 0 {
+                format!("{saved} completed scan(s) are already saved and unaffected.")
+            } else {
+                "No scan has completed yet.".to_owned()
+            }
+        )
+    }
+
+    /// Stop a live run, no questions asked.
+    ///
+    /// The UI asks first; this is what an answered dialog, or the app itself,
+    /// calls once the decision is made.
+    pub fn force_stop(&mut self, focus: &mut focus::FocusState, mount: &mut MountState, reason: &str) {
+        self.confirm_stop_open = false;
+        self.abort(focus, mount, reason);
+    }
+
     pub fn leave_tab(&mut self, focus: &mut focus::FocusState, mount: &mut MountState) {
         let motion_or_recording = self
             .run
             .as_ref()
-            .map(|run| run.phase != RunPhase::Processing)
+            .map(|run| run.phase != RunPhase::Complete)
             .unwrap_or(false)
             || self.calibration.is_some();
         if motion_or_recording {
@@ -233,12 +349,14 @@ impl AcquireState {
                     self.status = "Acquisition, reconstruction, and output complete".into();
                     self.log.push(self.status.clone());
                     self.run = None;
+                    self.processing_since = None;
                     completed = Some(output);
                 }
                 ProcessMessage::Failed(error) => {
                     self.status = format!("Processing failed: {error}");
                     self.log.push(self.status.clone());
                     self.run = None;
+                    self.processing_since = None;
                 }
             }
         }
@@ -344,10 +462,6 @@ impl AcquireState {
         let Some(mut run) = self.run.take() else {
             return;
         };
-        if run.phase == RunPhase::Processing {
-            self.run = Some(run);
-            return;
-        }
 
         let outcome = (|| -> Result<bool, String> {
             match run.phase {
@@ -395,19 +509,23 @@ impl AcquireState {
                             // prominence coverage and the mount is already at
                             // speed when the near limb arrives.
                             if run.limb_margin_deg > 0.0 {
+                                let run_up = RUN_UP_MARGINS * run.limb_margin_deg;
                                 let duration = Duration::from_secs_f64(
-                                    run.limb_margin_deg
-                                        / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+                                    run_up / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
                                 );
                                 mount.start_acquisition_nudge(
                                     run.direction.opposite(),
                                     duration,
                                     PROBE_RATE_INDEX,
                                 )?;
-                                run.scan_span_deg += 2.0 * run.limb_margin_deg;
+                                // Run-up before the near limb, plus one margin
+                                // of overshoot past the far one.
+                                run.scan_span_deg +=
+                                    (RUN_UP_MARGINS + 1.0) * run.limb_margin_deg;
                                 run.phase = RunPhase::PrepositionMargin;
                                 self.status = format!(
-                                    "Disc cleared; backing off a further {:.2}° limb margin",
+                                    "Disc cleared; backing off {run_up:.2}° of run-up \
+                                     ({RUN_UP_MARGINS:.0}× the {:.2}° limb margin)",
                                     run.limb_margin_deg
                                 );
                             } else {
@@ -436,8 +554,17 @@ impl AcquireState {
                     run.phase = RunPhase::Settling;
                     run.settle_until = Instant::now() + SETTLE_TIME;
                     self.status = format!(
-                        "Limb margin reached; settling for a {:.2}° scan",
+                        "Run-up reached; settling for a {:.2}° scan",
                         run.scan_span_deg
+                    );
+                }
+                RunPhase::InterScanMargin if mount.take_acquisition_nudge_done() => {
+                    run.phase = RunPhase::Settling;
+                    run.settle_until = Instant::now() + SETTLE_TIME;
+                    self.status = format!(
+                        "Run-up reached; settling for scan {}/{}",
+                        run.scan_index + 1,
+                        self.scan_count
                     );
                 }
                 RunPhase::Settling if Instant::now() >= run.settle_until => {
@@ -605,10 +732,35 @@ impl AcquireState {
                     self.log.push(focus.recording_status.clone());
                     run.scan_index += 1;
                     if run.scan_index < self.scan_count {
-                        run.phase = RunPhase::Settling;
-                        run.settle_until = Instant::now() + SETTLE_TIME;
-                        self.status =
-                            format!("Scan {} saved; settling for reverse scan", run.scan_index);
+                        // The sweep just finished stopped ONE margin past its
+                        // far limb — which is the next sweep's near limb. Back
+                        // off one more so the reverse pass gets the same full
+                        // run-up, instead of accelerating across its own
+                        // pre-limb margin the way the first pass used to.
+                        let extra = (RUN_UP_MARGINS - 1.0) * run.limb_margin_deg;
+                        if extra > 0.0 {
+                            let next = scan_direction(run.direction, run.scan_index);
+                            let duration = Duration::from_secs_f64(
+                                extra / (PROBE_RATE_MULTIPLE * SIDEREAL_DEG_PER_SEC),
+                            );
+                            mount.start_acquisition_nudge(
+                                next.opposite(),
+                                duration,
+                                PROBE_RATE_INDEX,
+                            )?;
+                            run.phase = RunPhase::InterScanMargin;
+                            self.status = format!(
+                                "Scan {} saved; backing off {extra:.2}° of run-up",
+                                run.scan_index
+                            );
+                        } else {
+                            run.phase = RunPhase::Settling;
+                            run.settle_until = Instant::now() + SETTLE_TIME;
+                            self.status = format!(
+                                "Scan {} saved; settling for reverse scan",
+                                run.scan_index
+                            );
+                        }
                     } else {
                         let final_direction =
                             scan_direction(run.direction, run.scan_index.saturating_sub(1));
@@ -658,7 +810,7 @@ impl AcquireState {
                         if run.recenter_present_samples >= SCAN_SIGNAL_REQUIRED_SAMPLES {
                             self.status =
                                 "Disc re-centred and verified; starting reconstruction".into();
-                            self.begin_processing(&mut run, ctx);
+                            self.finish_run(&mut run, ctx);
                         }
                     }
                     if run.phase == RunPhase::RecenterCheck && Instant::now() >= run.deadline {
@@ -668,7 +820,7 @@ impl AcquireState {
                         );
                         self.status =
                             "Re-centre could not be verified; processing the saved scans".into();
-                        self.begin_processing(&mut run, ctx);
+                        self.finish_run(&mut run, ctx);
                     }
                 }
                 _ => {}
@@ -677,6 +829,9 @@ impl AcquireState {
         })();
 
         match outcome {
+            // A completed run is released here, which is what frees the tab
+            // for the next scan while any reconstruction carries on.
+            Ok(_) if run.phase == RunPhase::Complete => self.run = None,
             Ok(_) => self.run = Some(run),
             Err(error) => {
                 mount.stop_acquisition_motion();
@@ -726,21 +881,19 @@ impl AcquireState {
         focus: &focus::FocusState,
         mount: &mut MountState,
     ) -> Result<(), String> {
-        self.validate_common(focus, mount)?;
-        if !self.prepared_confirmed {
-            return Err("confirm that the Sun is centred and focus is complete".into());
+        // The single gate, and it reports EVERY outstanding item rather than
+        // the first: the start button is always live, so pressing it has to
+        // say what the whole remaining list is.
+        let issues = self.pre_scan_issues(focus, mount);
+        if !issues.is_empty() {
+            return Err(match issues.len() {
+                1 => issues.into_iter().next().unwrap_or_default(),
+                n => format!("{n} things to fix first — {}", issues.join("; ")),
+            });
         }
-        if !self.motion_confirmed {
-            return Err("confirm that mount motion is safe".into());
-        }
-        if self
-            .off_axis_deg
-            .map(|angle| angle > OFF_AXIS_WARN_DEG)
-            .unwrap_or(false)
-            && !self.off_axis_confirmed
-        {
-            return Err("confirm the off-axis warning or realign the sensor".into());
-        }
+        // The Sun is not a star: assert the solar rate rather than trusting
+        // whatever the mount was left on.
+        mount.request_solar_tracking_rate();
         std::fs::create_dir_all(&self.output_dir)
             .map_err(|e| format!("cannot create output folder: {e}"))?;
         let session_dir = self.output_dir.join(format!("scan-{}", unix_timestamp()));
@@ -790,6 +943,145 @@ impl AcquireState {
         Ok(())
     }
 
+    /// Bytes the configured run will write, plus headroom.
+    ///
+    /// mono16, so two bytes a pixel, at the frame rate the exposure allows.
+    /// Deliberately an over-estimate: refusing a scan that would have fitted
+    /// costs a re-try, while running out of room mid-sweep costs the sweep.
+    fn estimated_capture_bytes(&self, focus: &focus::FocusState) -> u64 {
+        let (_, _, rate_multiple) = ACQUISITION_RATES[self
+            .scan_rate_index
+            .min(ACQUISITION_RATES.len().saturating_sub(1))];
+        let span = self.scan_span_deg + (RUN_UP_MARGINS + 1.0) * self.limb_margin_deg;
+        let seconds = scan_duration(span, rate_multiple).as_secs_f64()
+            + (PRE_ROLL + POST_ROLL).as_secs_f64();
+        // The rate the camera is ACTUALLY delivering. Falling back to
+        // 1/exposure only when nothing has been measured yet, and capped,
+        // because that ceiling is tens of times higher than any real readout.
+        let fps = if focus.live_fps > 0.0 {
+            focus.live_fps
+        } else {
+            (1_000_000.0 / (focus.exposure_us.max(1) as f64)).min(120.0)
+        };
+        let width = focus.current_frame_width().unwrap_or(4_000) as f64;
+        let height = self.capture_height.max(1) as f64;
+        let bytes = seconds * fps * width * height * 2.0 * self.scan_count as f64;
+        // A quarter again, plus a floor, for the reconstruction's own output.
+        ((bytes * 1.25) as u64).saturating_add(256 * 1024 * 1024)
+    }
+
+    /// What the tab is busy with, phrased so the wait is understandable.
+    ///
+    /// "an acquisition operation is already running" was true of a finished
+    /// scan still being reconstructed, and reconstruction takes minutes — so
+    /// it read as a stuck flag rather than as work in progress. Name the stage
+    /// and how long it has been going.
+    fn current_activity(&self) -> Option<String> {
+        if self.calibration.is_some() {
+            return Some("scan-axis calibration is running — let it finish".into());
+        }
+        if self.processing_since.is_some() {
+            let waited = self
+                .processing_since
+                .map(|start| {
+                    let secs = start.elapsed().as_secs();
+                    if secs < 90 {
+                        format!(" ({secs} s so far)")
+                    } else {
+                        format!(" ({:.0} min so far)", secs as f64 / 60.0)
+                    }
+                })
+                .unwrap_or_default();
+            return Some(format!(
+                "the scan is recorded and RECONSTRUCTION is still running{waited} — \
+                 this finishes on its own and does not hold up the next scan"
+            ));
+        }
+        let run = self.run.as_ref()?;
+        Some(format!(
+            "scan {} of {} is in progress ({}) — stop it first",
+            run.scan_index + 1,
+            self.scan_count,
+            run.phase.describe(),
+        ))
+    }
+
+    /// Everything standing between the current state and a scan, as advice.
+    ///
+    /// Collected as a LIST rather than a first-failure `Err`, and never used to
+    /// disable the start button: a greyed-out control states that something is
+    /// wrong without saying what, which leaves the only fix as guesswork. The
+    /// button stays live, and this is shown next to it.
+    fn pre_scan_issues(&self, focus: &focus::FocusState, mount: &MountState) -> Vec<String> {
+        let mut issues = Vec::new();
+        if let Some(busy) = self.current_activity() {
+            issues.push(busy);
+        }
+        if !mount.is_connected() {
+            issues.push("connect the ZWO mount on the Mount tab".into());
+        }
+        if !focus.streaming {
+            issues.push("start the camera preview".into());
+        }
+        if mount.is_connected() && !mount.tracking_is_on() {
+            issues.push("turn mount tracking on".into());
+        }
+        if focus.dispersion != DispAxis::Vertical {
+            issues.push("set dispersion to Vertical on the Focus tab".into());
+        }
+        if focus.auto_exposure {
+            issues.push(
+                "turn auto-exposure OFF on the Focus tab: it re-times the sensor mid-scan and \
+                 moves the brightness baseline the limb search depends on"
+                    .into(),
+            );
+        }
+        if self.anchor_y.is_none() {
+            issues.push("select a spectral-line anchor".into());
+        }
+        if !self.prepared_confirmed {
+            issues.push("confirm that the Sun is centred and focus is complete".into());
+        }
+        if !self.motion_confirmed {
+            issues.push("confirm that mount motion is safe".into());
+        }
+        if self
+            .off_axis_deg
+            .map(|angle| angle > OFF_AXIS_WARN_DEG)
+            .unwrap_or(false)
+            && !self.off_axis_confirmed
+        {
+            issues.push("confirm the off-axis warning or realign the sensor".into());
+        }
+        if let Some(minutes) = mount.sun_meridian_offset_minutes() {
+            let side = if minutes < 0.0 { -1 } else { 1 };
+            if minutes.abs() <= 30.0 && self.meridian_ack_side != side {
+                issues.push(if minutes < 0.0 {
+                    format!(
+                        "Sun reaches the meridian in {:.0} min — review and acknowledge the meridian warning",
+                        -minutes
+                    )
+                } else {
+                    format!(
+                        "Sun crossed the meridian {:.0} min ago — confirm the mount has flipped and is tracking",
+                        minutes
+                    )
+                });
+            }
+        }
+        let needed = self.estimated_capture_bytes(focus);
+        if let Some(free) = crate::storage::free_bytes(&self.output_dir) {
+            if free < needed {
+                issues.push(format!(
+                    "capture volume has {} free but this run needs about {} — free space, choose another volume, or record fewer scans",
+                    crate::storage::human_bytes(free),
+                    crate::storage::human_bytes(needed),
+                ));
+            }
+        }
+        issues
+    }
+
     fn validate_common(&self, focus: &focus::FocusState, mount: &MountState) -> Result<(), String> {
         if !mount.is_connected() {
             return Err("connect the ZWO mount on the Mount tab".into());
@@ -802,6 +1094,19 @@ impl AcquireState {
         }
         if focus.dispersion != DispAxis::Vertical {
             return Err("set dispersion to Vertical on the Focus tab".into());
+        }
+        // Auto-exposure is always wrong for a scan, so refuse rather than
+        // quietly correct it. The SDK re-times the sensor the moment the disc
+        // lights the slit — a driver reconfiguration in the middle of a
+        // capture — and it also moves the brightness baseline that limb
+        // detection measures against, so both the science frames and the
+        // stopping logic go with it.
+        if focus.auto_exposure {
+            return Err(
+                "turn auto-exposure OFF on the Focus tab: it re-times the sensor mid-scan and \
+                 moves the brightness baseline the limb search depends on"
+                    .into(),
+            );
         }
         if self.anchor_y.is_none() {
             return Err("select a spectral-line anchor".into());
@@ -836,27 +1141,60 @@ impl AcquireState {
     ) {
         self.status = "Reconstructing scan(s) with the high-quality pipeline".into();
         self.log.push(self.status.clone());
+        self.processing_since = Some(Instant::now());
         let tx = self.process_tx.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let result = process_scans(&files, &session_dir, &tx);
-            match result {
-                Ok(output) => {
-                    let _ = tx.send(ProcessMessage::Done(output));
+            // Caught, because the ONLY thing that clears `run` is a message
+            // from this thread. A panic in the pipeline would otherwise leave
+            // the tab reporting a scan forever in progress, with no way back
+            // short of restarting the app.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_scans(&files, &session_dir, &tx)
+            }));
+            let message = match result {
+                Ok(Ok(output)) => ProcessMessage::Done(output),
+                Ok(Err(error)) => ProcessMessage::Failed(error),
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "no further detail".to_owned());
+                    ProcessMessage::Failed(format!(
+                        "reconstruction panicked ({detail}); the recorded SER files are intact"
+                    ))
                 }
-                Err(error) => {
-                    let _ = tx.send(ProcessMessage::Failed(error));
-                }
-            }
+            };
+            let _ = tx.send(message);
             repaint.request_repaint();
         });
     }
 
-    fn begin_processing(&mut self, run: &mut ScanRun, ctx: &egui::Context) {
-        let files = run.files.clone();
-        let session_dir = run.session_dir.clone();
-        self.start_processing(files, session_dir, ctx);
-        run.phase = RunPhase::Processing;
+    /// End the run, and reconstruct only if the user asked for that.
+    ///
+    /// Reconstruction used to start automatically and hold the run open for
+    /// the minutes it takes, which is backwards when the sky is good: the
+    /// scarce resource is seeing, not CPU. The session is remembered instead,
+    /// and can be reconstructed whenever.
+    fn finish_run(&mut self, run: &mut ScanRun, ctx: &egui::Context) {
+        run.phase = RunPhase::Complete;
+        let session = Session {
+            dir: run.session_dir.clone(),
+            files: run.files.clone(),
+        };
+        let count = session.files.len();
+        self.last_session = Some(session.clone());
+        if self.auto_process {
+            self.start_processing(session.files, session.dir, ctx);
+        } else {
+            self.status = format!(
+                "{count} scan(s) saved to {} — not reconstructed. Scan again while the seeing holds; \
+                 reconstruct from the Reconstruct section when you are done.",
+                session.dir.display()
+            );
+            self.log.push(self.status.clone());
+        }
     }
 
     fn abort(&mut self, focus: &mut focus::FocusState, mount: &mut MountState, reason: &str) {
@@ -1051,9 +1389,32 @@ impl AcquireState {
             if ui.button("Choose…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.output_dir = path;
+                    if let Err(error) = crate::storage::save_capture_dir(&self.output_dir) {
+                        self.log.push(format!("capture folder not remembered: {error}"));
+                    }
                 }
             }
         });
+        // Headroom on the volume the frames land on, against what this run
+        // will actually write, so a short disk is visible before the mount
+        // starts moving rather than as a truncated sweep.
+        if let Some(free) = crate::storage::free_bytes(&self.output_dir) {
+            let needed = self.estimated_capture_bytes(focus);
+            let short = free < needed;
+            ui.label(
+                egui::RichText::new(format!(
+                    "capture volume: {} free · this run needs ~{}",
+                    crate::storage::human_bytes(free),
+                    crate::storage::human_bytes(needed),
+                ))
+                .small()
+                .color(if short {
+                    egui::Color32::from_rgb(255, 120, 120)
+                } else {
+                    ACCENT_DIM
+                }),
+            );
+        }
 
         ui.separator();
         ui.heading("Scan direction");
@@ -1123,7 +1484,14 @@ impl AcquireState {
                 .fixed_decimals(2),
         )
         .on_hover_text(
-            "Extra travel past EACH limb, recorded. The limb search watches              disc brightness, so it reports the far limb the moment the              photosphere leaves the slit — which is where prominences begin.              This carries the sweep past them, and gives the mount room to              come up to speed before the next pass starts. 0.08° is about              0.3 solar radii. Added at both ends, so it lengthens each sweep              by twice this.",
+            "Extra travel past EACH limb, recorded. The limb search watches \
+             disc brightness, so it reports the far limb the moment the \
+             photosphere leaves the slit — which is where prominences begin. \
+             This carries the sweep past them. 0.03° is about 0.11 solar radii. \
+             The near side backs off TWICE this before starting, so the mount \
+             clears backlash and reaches a constant rate before the recorded \
+             margin begins; each sweep is therefore three margins longer than \
+             the span.",
         );
         self.scan_rate_index = self
             .scan_rate_index
@@ -1137,17 +1505,18 @@ impl AcquireState {
             });
         ui.add(egui::Slider::new(&mut self.scan_count, 1..=8).text("alternating scans"));
         let (_, _, rate_multiple) = ACQUISITION_RATES[self.scan_rate_index];
-        // Quote what will actually be travelled: the margin is added at both
-        // limbs, so it lengthens the sweep by twice the setting.
-        let total_span = self.scan_span_deg + 2.0 * self.limb_margin_deg;
+        // Quote what will actually be travelled: two margins of run-up before
+        // the near limb and one of overshoot past the far one.
+        let total_span = self.scan_span_deg + (RUN_UP_MARGINS + 1.0) * self.limb_margin_deg;
         let duration = scan_duration(total_span, rate_multiple);
         let motion_per_exposure = rate_multiple
             * 15.0
             * (focus.exposure_us as f64 / 1_000_000.0);
         ui.label(format!(
-            "{rate_multiple:.2}× sidereal · {:.1} s across {total_span:.2}° ({:.2}° + 2×{:.2}° margin) · ~{motion_per_exposure:.2}″ per exposure",
+            "{rate_multiple:.2}× sidereal · {:.1} s across {total_span:.2}° ({:.2}° + {}×{:.2}° margin) · ~{motion_per_exposure:.2}″ per exposure",
             duration.as_secs_f64(),
             self.scan_span_deg,
+            RUN_UP_MARGINS + 1.0,
             self.limb_margin_deg,
         ));
         ui.label(
@@ -1162,27 +1531,126 @@ impl AcquireState {
         let processing = self
             .run
             .as_ref()
-            .map(|run| run.phase == RunPhase::Processing)
+            .map(|_| false)
             .unwrap_or(false);
+        let issues = self.pre_scan_issues(focus, mount);
+        if !issues.is_empty() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(if issues.len() == 1 {
+                    "Before starting:".to_owned()
+                } else {
+                    format!("Before starting ({}):", issues.len())
+                })
+                .small()
+                .strong()
+                .color(egui::Color32::from_rgb(255, 205, 75)),
+            );
+            for issue in &issues {
+                ui.label(egui::RichText::new(format!("• {issue}")).small().weak());
+            }
+            ui.add_space(2.0);
+        }
         ui.horizontal(|ui| {
+            // ALWAYS enabled. The reasons are listed above instead; the
+            // confirmation dialog refuses if any still stand.
             let start = egui::Button::new(
                 egui::RichText::new("Review & start…")
                     .strong()
                     .color(egui::Color32::WHITE),
             )
             .fill(ACCENT_DIM);
-            if ui.add_enabled(!active, start).clicked() {
+            if ui.add(start).clicked() {
                 self.confirm_start_open = true;
             }
             if ui
                 .add_enabled(active && !processing, egui::Button::new("STOP"))
                 .clicked()
             {
-                self.abort(focus, mount, "Acquisition stopped by user");
+                // Asked, not done. A scan is minutes of sky and the button sits
+                // next to the one that starts it.
+                self.confirm_stop_open = true;
             }
         });
+
         ui.separator();
-        ui.label(egui::RichText::new(&self.status).strong());
+        ui.heading("Reconstruct");
+        ui.checkbox(
+            &mut self.auto_process,
+            "reconstruct as soon as a run finishes",
+        )
+        .on_hover_text(
+            "Off by default. Reconstruction takes minutes of CPU and none of \
+             the sky, so under good seeing it is better to keep scanning and \
+             reconstruct afterwards. The SER files are complete and safe on \
+             disk either way.",
+        );
+        let busy = self.processing_since.is_some();
+        ui.horizontal_wrapped(|ui| {
+            let last = self
+                .last_session
+                .as_ref()
+                .map(|session| session.files.len())
+                .unwrap_or(0);
+            if ui
+                .add_enabled(
+                    !busy && last > 0,
+                    egui::Button::new(format!("Reconstruct last run ({last})")),
+                )
+                .on_disabled_hover_text(if busy {
+                    "a reconstruction is already running"
+                } else {
+                    "no run has finished in this session"
+                })
+                .clicked()
+            {
+                if let Some(session) = self.last_session.clone() {
+                    self.start_processing(session.files, session.dir, ctx);
+                }
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Reconstruct a folder…"))
+                .on_hover_text(
+                    "Pick any past session folder of scan-NN.ser files — \
+                     including from an earlier night, or an earlier run of the app.",
+                )
+                .clicked()
+            {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_directory(&self.output_dir)
+                    .pick_folder()
+                {
+                    match session_from_dir(&dir) {
+                        Ok(session) => self.start_processing(session.files, session.dir, ctx),
+                        Err(error) => {
+                            self.status = error.clone();
+                            self.log.push(error);
+                        }
+                    }
+                }
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            // A spinner while the pipeline works: reconstruction runs for
+            // minutes on a worker thread, and a static line of text during it
+            // is indistinguishable from a hang.
+            if processing {
+                ui.spinner();
+            }
+            ui.label(egui::RichText::new(&self.status).strong());
+        });
+        if processing {
+            ui.label(
+                egui::RichText::new(
+                    "Reconstructing — the scan is safely recorded. This runs on its own \
+                     thread; the next scan can start as soon as it finishes.",
+                )
+                .small()
+                .color(ACCENT),
+            );
+        }
         if focus.recording {
             ui.label(format!(
                 "{} · {} frames",
@@ -1190,6 +1658,59 @@ impl AcquireState {
             ));
         }
         self.show_start_confirmation(ctx, focus, mount);
+        self.show_stop_confirmation(ctx, focus, mount);
+    }
+
+    fn show_stop_confirmation(
+        &mut self,
+        ctx: &egui::Context,
+        focus: &mut focus::FocusState,
+        mount: &mut MountState,
+    ) {
+        if !self.confirm_stop_open {
+            return;
+        }
+        if !self.run_is_live() {
+            // It finished while the dialog was up; nothing left to stop.
+            self.confirm_stop_open = false;
+            return;
+        }
+        let detail = self.stop_consequences();
+        let mut open = true;
+        let mut stop = false;
+        let mut keep = false;
+        egui::Window::new("Stop the scan in progress?")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(detail));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Keep scanning")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT_DIM),
+                        )
+                        .clicked()
+                    {
+                        keep = true;
+                    }
+                    if ui.button("Stop the scan").clicked() {
+                        stop = true;
+                    }
+                });
+            });
+        if stop {
+            self.force_stop(focus, mount, "Acquisition stopped by user");
+        } else if keep || !open {
+            self.confirm_stop_open = false;
+        }
     }
 
     fn show_start_confirmation(
@@ -1280,9 +1801,10 @@ impl AcquireState {
                     && meridian_ready
                     && off_axis_ready;
                 ui.horizontal(|ui| {
+                    // Live even when not ready: pressing it reports exactly
+                    // what is outstanding, which a greyed button cannot.
                     if ui
-                        .add_enabled(
-                            ready,
+                        .add(
                             egui::Button::new(
                                 egui::RichText::new("Begin scan")
                                     .strong()
@@ -1296,7 +1818,7 @@ impl AcquireState {
                     }
                     if !ready {
                         ui.label(
-                            egui::RichText::new("Complete the items above to continue.")
+                            egui::RichText::new("Outstanding items are listed above.")
                                 .small()
                                 .weak(),
                         );
@@ -1515,6 +2037,43 @@ fn recenter_motion(run: &ScanRun) -> Result<(f64, Duration), String> {
     Ok((distance_deg, duration))
 }
 
+/// Rebuild a [`Session`] from a folder of `scan-NN.ser` files.
+///
+/// The reverse flag is not stored anywhere: sweeps alternate direction, so it
+/// is the index parity, exactly as during the run. That makes any past session
+/// folder reconstructable without a sidecar.
+fn session_from_dir(dir: &Path) -> Result<Session, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|e| e.eq_ignore_ascii_case("ser"))
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("scan-"))
+        })
+        .collect();
+    if paths.is_empty() {
+        return Err(format!(
+            "no scan-NN.ser files in {} — pick a session folder",
+            dir.display()
+        ));
+    }
+    // scan-01, scan-02, ... so a plain name sort is capture order.
+    paths.sort();
+    let files = paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| (path, index % 2 == 1))
+        .collect();
+    Ok(Session {
+        dir: dir.to_path_buf(),
+        files,
+    })
+}
+
 fn scan_path(session_dir: &Path, index: usize) -> PathBuf {
     session_dir.join(format!("scan-{:02}.ser", index + 1))
 }
@@ -1593,7 +2152,7 @@ fn off_axis_angle(north_shift: f64, east_shift: f64) -> f64 {
     }
 }
 
-fn process_scans(
+pub(crate) fn process_scans(
     files: &[(PathBuf, bool)],
     session_dir: &Path,
     tx: &Sender<ProcessMessage>,
@@ -1746,6 +2305,124 @@ mod tests {
         assert_eq!(scan_direction(Direction::East, 0), Direction::East);
         assert_eq!(scan_direction(Direction::East, 1), Direction::West);
         assert_eq!(scan_direction(Direction::East, 2), Direction::East);
+    }
+
+    #[test]
+    fn the_sweep_budgets_run_up_before_the_limb_and_overshoot_after() {
+        // Two margins of run-up on the near side, one of overshoot on the far
+        // side. Budgeting only two total is what left the mount still coming
+        // up to rate across its own pre-limb margin.
+        let margin = LIMB_MARGIN_DEFAULT_DEG;
+        let span = 0.80;
+        let total = span + (RUN_UP_MARGINS + 1.0) * margin;
+        assert!((total - (span + 3.0 * margin)).abs() < 1e-12, "{total}");
+        assert_eq!(RUN_UP_MARGINS, 2.0);
+    }
+
+    #[test]
+    fn run_up_is_travelled_before_the_recorded_margin() {
+        // The backed-off distance must exceed the recorded pre-limb margin,
+        // otherwise the acceleration lands inside the data again.
+        let margin = LIMB_MARGIN_DEFAULT_DEG;
+        let backed_off = RUN_UP_MARGINS * margin;
+        assert!(backed_off > margin, "{backed_off} vs {margin}");
+    }
+
+    #[test]
+    fn a_zero_margin_still_produces_a_usable_span() {
+        let span = 0.80;
+        assert!((span + (RUN_UP_MARGINS + 1.0) * 0.0 - span).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_session_folder_reconstructs_without_a_sidecar() {
+        let dir = std::env::temp_dir().join(format!("ghostsun-session-{}", unix_timestamp()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for index in 0..3 {
+            std::fs::write(scan_path(&dir, index), b"x").unwrap();
+        }
+        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+        let session = session_from_dir(&dir).unwrap();
+        assert_eq!(session.files.len(), 3, "non-SER files must not be picked up");
+        // Sweeps alternate, so reverse is index parity — same as during the run.
+        assert_eq!(
+            session.files.iter().map(|(_, r)| *r).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_folder_without_scans_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ghostsun-empty-{}", unix_timestamp()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(session_from_dir(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_run_does_not_reconstruct_unless_asked() {
+        // Capture is the scarce resource; CPU is not.
+        assert!(!AcquireState::default().auto_process);
+    }
+
+    fn run_in(phase: RunPhase) -> ScanRun {
+        ScanRun {
+            phase,
+            session_dir: PathBuf::from("."),
+            files: Vec::new(),
+            scan_index: 0,
+            direction: Direction::East,
+            rate_code: 4,
+            rate_multiple: 4.0,
+            scan_span_deg: 0.8,
+            limb_margin_deg: LIMB_MARGIN_DEFAULT_DEG,
+            preposition_baseline: 1.0,
+            preposition_last_seq: 0,
+            preposition_steps: 0,
+            preposition_max_steps: 10,
+            preposition_samples: 0,
+            preposition_clear_samples: 0,
+            scan_last_seq: 0,
+            scan_present_samples: 0,
+            scan_seen_disc: false,
+            scan_clear_samples: 0,
+            scan_entry_at: None,
+            scan_exit_at: None,
+            recenter_last_seq: 0,
+            recenter_present_samples: 0,
+            settle_until: Instant::now(),
+            deadline: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn an_idle_tab_has_nothing_to_warn_about() {
+        assert!(!AcquireState::default().run_is_live());
+    }
+
+    #[test]
+    fn a_sweep_in_progress_is_live() {
+        let mut state = AcquireState::default();
+        state.run = Some(run_in(RunPhase::Scanning));
+        assert!(state.run_is_live());
+        assert!(state.stop_consequences().contains("sweeping across the disc"));
+    }
+
+    #[test]
+    fn a_finished_run_is_not_live() {
+        // Otherwise every tab click after a run would raise a pointless warning.
+        let mut state = AcquireState::default();
+        state.run = Some(run_in(RunPhase::Complete));
+        assert!(!state.run_is_live());
+    }
+
+    #[test]
+    fn reconstruction_alone_is_not_live() {
+        // It holds neither the mount nor the camera, so leaving cannot hurt it.
+        let mut state = AcquireState::default();
+        state.processing_since = Some(Instant::now());
+        assert!(!state.run_is_live());
     }
 
     #[test]

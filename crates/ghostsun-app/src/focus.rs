@@ -179,6 +179,13 @@ pub struct FocusUpdate {
     pub peak: f32,
     pub full_w: usize,
     pub full_h: usize,
+    /// Frames per second the worker is actually pulling, averaged over a short
+    /// window. 0.0 until the first window closes.
+    ///
+    /// Measured, never derived from the exposure: 1/exposure is a ceiling the
+    /// sensor readout and the USB link do not come close to, so sizing a
+    /// capture from it overstates the file by more than an order of magnitude.
+    pub live_fps: f64,
     pub cur_exposure: Option<u32>,
     pub cur_gain: Option<u16>,
     // -- Stage B (telescope) ------------------------------------------------
@@ -381,8 +388,15 @@ pub struct FocusState {
     pub recording_status: String,
     /// A hardware ROI is applied to the sensor outside of any recording, so
     /// the live preview IS the capture band at the cropped frame rate.
+    /// Measured capture rate, 0.0 until the camera has run for a second.
+    pub live_fps: f64,
     pub live_roi_active: bool,
     pub live_roi_status: String,
+    /// Sensor row of the live band's TOP edge; 0 when the full frame is read.
+    ///
+    /// Anchors are held in absolute sensor rows, but a cropped frame's
+    /// profiles are in band rows. This is the offset between them.
+    pub live_roi_y0: usize,
     /// A geometry change is in flight. Each one replaces the device handle,
     /// so a second request before the first lands is both pointless and, on
     /// these cameras, actively harmful.
@@ -463,8 +477,10 @@ impl Default for FocusState {
             recorded_frames: 0,
             recording_path: None,
             recording_status: "not recording".into(),
+            live_fps: 0.0,
             live_roi_active: false,
             live_roi_status: "full sensor".into(),
+            live_roi_y0: 0,
             live_roi_pending: false,
             dispersion: DispAxis::Vertical,
             dispersion_a_per_px: 0.085,
@@ -597,8 +613,10 @@ impl FocusState {
     pub fn stop(&mut self) {
         // The worker owns the camera handle; when it exits the device is
         // released and reopens full-frame, so a live ROI cannot survive.
+        self.live_fps = 0.0;
         self.live_roi_active = false;
         self.live_roi_pending = false;
+        self.live_roi_y0 = 0;
         self.live_roi_status = "full sensor".into();
         if let Some(s) = &self.stop {
             s.store(true, Ordering::SeqCst);
@@ -662,6 +680,7 @@ impl FocusState {
                     Ok(FocusMsg::LiveRoi { active, y0, h }) => {
                         self.live_roi_active = active;
                         self.live_roi_pending = false;
+                        self.live_roi_y0 = if active { y0 } else { 0 };
                         self.live_roi_status = if active {
                             format!("hardware ROI live · rows {y0}–{} ({h} px)", y0 + h)
                         } else {
@@ -821,6 +840,9 @@ impl FocusState {
                     self.labels.clear();
                 }
             }
+            if u.live_fps > 0.0 {
+                self.live_fps = u.live_fps;
+            }
             self.last = Some(*u);
             self.frame_seq = self.frame_seq.wrapping_add(1);
         }
@@ -900,7 +922,16 @@ impl FocusState {
     /// Horizontal spectral-line candidates, expressed as sensor Y positions.
     ///
     /// SER acquisition uses one as the fixed centre of its vertical crop.
+    /// Candidate spectral lines as (row, depth), in ABSOLUTE SENSOR ROWS.
+    ///
+    /// The fits come off the delivered frame, so under a hardware ROI they are
+    /// band rows. Returning those unshifted is what moved the capture band:
+    /// an anchor picked while cropped was re-applied against the full sensor,
+    /// dropping the band by `live_roi_y0` and carrying Halpha out of it — which
+    /// is why the grating had to be walked back every time. Shift here, once,
+    /// so every consumer speaks sensor rows.
     pub fn vertical_anchor_lines(&self) -> Vec<(f64, f64)> {
+        let offset = self.live_roi_y0 as f64;
         self.last
             .as_ref()
             .map(|frame| {
@@ -908,7 +939,7 @@ impl FocusState {
                     .lines_y
                     .iter()
                     .filter(|line| line.depth > DEPTH_GATE)
-                    .map(|line| (line.center, line.depth))
+                    .map(|line| (line.center + offset, line.depth))
                     .collect();
                 lines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 lines
@@ -918,6 +949,10 @@ impl FocusState {
 
     pub fn current_frame_height(&self) -> Option<usize> {
         self.last.as_ref().map(|frame| frame.full_h)
+    }
+
+    pub fn current_frame_width(&self) -> Option<usize> {
+        self.last.as_ref().map(|frame| frame.full_w)
     }
 
     /// Best available sensor height for bounding capture-band controls.
@@ -1342,13 +1377,21 @@ impl FocusState {
         ui.add_space(10.0);
         ui.spacing_mut().slider_width = (ui.available_width() - 130.0).max(120.0);
 
+        // Sensor settings are latched for the duration of a capture (the
+        // worker enforces it too); grey them out rather than silently
+        // deferring a change the user just made.
+        let settings_locked = self.recording;
         if ui
-            .checkbox(&mut self.auto_exposure, "auto-exposure")
+            .add_enabled(
+                !settings_locked,
+                egui::Checkbox::new(&mut self.auto_exposure, "auto-exposure"),
+            )
+            .on_disabled_hover_text("locked while recording")
             .changed()
         {
             self.send_cmd(FocusCmd::AutoExposure(self.auto_exposure));
         }
-        let manual = !self.auto_exposure;
+        let manual = !self.auto_exposure && !settings_locked;
 
         let (emin, emax) = self
             .cameras
@@ -2021,11 +2064,10 @@ impl FocusState {
             .as_ref()
             .map(|update| update.hw_roi_active)
             .unwrap_or(false);
-        // While the sensor is cropped the detected lines are in BAND rows,
-        // not sensor rows, so accepting a click here would silently rewrite
-        // the anchor into the wrong coordinate space. Release the ROI to
-        // pick a different line.
-        let selectable = selectable && !hw_roi_active;
+        // Anchors are sensor rows; this view is band rows. Converting means a
+        // line can now be picked while cropped — which is the only way to
+        // confirm the band really is centred on the line.
+        let band_y0 = self.live_roi_y0 as f64;
         ui.vertical_centered(|ui| {
             let avail = ui.available_width().max(1.0);
             let aspect = tex.aspect_ratio();
@@ -2051,7 +2093,8 @@ impl FocusState {
             let sensor_to_screen_y = |sensor_y: f64| {
                 rect.top()
                     + rect.height()
-                        * (sensor_y / frame_height.max(1) as f64).clamp(0.0, 1.0) as f32
+                        * ((sensor_y - band_y0) / frame_height.max(1) as f64).clamp(0.0, 1.0)
+                            as f32
             };
 
             if hw_roi_active {
@@ -2063,7 +2106,7 @@ impl FocusState {
                     egui::Color32::from_rgb(255, 205, 75),
                 );
             }
-            for &(line_y, _) in candidates.iter().filter(|_| !hw_roi_active) {
+            for &(line_y, _) in candidates.iter() {
                 let y = sensor_to_screen_y(line_y);
                 ui.painter().hline(
                     rect.x_range(),
@@ -2071,7 +2114,7 @@ impl FocusState {
                     egui::Stroke::new(1.0_f32, SPECTRAL_COLOR.gamma_multiply(0.45)),
                 );
             }
-            if let Some(anchor) = selected_y.filter(|_| !hw_roi_active) {
+            if let Some(anchor) = selected_y {
                 let half_crop = capture_height as f64 / 2.0;
                 let y0 = sensor_to_screen_y(anchor - half_crop);
                 let y1 = sensor_to_screen_y(anchor + half_crop);
@@ -2102,8 +2145,9 @@ impl FocusState {
 
             if selectable && response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
-                    let sensor_y =
-                        ((pointer.y - rect.top()) / rect.height()) as f64 * frame_height as f64;
+                    let sensor_y = band_y0
+                        + ((pointer.y - rect.top()) / rect.height()) as f64
+                            * frame_height as f64;
                     return candidates
                         .iter()
                         .min_by(|a, b| {
@@ -2129,6 +2173,10 @@ impl FocusState {
         let last = self.last.as_ref()?;
         let profile = last.prof_y.clone();
         let candidates: Vec<f64> = last.lines_y.iter().map(|line| line.center).collect();
+        // The plot's x axis is the delivered frame's rows; the anchor is a
+        // sensor row. Convert in, and convert the click back out.
+        let band_y0 = self.live_roi_y0 as f64;
+        let selected_y = selected_y.map(|y| y - band_y0);
         let labels: Vec<(f64, String)> = if self.spectral_is_y() {
             self.labels
                 .iter()
@@ -2148,6 +2196,7 @@ impl FocusState {
             SPECTRAL_COLOR,
             170.0,
         )
+        .map(|clicked| clicked + band_y0)
     }
 
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -2793,6 +2842,11 @@ fn worker(
     // Consecutive 1 s frame timeouts, so a stalled stream is reported rather
     // than spun on in silence.
     let mut stalled: u32 = 0;
+    // Rolling frame-rate measurement. Counted here, in the pull loop, because
+    // this is the only place every delivered frame is seen.
+    let mut fps_frames: u32 = 0;
+    let mut fps_since = Instant::now();
+    let mut live_fps: f64 = 0.0;
     // A geometry change replaces the device handle, and a fresh handle has
     // none of these — track the live values so they can be re-applied.
     let mut cur_exp = exposure_us;
@@ -2802,17 +2856,34 @@ fn worker(
     while !stop.load(Ordering::SeqCst) {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                // Exposure, gain and auto-exposure are LATCHED while a
+                // recording is pending or active. Every one of these is a
+                // driver-side reconfiguration, and issuing one mid-scan is
+                // what wedged the stream. The value is still remembered, so
+                // it takes effect when the recording ends.
                 FocusCmd::Exposure(e) => {
                     cur_exp = e;
-                    cam.set_exposure_us(e).ok();
+                    if capture_locked(&pending_ser, &active_ser) {
+                        crate::applog!("camera: exposure {e} us deferred until the capture ends");
+                    } else {
+                        cam.set_exposure_us(e).ok();
+                    }
                 }
                 FocusCmd::Gain(g) => {
                     cur_gain = g;
-                    cam.set_gain(g).ok();
+                    if capture_locked(&pending_ser, &active_ser) {
+                        crate::applog!("camera: gain {g} deferred until the capture ends");
+                    } else {
+                        cam.set_gain(g).ok();
+                    }
                 }
                 FocusCmd::AutoExposure(on) => {
                     cur_auto = on;
-                    cam.set_auto_exposure(on).ok();
+                    if capture_locked(&pending_ser, &active_ser) {
+                        crate::applog!("camera: auto-exposure {on} deferred until the capture ends");
+                    } else {
+                        cam.set_auto_exposure(on).ok();
+                    }
                 }
                 FocusCmd::Dispersion(h) => disp_h = h,
                 FocusCmd::LiveRoi {
@@ -2927,6 +2998,11 @@ fn worker(
                     // No ROI restore: see StartSer. The sensor keeps the
                     // geometry the user chose.
                     let pending = pending_ser.take();
+                    // Anything the user changed while the capture held the
+                    // lock lands now, with no frames at risk.
+                    cam.set_auto_exposure(cur_auto).ok();
+                    cam.set_exposure_us(cur_exp).ok();
+                    cam.set_gain(cur_gain).ok();
                     if let Some(active) = active_ser.take() {
                         let finished = finish_ser_message(active);
                         let preview = cam.resume_preview();
@@ -2965,6 +3041,13 @@ fn worker(
                 if stalled > 0 {
                     crate::applog!("camera: frames resumed after {stalled}s");
                     stalled = 0;
+                }
+                fps_frames += 1;
+                let window = fps_since.elapsed();
+                if window >= std::time::Duration::from_millis(1000) {
+                    live_fps = fps_frames as f64 / window.as_secs_f64();
+                    fps_frames = 0;
+                    fps_since = Instant::now();
                 }
                 if let Some(request) = pending_ser.take() {
                     let (y0, height) = match request.hw_roi_y0 {
@@ -3032,10 +3115,19 @@ fn worker(
                             // Say it once, the moment it starts: a scan with
                             // gaps is worth knowing about while it is still
                             // possible to slow the camera down.
-                            let _ = tx.send(FocusMsg::Error(format!(
+                            //
+                            // A NOTE, never an Error. `write_frame` returns
+                            // false when the writer's bounded queue is
+                            // momentarily full — transient backpressure, not a
+                            // dead camera. Sent as an Error the app tore the
+                            // whole stream down (`stop()`), so one late frame
+                            // as the disc lit the slit ended the scan and left
+                            // the device wedged. The scan continues with a gap.
+                            let _ = tx.send(FocusMsg::Note(
                                 "disk cannot keep up at this frame rate — frames are being dropped. \
                                  Lower the frame rate (longer exposure) or shrink the capture band."
-                            )));
+                                    .to_owned(),
+                            ));
                         }
                     }
                 }
@@ -3113,6 +3205,7 @@ fn worker(
                     peak,
                     full_w: frame.width,
                     full_h: frame.height,
+                    live_fps,
                     cur_exposure,
                     cur_gain,
                 });
@@ -3200,6 +3293,12 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
         }
         Err(error) => FocusMsg::RecordingError(error.to_string()),
     }
+}
+
+/// Is a capture pending or running? While it is, sensor-side settings are
+/// latched: a driver reconfiguration mid-scan is what stalls the stream.
+fn capture_locked(pending: &Option<SerRequest>, active: &Option<ActiveSer>) -> bool {
+    pending.is_some() || active.is_some()
 }
 
 fn full_frame_roi(info: &CameraInfo) -> Roi {
@@ -3527,6 +3626,7 @@ mod tests {
             peak: 0.0,
             full_w: 0,
             full_h: 0,
+            live_fps: 0.0,
             cur_exposure: None,
             cur_gain: None,
             slit_cut: Vec::new(),

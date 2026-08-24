@@ -20,3 +20,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ureq = { version = "3.3", default-features = false, features = ["native-tls"] }
 serialport = { version = "4.7", default-features = false }
 webbrowser = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

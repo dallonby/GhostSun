@@ -11,6 +11,8 @@ mod focus;
 mod focusmetrics;
 mod gong;
 mod mount;
+mod process;
+mod storage;
 mod vcurve;
 
 use eframe::egui;
@@ -95,6 +97,7 @@ enum ViewMode {
     Focus,
     Mount,
     Acquire,
+    Process,
 }
 
 enum Job {
@@ -168,6 +171,9 @@ struct App {
     focus: focus::FocusState,
     mount: mount::MountState,
     acquire: acquire::AcquireState,
+    process: process::ProcessState,
+    /// A tab switch held back because it would have killed a live scan.
+    pending_mode: Option<ViewMode>,
 }
 
 impl App {
@@ -205,6 +211,8 @@ impl App {
             focus: focus::FocusState::default(),
             mount: mount::MountState::default(),
             acquire: acquire::AcquireState::default(),
+            process: process::ProcessState::default(),
+            pending_mode: None,
         }
     }
 
@@ -253,6 +261,100 @@ impl App {
                 Err(e) => self.log.push(format!("PNG load failed: {e}")),
             },
             _ => self.log.push(format!("unsupported file type: {ext}")),
+        }
+    }
+
+    /// Move to another tab, running every enter/leave side effect.
+    ///
+    /// One place, because the confirmation path switches tabs too, and a second
+    /// copy would drift — the camera would stop without the next tab ever being
+    /// told it had been entered.
+    fn switch_mode(&mut self, target: ViewMode) {
+        if target == self.mode {
+            return;
+        }
+        // leaving Focus: stop the camera stream
+        if self.mode == ViewMode::Focus
+            && !matches!(target, ViewMode::Mount | ViewMode::Acquire)
+        {
+            self.focus.stop();
+        }
+        if self.mode == ViewMode::Mount {
+            self.mount.leave_tab(&mut self.focus);
+        }
+        if self.mode == ViewMode::Acquire {
+            self.acquire.leave_tab(&mut self.focus, &mut self.mount);
+        }
+        // entering Focus: discover cameras once
+        if target == ViewMode::Focus && self.focus.cameras.is_empty() {
+            self.focus.refresh_cameras();
+        }
+        if target == ViewMode::Mount {
+            self.mount.enter_tab(&mut self.focus);
+        }
+        if target == ViewMode::Acquire {
+            self.acquire.enter_tab(&mut self.focus);
+        }
+        self.mode = target;
+        self.texture = None;
+        self.tex_mode = None;
+    }
+
+    /// Ask before a tab switch throws away a scan that is still running.
+    fn leave_acquire_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.pending_mode else {
+            return;
+        };
+        if !self.acquire.run_is_live() {
+            // It finished on its own while the dialog was open, so the switch
+            // costs nothing now: just make it.
+            self.pending_mode = None;
+            self.switch_mode(target);
+            return;
+        }
+        let detail = self.acquire.stop_consequences();
+        let mut open = true;
+        let mut leave = false;
+        let mut stay = false;
+        egui::Window::new("A scan is still running")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(430.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Leaving the Acquire tab stops it.");
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(detail));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Stay on Acquire")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(120, 90, 30)),
+                        )
+                        .clicked()
+                    {
+                        stay = true;
+                    }
+                    if ui.button("Stop the scan and leave").clicked() {
+                        leave = true;
+                    }
+                });
+            });
+        if leave {
+            self.acquire.force_stop(
+                &mut self.focus,
+                &mut self.mount,
+                "Acquisition stopped when leaving the tab",
+            );
+            self.pending_mode = None;
+            self.switch_mode(target);
+        } else if stay || !open {
+            self.pending_mode = None;
         }
     }
 
@@ -580,7 +682,7 @@ impl App {
                     return;
                 }
             }
-            ViewMode::Focus | ViewMode::Mount | ViewMode::Acquire => return,
+            ViewMode::Focus | ViewMode::Mount | ViewMode::Acquire | ViewMode::Process => return,
         };
         self.texture = Some(ctx.load_texture(
             "main",
@@ -669,6 +771,18 @@ fn style(ctx: &egui::Context) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_jobs();
+        self.leave_acquire_confirmation(ctx);
+        if self.mode == ViewMode::Process {
+            if let Some(output) = self.process.poll(ctx) {
+                self.set_loaded(
+                    output.image,
+                    None,
+                    None,
+                    output.name,
+                    Some(output.source_ser),
+                );
+            }
+        }
         if self.mode == ViewMode::Focus {
             self.focus.poll(ctx);
         } else if self.mode == ViewMode::Mount {
@@ -766,34 +880,20 @@ impl eframe::App for App {
                             ui.selectable_value(&mut mode, ViewMode::Color, "Hα Color");
                             ui.selectable_value(&mut mode, ViewMode::Mount, "Mount");
                             ui.selectable_value(&mut mode, ViewMode::Acquire, "Acquire");
+                            ui.selectable_value(&mut mode, ViewMode::Process, "Process");
                             ui.selectable_value(&mut mode, ViewMode::Focus, "Focus");
+                            if mode != self.mode
+                                && self.mode == ViewMode::Acquire
+                                && self.acquire.run_is_live()
+                            {
+                                // Leaving the Acquire tab aborts the run. That
+                                // used to happen silently on a stray tab click,
+                                // in the middle of minutes of sky. Ask first.
+                                self.pending_mode = Some(mode);
+                                mode = self.mode;
+                            }
                             if mode != self.mode {
-                                // leaving Focus: stop the camera stream
-                                if self.mode == ViewMode::Focus
-                                    && !matches!(mode, ViewMode::Mount | ViewMode::Acquire)
-                                {
-                                    self.focus.stop();
-                                }
-                                if self.mode == ViewMode::Mount {
-                                    self.mount.leave_tab(&mut self.focus);
-                                }
-                                if self.mode == ViewMode::Acquire {
-                                    self.acquire
-                                        .leave_tab(&mut self.focus, &mut self.mount);
-                                }
-                                // entering Focus: discover cameras once
-                                if mode == ViewMode::Focus && self.focus.cameras.is_empty() {
-                                    self.focus.refresh_cameras();
-                                }
-                                if mode == ViewMode::Mount {
-                                    self.mount.enter_tab(&mut self.focus);
-                                }
-                                if mode == ViewMode::Acquire {
-                                    self.acquire.enter_tab(&mut self.focus);
-                                }
-                                self.mode = mode;
-                                self.texture = None;
-                                self.tex_mode = None;
+                                self.switch_mode(mode);
                             }
                         },
                     );
@@ -823,6 +923,10 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         self.mount.controls_ui(ui, &mut self.focus);
                     });
+                return;
+            }
+            if self.mode == ViewMode::Process {
+                // The review grid wants the width; it lives in the main panel.
                 return;
             }
             if self.mode == ViewMode::Acquire {
@@ -1082,6 +1186,10 @@ impl eframe::App for App {
                 }
                 if self.mode == ViewMode::Mount {
                     self.mount.view_ui(ui, ctx, &mut self.focus);
+                    return;
+                }
+                if self.mode == ViewMode::Process {
+                    self.process.ui(ui, ctx);
                     return;
                 }
                 if self.mode == ViewMode::Acquire {
