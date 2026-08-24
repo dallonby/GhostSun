@@ -3093,14 +3093,24 @@ fn worker(
                     } else {
                         Some(current_roi.y)
                     };
+                    // Exposure/gain/speed AS THE CAMERA REPORTS THEM, not as we
+                    // last set them. The delivered rate has been observed to sit
+                    // at one of two exact frame periods from one scan to the
+                    // next with nothing in the app touching the camera between
+                    // them, so the state at each capture start is worth a line
+                    // in the log to settle what actually changes.
                     crate::applog!(
-                        "ser: start {} (sensor {}x{}+{}+{}, {})",
+                        "ser: start {} (sensor {}x{}+{}+{}, {}) exposure {:?} us, gain {:?}, speed {:?}, live {:.1} fps",
                         path.display(),
                         current_roi.w,
                         current_roi.h,
                         current_roi.x,
                         current_roi.y,
-                        if hw_roi_y0.is_some() { "hardware band" } else { "software crop" }
+                        if hw_roi_y0.is_some() { "hardware band" } else { "software crop" },
+                        cam.current_exposure_us(),
+                        cam.current_gain(),
+                        cam.speed_level(),
+                        live_fps,
                     );
                     pending_ser = Some(SerRequest {
                         path,

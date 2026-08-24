@@ -260,12 +260,25 @@ impl SerSummary {
     }
 }
 
-/// Per-frame UTC ticks for the trailer. Prefers the camera clock when every
-/// frame has one and it is strictly increasing: the pairing with the smallest
-/// host-minus-device lag is the best estimate of the clock offset (host stamps
-/// can only be late, never early), so the constant USB latency floor is all
-/// that remains. Otherwise host stamps, monotonized so an NTP step can never
-/// send the trailer backwards in time.
+/// Per-frame UTC ticks for the trailer.
+///
+/// The camera clock is preferred when every frame carries one and it is
+/// strictly increasing, because its SPACING is clean where host stamps jitter
+/// by whatever the USB stack and scheduler were doing.
+///
+/// Its SCALE, however, cannot be assumed. The field is documented in
+/// microseconds, but on real hardware it has been measured running 1.8x slow
+/// against the wall clock: eight consecutive scans reported ~708 fps on the
+/// camera clock and ~385 fps on host stamps, and cross-checking each scan's
+/// span against the gap to the next scan's first frame showed the camera-clock
+/// spans short by exactly that factor (an "impossible" 20 s of dead air
+/// between scans where host-clocked ones showed 2 s). Anchoring only the
+/// offset — as this did — leaves that error in the file, so every duration and
+/// frame rate derived from it is wrong.
+///
+/// So fit BOTH scale and offset against the host stamps: keep the camera's
+/// spacing, take the host's time base. The offset is still the minimum
+/// residual rather than the mean, because a host stamp can only ever be late.
 fn trailer_ticks(times: &[(i64, Option<u64>)]) -> (Vec<i64>, bool) {
     let device: Option<Vec<i64>> = times
         .iter()
@@ -273,22 +286,98 @@ fn trailer_ticks(times: &[(i64, Option<u64>)]) -> (Vec<i64>, bool) {
         .collect();
     if let Some(dev) = device {
         if dev.len() >= 2 && dev.windows(2).all(|w| w[1] > w[0]) {
-            let offset = times
-                .iter()
-                .zip(&dev)
-                .map(|(t, &d)| t.0 - d)
-                .min()
-                .unwrap_or(0);
-            return (dev.iter().map(|&d| d + offset).collect(), true);
+            if let Some(fitted) = device_on_host_timebase(times, &dev) {
+                return (fitted, true);
+            }
         }
     }
+    (monotonic_host(times), false)
+}
+
+/// Map the camera clock onto the host time base, preserving its spacing.
+///
+/// `None` when the fit is degenerate or the implied rate is not credible, in
+/// which case the caller falls back to host stamps: a bad fit would be worse
+/// than the jitter it set out to remove.
+fn device_on_host_timebase(times: &[(i64, Option<u64>)], dev: &[i64]) -> Option<Vec<i64>> {
+    let n = dev.len();
+    if n < 2 {
+        return None;
+    }
+    // EVERYTHING relative to the first frame. .NET ticks are ~6.4e17 today,
+    // where one f64 ulp is 128 ticks (12.8 us) — doing this arithmetic on
+    // absolute values quantises the whole trailer to that step. Offsets from
+    // the first frame are at most a few times 1e8 for a scan of any length,
+    // which f64 carries exactly, and the absolute anchor stays an i64.
+    let dev0 = dev[0];
+    let host0 = times[0].0;
+    let x: Vec<f64> = dev.iter().map(|&d| (d - dev0) as f64).collect();
+    let y: Vec<f64> = times.iter().map(|t| (t.0 - host0) as f64).collect();
+
+    let mean_x = x.iter().sum::<f64>() / n as f64;
+    let mean_y = y.iter().sum::<f64>() / n as f64;
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    for (xi, yi) in x.iter().zip(&y) {
+        let dx = xi - mean_x;
+        sxx += dx * dx;
+        sxy += dx * (yi - mean_y);
+    }
+    if sxx <= 0.0 {
+        return None;
+    }
+    // Least squares for the rate. Host stamps are late by a variable latency,
+    // never early, so this slightly under-estimates — by parts in a thousand,
+    // against a scale error measured in tens of percent.
+    let fitted = sxy / sxx;
+    // The field is DOCUMENTED in microseconds, so 1.0 is the prior and it is
+    // only overridden on strong evidence. Host latency jitter is a few ms; over
+    // a short clip that is a large share of the span and the fit is noise, so a
+    // rate is believed only from a long recording, and only when it is far
+    // enough from 1.0 to be a real scale error rather than fitted jitter.
+    let host_span = (times[n - 1].0 - host0) as f64 / TICKS_PER_SECOND as f64;
+    let credible = n >= 64 && host_span >= 1.0 && fitted.is_finite();
+    let scale = if credible && (fitted - 1.0).abs() > 0.02 {
+        fitted
+    } else {
+        1.0
+    };
+    // A camera clock an order of magnitude out in either direction is not a
+    // clock we understand; take the host stamps instead of inventing times.
+    if !(0.1..=10.0).contains(&scale) {
+        return None;
+    }
+
+    // Scaled offsets from the first frame, as integers.
+    let scaled: Vec<i64> = x.iter().map(|xi| (scale * xi).round() as i64).collect();
+    // Host stamps can only be late, so the smallest residual is the pairing
+    // with the least latency and the best estimate of the true start.
+    let anchor = times
+        .iter()
+        .zip(&scaled)
+        .map(|(t, &s)| t.0 - s)
+        .min()?;
+
+    // Compressing the scale can tie adjacent frames; the trailer only has to
+    // be non-decreasing.
+    let mut out = Vec::with_capacity(n);
+    let mut last = i64::MIN;
+    for s in scaled {
+        last = last.max(anchor + s);
+        out.push(last);
+    }
+    Some(out)
+}
+
+/// Host stamps, monotonized so an NTP step cannot send the trailer backwards.
+fn monotonic_host(times: &[(i64, Option<u64>)]) -> Vec<i64> {
     let mut out = Vec::with_capacity(times.len());
     let mut last = i64::MIN;
     for t in times {
         last = last.max(t.0);
         out.push(last);
     }
-    (out, false)
+    out
 }
 
 /// Incremental mono16 SER writer for live acquisition.
@@ -581,6 +670,99 @@ mod tests {
         assert_eq!(ts[0], host0 - 10_000);
         assert_eq!(reader.scan_utc_ticks(), (ts[0], ts[6]));
         assert_eq!(reader.scan_mid_utc_ticks(), ts[0] + (ts[6] - ts[0]) / 2);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_slow_camera_clock_is_rescaled_onto_the_host_time_base() {
+        // The measured hardware fault: the camera clock advanced 1413 us per
+        // frame where the wall clock advanced 2544, so the file claimed ~708
+        // fps for a camera really running ~393. Spacing is the camera's; the
+        // RATE has to be the host's.
+        let path = temp_ser("slowclock");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        let n = 4000usize;
+        for i in 0..n {
+            let dev = 1_000_000 + 1413 * i as u64;
+            // Real time advances 2544 us per frame, plus a little late jitter.
+            let real_us = 2544 * i as u64 + (i as u64 % 7) * 120;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(real_us),
+                    device_us: Some(dev),
+                },
+            )
+            .unwrap();
+        }
+        let summary = rec.finish().unwrap();
+        assert!(summary.device_clock, "camera spacing should still be used");
+        let fps = summary.fps().unwrap();
+        assert!((fps - 393.0).abs() < 2.0, "fps {fps} — should follow the wall clock");
+
+        let reader = SerReader::open(&path).unwrap();
+        let ts = reader.timestamps.clone().unwrap();
+        // Still perfectly even: the camera's spacing survived the rescale.
+        let steps: Vec<i64> = ts.windows(2).map(|w| w[1] - w[0]).collect();
+        let lo = *steps.iter().min().unwrap();
+        let hi = *steps.iter().max().unwrap();
+        assert!(hi - lo <= 1, "spacing should stay jitter-free: {lo}..{hi}");
+        // And the duration is the real one, not the camera's compressed view.
+        let span = (ts[n - 1] - ts[0]) as f64 / TICKS_PER_SECOND as f64;
+        assert!((span - 2544.0 * (n as f64 - 1.0) / 1e6).abs() < 0.1, "span {span}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_correct_camera_clock_is_left_alone() {
+        // A camera whose microseconds really are microseconds must not be
+        // "corrected" by fitting to host jitter.
+        let path = temp_ser("goodclock");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        let n = 2000usize;
+        for i in 0..n {
+            let dev = 500_000 + 2000 * i as u64;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(2000 * i as u64 + (i as u64 % 5) * 300),
+                    device_us: Some(dev),
+                },
+            )
+            .unwrap();
+        }
+        let summary = rec.finish().unwrap();
+        let fps = summary.fps().unwrap();
+        assert!((fps - 500.0).abs() < 0.5, "fps {fps}");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn trailer_times_are_not_quantised_by_float_precision() {
+        // .NET ticks are ~6.4e17, where one f64 ulp is 128 ticks. Doing the
+        // fit on absolute values silently rounded every frame to 12.8 us.
+        let path = temp_ser("precision");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        for i in 0..200u64 {
+            let dev = 1_000_000 + 1000 * i;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(dev + 2000),
+                    device_us: Some(dev),
+                },
+            )
+            .unwrap();
+        }
+        rec.finish().unwrap();
+        let reader = SerReader::open(&path).unwrap();
+        let ts = reader.timestamps.clone().unwrap();
+        for w in ts.windows(2) {
+            assert_eq!(w[1] - w[0], 10_000, "1 ms steps must survive exactly");
+        }
         std::fs::remove_file(path).unwrap();
     }
 

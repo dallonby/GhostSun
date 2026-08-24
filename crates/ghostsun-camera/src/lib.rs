@@ -200,6 +200,15 @@ pub trait Camera: Send {
     fn current_gain(&mut self) -> Option<u16> {
         None
     }
+    /// Frame-speed level and its ceiling, when the backend exposes them.
+    ///
+    /// Purely diagnostic. The delivered frame rate has been seen to sit at one
+    /// of two exact periods across scans with nothing in the app touching the
+    /// camera in between, and the speed level is one of the few things that
+    /// could do that without our knowledge.
+    fn speed_level(&mut self) -> Option<(u16, u32)> {
+        None
+    }
     fn set_roi(&mut self, roi: Roi) -> Result<()>;
     /// Request 8- or 16-bit mono readout. Default is 16-bit. Must be set while
     /// stopped; backends that only support 16-bit return an error for 8.

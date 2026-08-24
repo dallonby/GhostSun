@@ -166,7 +166,15 @@ struct Api {
     put_roi: FnPutRoi,
     get_final_size: FnGetFinalSize,
     put_real_time: Option<FnPutRealTime>,
+    /// Frame-speed level and its ceiling. Read-only here: GhostSun never sets
+    /// them, so reporting them is the only way to tell whether the SDK moved
+    /// the camera to a slower level behind our back.
+    get_speed: Option<FnGetSpeed>,
+    get_max_speed: Option<FnGetMaxSpeed>,
 }
+
+type FnGetSpeed = unsafe extern "C" fn(HToupcam, *mut c_ushort) -> c_int;
+type FnGetMaxSpeed = unsafe extern "C" fn(HToupcam) -> c_uint;
 
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> crate::Result<T> {
     let s: Symbol<T> = lib
@@ -275,6 +283,8 @@ impl Api {
             put_roi: sym(&lib, b"Toupcam_put_Roi")?,
             get_final_size: sym(&lib, b"Toupcam_get_FinalSize")?,
             put_real_time: optional_sym(&lib, b"Toupcam_put_RealTime"),
+            get_speed: optional_sym(&lib, b"Toupcam_get_Speed"),
+            get_max_speed: optional_sym(&lib, b"Toupcam_get_MaxSpeed"),
             _lib: lib,
         })
     }
@@ -623,6 +633,16 @@ impl Camera for ToupcamCam {
         } else {
             None
         }
+    }
+
+    fn speed_level(&mut self) -> Option<(u16, u32)> {
+        let get = self.api.get_speed?;
+        let mut level: c_ushort = 0;
+        if unsafe { get(self.h, &mut level) } < 0 {
+            return None;
+        }
+        let max = self.api.get_max_speed.map(|f| unsafe { f(self.h) }).unwrap_or(0);
+        Some((level, max))
     }
 
     fn set_roi(&mut self, roi: Roi) -> crate::Result<()> {
