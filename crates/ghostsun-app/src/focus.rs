@@ -3407,6 +3407,12 @@ fn finish_ser_message(active: ActiveSer) -> FocusMsg {
                     0.0
                 }
             });
+            if summary.device_gaps > 0 {
+                crate::applog!(
+                    "ser: {} frame(s) arrived without a usable camera timestamp",
+                    summary.device_gaps
+                );
+            }
             FocusMsg::RecordingStopped {
                 path,
                 frames,

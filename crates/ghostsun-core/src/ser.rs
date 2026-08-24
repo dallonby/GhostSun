@@ -246,6 +246,11 @@ pub struct SerSummary {
     pub last_utc_ticks: Option<i64>,
     /// Trailer times come from the camera clock (true) or host stamps (false).
     pub device_clock: bool,
+    /// Frames the camera did not stamp usably, which fell back to host times.
+    ///
+    /// Non-zero says the camera clock is dropping frames' timestamps — the
+    /// thing that used to demote a whole recording to host stamps.
+    pub device_gaps: usize,
 }
 
 impl SerSummary {
@@ -279,19 +284,39 @@ impl SerSummary {
 /// So fit BOTH scale and offset against the host stamps: keep the camera's
 /// spacing, take the host's time base. The offset is still the minimum
 /// residual rather than the mean, because a host stamp can only ever be late.
-fn trailer_ticks(times: &[(i64, Option<u64>)]) -> (Vec<i64>, bool) {
-    let device: Option<Vec<i64>> = times
+fn trailer_ticks(times: &[(i64, Option<u64>)]) -> (Vec<i64>, bool, usize) {
+    let dev: Vec<Option<i64>> = times
         .iter()
         .map(|t| t.1.map(|us| (us.min(i64::MAX as u64 / 10) as i64) * 10))
         .collect();
-    if let Some(dev) = device {
-        if dev.len() >= 2 && dev.windows(2).all(|w| w[1] > w[0]) {
-            if let Some(fitted) = device_on_host_timebase(times, &dev) {
-                return (fitted, true);
+    // A frame is usable if it has a stamp that advances on the last usable
+    // one. Both tests used to be all-or-nothing — collecting into an
+    // Option<Vec> and requiring every pair to increase — so ONE frame out of
+    // fifteen thousand arriving without FRAMEINFO_FLAG_TIMESTAMP, or one
+    // repeated tick, threw the camera clock away for the whole recording and
+    // left the file on jittery host stamps. Tolerate the odd bad frame and
+    // keep the clock.
+    let mut usable = vec![false; dev.len()];
+    let mut last = i64::MIN;
+    for (i, d) in dev.iter().enumerate() {
+        if let Some(d) = *d {
+            if d > last {
+                usable[i] = true;
+                last = d;
             }
         }
     }
-    (monotonic_host(times), false)
+    let good = usable.iter().filter(|&&u| u).count();
+    // A handful of bad frames is noise; a large share of them means the clock
+    // is not to be trusted at all. Note this is only about WHETHER to use the
+    // camera clock — deciding whether to believe a rate other than the
+    // documented microsecond is a separate, stricter judgement in the fit.
+    if good >= 2 && good * 10 >= dev.len() * 9 {
+        if let Some(fitted) = device_on_host_timebase(times, &dev, &usable) {
+            return (fitted, true, dev.len() - good);
+        }
+    }
+    (monotonic_host(times), false, 0)
 }
 
 /// Map the camera clock onto the host time base, preserving its spacing.
@@ -299,29 +324,36 @@ fn trailer_ticks(times: &[(i64, Option<u64>)]) -> (Vec<i64>, bool) {
 /// `None` when the fit is degenerate or the implied rate is not credible, in
 /// which case the caller falls back to host stamps: a bad fit would be worse
 /// than the jitter it set out to remove.
-fn device_on_host_timebase(times: &[(i64, Option<u64>)], dev: &[i64]) -> Option<Vec<i64>> {
+fn device_on_host_timebase(
+    times: &[(i64, Option<u64>)],
+    dev: &[Option<i64>],
+    usable: &[bool],
+) -> Option<Vec<i64>> {
     let n = dev.len();
-    if n < 2 {
-        return None;
-    }
-    // EVERYTHING relative to the first frame. .NET ticks are ~6.4e17 today,
+    // EVERYTHING relative to the first usable frame. .NET ticks are ~6.4e17,
     // where one f64 ulp is 128 ticks (12.8 us) — doing this arithmetic on
     // absolute values quantises the whole trailer to that step. Offsets from
     // the first frame are at most a few times 1e8 for a scan of any length,
     // which f64 carries exactly, and the absolute anchor stays an i64.
-    let dev0 = dev[0];
-    let host0 = times[0].0;
-    let x: Vec<f64> = dev.iter().map(|&d| (d - dev0) as f64).collect();
-    let y: Vec<f64> = times.iter().map(|t| (t.0 - host0) as f64).collect();
+    let first = (0..n).find(|&i| usable[i])?;
+    let dev0 = dev[first]?;
 
-    let mean_x = x.iter().sum::<f64>() / n as f64;
-    let mean_y = y.iter().sum::<f64>() / n as f64;
+    let pairs: Vec<(f64, f64)> = (0..n)
+        .filter(|&i| usable[i])
+        .filter_map(|i| Some(((dev[i]? - dev0) as f64, (times[i].0 - times[first].0) as f64)))
+        .collect();
+    if pairs.len() < 2 {
+        return None;
+    }
+    let count = pairs.len() as f64;
+    let mean_x = pairs.iter().map(|p| p.0).sum::<f64>() / count;
+    let mean_y = pairs.iter().map(|p| p.1).sum::<f64>() / count;
     let mut sxx = 0.0;
     let mut sxy = 0.0;
-    for (xi, yi) in x.iter().zip(&y) {
-        let dx = xi - mean_x;
+    for (x, y) in &pairs {
+        let dx = x - mean_x;
         sxx += dx * dx;
-        sxy += dx * (yi - mean_y);
+        sxy += dx * (y - mean_y);
     }
     if sxx <= 0.0 {
         return None;
@@ -335,8 +367,8 @@ fn device_on_host_timebase(times: &[(i64, Option<u64>)], dev: &[i64]) -> Option<
     // a short clip that is a large share of the span and the fit is noise, so a
     // rate is believed only from a long recording, and only when it is far
     // enough from 1.0 to be a real scale error rather than fitted jitter.
-    let host_span = (times[n - 1].0 - host0) as f64 / TICKS_PER_SECOND as f64;
-    let credible = n >= 64 && host_span >= 1.0 && fitted.is_finite();
+    let host_span = (times[n - 1].0 - times[0].0) as f64 / TICKS_PER_SECOND as f64;
+    let credible = pairs.len() >= 64 && host_span >= 1.0 && fitted.is_finite();
     let scale = if credible && (fitted - 1.0).abs() > 0.02 {
         fitted
     } else {
@@ -348,22 +380,24 @@ fn device_on_host_timebase(times: &[(i64, Option<u64>)], dev: &[i64]) -> Option<
         return None;
     }
 
-    // Scaled offsets from the first frame, as integers.
-    let scaled: Vec<i64> = x.iter().map(|xi| (scale * xi).round() as i64).collect();
     // Host stamps can only be late, so the smallest residual is the pairing
     // with the least latency and the best estimate of the true start.
-    let anchor = times
-        .iter()
-        .zip(&scaled)
-        .map(|(t, &s)| t.0 - s)
+    let anchor = (0..n)
+        .filter(|&i| usable[i])
+        .filter_map(|i| Some(times[i].0 - (scale * (dev[i]? - dev0) as f64).round() as i64))
         .min()?;
 
-    // Compressing the scale can tie adjacent frames; the trailer only has to
-    // be non-decreasing.
+    // Frames the camera did not stamp keep their host time; the rest get the
+    // camera's spacing on the host's base. Compressing the scale can tie
+    // adjacent frames, and the trailer only has to be non-decreasing.
     let mut out = Vec::with_capacity(n);
     let mut last = i64::MIN;
-    for s in scaled {
-        last = last.max(anchor + s);
+    for i in 0..n {
+        let value = match (usable[i], dev[i]) {
+            (true, Some(d)) => anchor + (scale * (d - dev0) as f64).round() as i64,
+            _ => times[i].0,
+        };
+        last = last.max(value);
         out.push(last);
     }
     Some(out)
@@ -474,6 +508,7 @@ impl SerRecorder {
             first_utc_ticks: None,
             last_utc_ticks: None,
             device_clock: false,
+            device_gaps: 0,
         }))
     }
 
@@ -490,7 +525,7 @@ impl SerRecorder {
         self.file.flush()?;
         // Trailer: one UTC tick count per frame, directly after the image
         // data. Position explicitly rather than trusting the cursor.
-        let (ticks, device_clock) = trailer_ticks(&self.times);
+        let (ticks, device_clock, device_gaps) = trailer_ticks(&self.times);
         let image_end = HEADER_SIZE as u64 + (self.frame_count * self.width * self.height * 2) as u64;
         self.file.seek(SeekFrom::Start(image_end))?;
         let mut trailer = Vec::with_capacity(ticks.len() * 8);
@@ -513,6 +548,7 @@ impl SerRecorder {
             first_utc_ticks: ticks.first().copied(),
             last_utc_ticks: ticks.last().copied(),
             device_clock,
+            device_gaps,
         });
         self.finished = true;
         Ok(())
@@ -712,6 +748,107 @@ mod tests {
         let span = (ts[n - 1] - ts[0]) as f64 / TICKS_PER_SECOND as f64;
         assert!((span - 2544.0 * (n as f64 - 1.0) / 1e6).abs() < 0.1, "span {span}");
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Build a recording whose camera stamps can be perturbed frame by frame.
+    fn record_with(tag: &str, n: usize, bad: &dyn Fn(usize) -> Option<u64>) -> SerSummary {
+        let path = temp_ser(tag);
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        for i in 0..n {
+            let nominal = 1_000_000 + 2000 * i as u64;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(nominal + (i as u64 % 5) * 200),
+                    device_us: bad(i).or(Some(nominal)),
+                },
+            )
+            .unwrap();
+        }
+        let summary = rec.finish().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        summary
+    }
+
+    #[test]
+    fn one_unstamped_frame_does_not_cost_the_camera_clock() {
+        // This is what demoted whole recordings to host stamps: collecting into
+        // an Option<Vec> meant a single None discarded fifteen thousand good
+        // timestamps.
+        let path = temp_ser("onemissing");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        for i in 0..500usize {
+            let nominal = 1_000_000 + 2000 * i as u64;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(nominal),
+                    device_us: if i == 137 { None } else { Some(nominal) },
+                },
+            )
+            .unwrap();
+        }
+        let summary = rec.finish().unwrap();
+        assert!(summary.device_clock, "one missing stamp must not demote the file");
+        assert_eq!(summary.device_gaps, 1);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn one_repeated_tick_does_not_cost_the_camera_clock() {
+        // The other all-or-nothing gate: a single tie failed `all(w[1] > w[0])`.
+        let summary = record_with("onetie", 500, &|i| {
+            if i == 200 { Some(1_000_000 + 2000 * 199) } else { None }
+        });
+        assert!(summary.device_clock, "one repeated tick must not demote the file");
+        assert_eq!(summary.device_gaps, 1);
+    }
+
+    #[test]
+    fn a_mostly_unstamped_recording_falls_back_to_host() {
+        // Tolerance is for the odd bad frame, not for a clock that is broken.
+        let path = temp_ser("mostlymissing");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        for i in 0..500usize {
+            let nominal = 1_000_000 + 2000 * i as u64;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(nominal),
+                    device_us: (i % 4 == 0).then_some(nominal),
+                },
+            )
+            .unwrap();
+        }
+        let summary = rec.finish().unwrap();
+        assert!(!summary.device_clock);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_gap_frame_keeps_the_trailer_ordered() {
+        let path = temp_ser("gaporder");
+        let base = SystemTime::now();
+        let mut rec = SerRecorder::create(&path, 1, 1, "cam", "shg").unwrap();
+        for i in 0..300usize {
+            let nominal = 1_000_000 + 2000 * i as u64;
+            rec.write_frame(
+                &[0u16],
+                FrameTime {
+                    host: base + std::time::Duration::from_micros(nominal + 900),
+                    device_us: if i == 150 { None } else { Some(nominal) },
+                },
+            )
+            .unwrap();
+        }
+        rec.finish().unwrap();
+        let reader = SerReader::open(&path).unwrap();
+        let ts = reader.timestamps.clone().unwrap();
+        assert!(ts.windows(2).all(|w| w[1] >= w[0]), "trailer must never go backwards");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
