@@ -16,5 +16,15 @@ license = "MIT"
 lto = "thin"
 codegen-units = 1
 
+# `cargo build` always uses the dev profile: cargo has no stable way to change
+# the default (`build.profile` is unstable, and `inherits` is rejected on root
+# profiles). So dev mirrors release, and a bare `cargo build` ships release-grade
+# binaries. Note this drops debug-assertions and overflow-checks from dev builds.
 [profile.dev]
-opt-level = 2
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
