@@ -80,6 +80,11 @@ const DEPTH_GATE: f64 = 0.03;
 const DEFAULT_CAPTURE_FRAMES: usize = 40;
 /// Rolling window for the live "lucky" Stage B readout.
 const LUCKY_WINDOW: usize = 90;
+/// Settling time for the live focus readouts.
+///
+/// Long enough that the digits hold still while the micrometer is turned,
+/// short enough that a real focus change is visible before the hand stops.
+const READOUT_TAU: f64 = 0.6;
 /// Fraction of the brightest pixels averaged for the Sun-search signal.
 ///
 /// A literal maximum is too easy for one hot pixel or cosmic ray to win.
@@ -343,6 +348,66 @@ pub struct SearchCameraRestore {
 
 /// Min-hold + rolling history for one measured axis.
 #[derive(Default)]
+/// Display smoothing with a time constant, not a sample count.
+///
+/// These readouts are driven by whatever the camera delivers, and that is not a
+/// fixed rate: a cropped band at 600 fps produces ten times the samples of a
+/// full frame, so an N-sample average settles ten times faster and the number
+/// is unreadable at one rate and sluggish at the other. Deriving the weight
+/// from ELAPSED TIME instead gives the same settling behaviour at any frame
+/// rate — which is the whole point, since the rate changes every time the ROI
+/// or exposure does.
+///
+/// Only the displayed figure is smoothed. Fits, min-holds and captured data
+/// keep the raw per-frame values.
+#[derive(Clone, Copy)]
+struct Smoothed {
+    value: Option<f64>,
+    last: Option<Instant>,
+    /// Seconds to close ~63% of a step.
+    tau: f64,
+}
+
+impl Smoothed {
+    fn new(tau: f64) -> Smoothed {
+        Smoothed {
+            value: None,
+            last: None,
+            tau: tau.max(1e-3),
+        }
+    }
+
+    fn push(&mut self, sample: f64) {
+        if !sample.is_finite() {
+            return;
+        }
+        let now = Instant::now();
+        let dt = self
+            .last
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(f64::INFINITY);
+        self.last = Some(now);
+        match self.value {
+            // A long gap means the reading is stale — restart rather than
+            // creep across from a value that describes a different setup.
+            Some(previous) if dt < self.tau * 20.0 => {
+                let alpha = 1.0 - (-dt / self.tau).exp();
+                self.value = Some(previous + alpha * (sample - previous));
+            }
+            _ => self.value = Some(sample),
+        }
+    }
+
+    fn get(&self) -> Option<f64> {
+        self.value
+    }
+
+    fn reset(&mut self) {
+        self.value = None;
+        self.last = None;
+    }
+}
+
 struct Track {
     min_hold: f64,
     history: VecDeque<f64>,
@@ -443,6 +508,10 @@ pub struct FocusState {
     capture: Option<Capture>,
     lucky_limb: LuckyBuf,
     lucky_struct: LuckyBuf,
+    /// Smoothed copies of the three big live numbers. Display only.
+    smooth_spectral: (Smoothed, Smoothed),
+    smooth_slit: (Smoothed, Smoothed),
+    smooth_tele: Smoothed,
     pub stage_status: String,
     saved: Option<SavedFocus>,
     sel_spectral: Option<Fit>,
@@ -512,6 +581,9 @@ impl Default for FocusState {
             capture: None,
             lucky_limb: LuckyBuf::new(LUCKY_WINDOW),
             lucky_struct: LuckyBuf::new(LUCKY_WINDOW),
+            smooth_spectral: (Smoothed::new(READOUT_TAU), Smoothed::new(READOUT_TAU)),
+            smooth_slit: (Smoothed::new(READOUT_TAU), Smoothed::new(READOUT_TAU)),
+            smooth_tele: Smoothed::new(READOUT_TAU),
             stage_status: String::new(),
             saved: SavedFocus::load(),
             sel_spectral: None,
@@ -614,6 +686,8 @@ impl FocusState {
         // The worker owns the camera handle; when it exits the device is
         // released and reopens full-frame, so a live ROI cannot survive.
         self.live_fps = 0.0;
+        self.smooth_tele.reset();
+        self.reset_holds();
         self.live_roi_active = false;
         self.live_roi_pending = false;
         self.live_roi_y0 = 0;
@@ -805,6 +879,20 @@ impl FocusState {
             }
             self.sel_spectral = spec;
             self.sel_slit = slit;
+            // Only a fit the readout would actually show is fed in; letting a
+            // rejected frame through would drag the number toward noise.
+            for (fit, smooth) in [
+                (&spec, &mut self.smooth_spectral),
+                (&slit, &mut self.smooth_slit),
+            ] {
+                match fit {
+                    Some(f) if f.depth > DEPTH_GATE => {
+                        smooth.0.push(f.fwhm);
+                        smooth.1.push(f.depth);
+                    }
+                    _ => {}
+                }
+            }
 
             // Stage B live readouts: rolling "lucky" percentile, so the number
             // tracks the instrument's ceiling rather than the atmosphere.
@@ -813,6 +901,17 @@ impl FocusState {
             }
             if let Some(sc) = u.structure.all {
                 self.lucky_struct.push(sc);
+            }
+            // Smoothed HERE, as data arrives, rather than at draw time: the
+            // repaint rate is not the measurement rate, and a value advanced by
+            // redraws would settle differently depending on what else the UI
+            // was doing.
+            let want_min = self.tele_metric.want_min();
+            if let Some(decile) = match self.tele_metric {
+                TeleMetric::LimbEdge => self.lucky_limb.lucky(want_min),
+                TeleMetric::Structure => self.lucky_struct.lucky(want_min),
+            } {
+                self.smooth_tele.push(decile);
             }
             self.accumulate_capture(&spec, &slit, &u);
 
@@ -1069,6 +1168,10 @@ impl FocusState {
     fn reset_holds(&mut self) {
         self.track_x.reset();
         self.track_y.reset();
+        self.smooth_spectral.0.reset();
+        self.smooth_spectral.1.reset();
+        self.smooth_slit.0.reset();
+        self.smooth_slit.1.reset();
     }
 
     /// Which geometric track is the spectral one, given the dispersion axis.
@@ -1246,6 +1349,7 @@ impl FocusState {
         self.curve_tele_bot = VCurve::new(want_min);
         self.lucky_limb.clear();
         self.lucky_struct.clear();
+        self.smooth_tele.reset();
     }
 
     fn clear_stage_a(&mut self) {
@@ -1451,6 +1555,10 @@ impl FocusState {
             self.send_cmd(FocusCmd::Dispersion(self.dispersion == DispAxis::Horizontal));
             self.lucky_limb.clear();
             self.lucky_struct.clear();
+            // The axes swap meaning, so every smoothed figure is about to
+            // describe a different measurement.
+            self.smooth_tele.reset();
+            self.reset_holds();
         }
         ui.label(
             egui::RichText::new("Spectral lines run ⊥ to this. Sets only which readout is which.")
@@ -1576,11 +1684,14 @@ impl FocusState {
         };
         let a_per_px = self.dispersion_a_per_px;
 
+        // The big figures are the smoothed ones; the raw fit still decides
+        // whether there is a line to report at all.
         readout(
             ui,
             "Spectral line (dispersion)",
             SPECTRAL_COLOR,
             spectral_fit,
+            self.smooth_spectral,
             spectral_min,
             Some(a_per_px),
         );
@@ -1590,6 +1701,7 @@ impl FocusState {
             "Slit jaws / dust (spatial)",
             SLIT_COLOR,
             slit_fit,
+            self.smooth_slit,
             slit_min,
             None,
         );
@@ -1830,6 +1942,9 @@ impl FocusState {
         });
         if before != self.tele_metric {
             self.retarget_tele_curves();
+            // Limb width and contrast are different quantities in different
+            // units; without this the readout would slide from one to the other.
+            self.smooth_tele.reset();
             self.stage_status = "metric changed — Stage B sweep reset (values not comparable)".into();
         }
         ui.label(
@@ -1849,11 +1964,7 @@ impl FocusState {
         );
 
         ui.add_space(6.0);
-        let want_min = self.tele_metric.want_min();
-        let live = match self.tele_metric {
-            TeleMetric::LimbEdge => self.lucky_limb.lucky(want_min),
-            TeleMetric::Structure => self.lucky_struct.lucky(want_min),
-        };
+        let live = self.smooth_tele.get();
         let n_lucky = match self.tele_metric {
             TeleMetric::LimbEdge => self.lucky_limb.len(),
             TeleMetric::Structure => self.lucky_struct.len(),
@@ -2664,6 +2775,7 @@ fn readout(
     title: &str,
     color: egui::Color32,
     fit: Option<Fit>,
+    smooth: (Smoothed, Smoothed),
     min_hold: f64,
     a_per_px: Option<f64>,
 ) {
@@ -2673,17 +2785,20 @@ fn readout(
             ui.label(egui::RichText::new(title).small().weak());
             match fit {
                 Some(f) if f.depth > DEPTH_GATE => {
+                    let fwhm = smooth.0.get().unwrap_or(f.fwhm);
+                    let depth = smooth.1.get().unwrap_or(f.depth);
                     ui.label(
-                        egui::RichText::new(format!("{:.2} px", f.fwhm))
+                        egui::RichText::new(format!("{fwhm:.2} px"))
                             .size(26.0)
                             .strong()
                             .color(color),
-                    );
+                    )
+                    .on_hover_text(format!("this frame: {:.2} px", f.fwhm));
                     let extra = match a_per_px {
                         Some(a) => {
-                            format!("{:.3} Å   ·   depth {:.0}%", f.fwhm * a, f.depth * 100.0)
+                            format!("{:.3} Å   ·   depth {:.0}%", fwhm * a, depth * 100.0)
                         }
-                        None => format!("depth {:.0}%", f.depth * 100.0),
+                        None => format!("depth {:.0}%", depth * 100.0),
                     };
                     ui.label(egui::RichText::new(extra).small());
                 }
@@ -3611,6 +3726,69 @@ mod tests {
             sigma: fwhm / 2.3548,
             continuum: 1000.0,
         }
+    }
+
+    /// Drive a smoother with `rate` samples/second of a constant value for
+    /// `seconds`, using a synthetic clock so the test does not sleep.
+    fn settle(tau: f64, rate: f64, seconds: f64, target: f64) -> f64 {
+        let dt = 1.0 / rate;
+        let mut value = 0.0f64;
+        let mut t = 0.0;
+        while t < seconds {
+            let alpha = 1.0 - (-dt / tau).exp();
+            value += alpha * (target - value);
+            t += dt;
+        }
+        value
+    }
+
+    #[test]
+    fn smoothing_settles_at_the_same_rate_whatever_the_frame_rate() {
+        // The reason this is time-based. An N-sample average would settle ten
+        // times faster at 600 fps than at 60, so the readout would be unusable
+        // at one rate or the other.
+        let slow = settle(READOUT_TAU, 60.0, READOUT_TAU, 10.0);
+        let fast = settle(READOUT_TAU, 600.0, READOUT_TAU, 10.0);
+        assert!((slow - fast).abs() < 0.05, "{slow} vs {fast}");
+        // One time constant closes ~63% of the step.
+        assert!((slow - 6.32).abs() < 0.2, "{slow}");
+    }
+
+    #[test]
+    fn the_first_sample_is_taken_whole() {
+        // Otherwise the reading crawls up from zero every time it starts.
+        let mut s = Smoothed::new(READOUT_TAU);
+        s.push(4.25);
+        assert_eq!(s.get(), Some(4.25));
+    }
+
+    #[test]
+    fn smoothing_converges_on_a_steady_value() {
+        let mut s = Smoothed::new(0.01);
+        for _ in 0..500 {
+            s.push(7.0);
+        }
+        let got = s.get().unwrap();
+        assert!((got - 7.0).abs() < 1e-3, "{got}");
+    }
+
+    #[test]
+    fn a_reset_reading_starts_clean() {
+        let mut s = Smoothed::new(READOUT_TAU);
+        s.push(3.0);
+        s.reset();
+        assert_eq!(s.get(), None);
+        s.push(9.0);
+        assert_eq!(s.get(), Some(9.0), "a reset value must not creep from the old one");
+    }
+
+    #[test]
+    fn a_bad_sample_is_ignored_rather_than_poisoning_the_reading() {
+        let mut s = Smoothed::new(READOUT_TAU);
+        s.push(2.0);
+        s.push(f64::NAN);
+        s.push(f64::INFINITY);
+        assert_eq!(s.get(), Some(2.0));
     }
 
     fn blank_update() -> FocusUpdate {
