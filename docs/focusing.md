@@ -287,6 +287,66 @@ value, bank a third point, and it will bracket.
 
 ## Stage B — telescope
 
+### ToupTek USB autofocus
+
+GhostSun can control a ToupTek AAF directly through the bundled ToupCam SDK on
+macOS and Windows. AAF devices appear under **ToupTek USB focuser**, separately
+from cameras. No serial port, ASCOM connection or additional macOS driver is
+required. Scanning and connecting read the device without requesting movement.
+
+1. Complete spectrograph focus first. Start the camera, select **B · telescope**
+   and **limb edge**, and place at least one solar boundary in the highlighted
+   region, with dark sky outside it. Set a short, unclipped exposure and turn
+   off auto-exposure. Stop recording before moving the focuser.
+2. Click **Scan USB focusers**, select your AAF and click **Connect focuser**.
+   GhostSun displays its current step position, firmware travel limit and
+   temperature when available.
+3. Set **min** and **max** to mechanical travel limits you have checked on your
+   telescope. These start at zero to require explicit setup; the firmware's
+   maximum is not a measurement of your telescope's safe travel. The current
+   position, every sweep point and the backlash approach must all lie within
+   the entered range. Use **− steps / + steps** for bounded manual jogging.
+4. Choose the **sweep step** and 5, 7, 9 or 11 points. The sweep is centred on
+   the current position. Seven points with a 50-step spacing cover ±150 steps;
+   suitable spacing depends on your focuser gearing and telescope. The exact
+   planned range appears above **Start solar-edge autofocus**. The range is
+   never automatically expanded or silently clipped.
+5. If needed, set **backlash approach** to a known take-up distance. GhostSun
+   approaches the first sample and the final focus from lower step positions;
+   the sweep itself moves in increasing steps. This does not change the AAF's
+   stored backlash settings. Zero means no extra take-up movement.
+6. Click **Start solar-edge autofocus**. At each position GhostSun waits for
+   movement to stop, allows the selected settling time, then collects a fresh
+   burst (30 valid frames by default, over at least one second). It averages
+   the sharpest quarter of the burst and uses the same limb or pair of limbs
+   throughout the run. Camera exposure and gain controls are locked during motion.
+7. A well-bracketed, sufficiently distinct focus minimum is fitted to the sweep.
+   GhostSun moves to it, settles, and takes another burst to verify sharpness.
+   The verified position and edge width appear in the panel, and the measured
+   sweep is plotted beside the preview. Positions and results are also written
+   to the normal GhostSun log. **Save converged settings** saves the verified
+   motor position alongside your spectrograph focus settings.
+
+**STOP FOCUSER**, stopping the camera, leaving Focus, changing focus stage or
+dispersion axis, and closing the app cancel the operation and request a motor
+halt. USB errors, stale camera frames, changed camera settings, movement timeouts
+or insufficient valid limb measurements also stop the run. No automatic return
+move is made after cancellation or failure. A rejected fit leaves the focuser
+at the last reached position; inspect the plotted curve before changing the
+range and starting again. Verification failure is reported as a failure, not a
+successful autofocus. A disconnected focuser requires an explicit reconnect.
+
+This searches for best focus within the configured range; it does not calibrate
+mechanical limits, automatically measure backlash or refocus during acquisition.
+Real seeing, telescope mechanics and thermal drift still determine how repeatable
+the result is. Temperature is currently informational.
+
+For a read-only SDK diagnostic:
+
+```sh
+cargo run --release --locked --package ghostsun-camera --example focuser_probe
+```
+
 Select **B · telescope**. Only run this once Stage A is closed.
 
 ### Pick a metric
@@ -305,6 +365,20 @@ the continuum automatically; the **Continuum cut along the slit** plot shows
 exactly what it is measuring.
 
 ### Sweep the focuser
+
+With **limb edge** selected, the telescope view highlights the detected outer
+solar boundaries in orange and shows enlarged live crops of those regions.
+The spectral/dust plots are hidden in this view. Only the highlighted regions
+contribute to the limb score; interior disc structure is excluded. Each crop
+shows FWHM smoothed over the last 1,000 ms of valid measurements. The outer
+10% at either end are trimmed to suppress brief fit spikes; this affects the
+display only. Autofocus uses the raw measurements, while the main readout retains the burst-based
+best-decile measurement. When both limb fits are valid, their widths are averaged.
+One visible limb is sufficient. Leave dark sky beyond the limb and at least
+12 camera pixels on either side; a boundary at the camera crop edge cannot be
+measured. Detection uses the local transition so dimmer limbs can be measured
+even when the disc centre is much brighter. These are live image enlargements
+without digital sharpening.
 
 The big number is a **best decile** over the last ~90 frames — it tracks your
 optics rather than the seeing, so let it settle for a second or two before

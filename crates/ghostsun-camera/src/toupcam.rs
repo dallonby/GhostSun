@@ -117,7 +117,7 @@ struct FrameInfoV4 {
 type EventCb = unsafe extern "C" fn(c_uint, *mut c_void);
 
 type FnEnumV2 = unsafe extern "C" fn(*mut DeviceV2) -> c_uint;
-type FnOpenByIndex = unsafe extern "C" fn(c_uint) -> HToupcam;
+type FnOpen = unsafe extern "system" fn(*const ToupChar) -> HToupcam;
 type FnClose = unsafe extern "C" fn(HToupcam);
 type FnStartPull = unsafe extern "C" fn(HToupcam, Option<EventCb>, *mut c_void) -> c_int;
 type FnPullV3 =
@@ -149,7 +149,7 @@ const LIBNAME: &str = "toupcam.dll";
 struct Api {
     _lib: Library,
     enum_v2: FnEnumV2,
-    open_by_index: FnOpenByIndex,
+    open: FnOpen,
     close: FnClose,
     start_pull: FnStartPull,
     pull_v3: FnPullV3,
@@ -187,7 +187,7 @@ unsafe fn optional_sym<T: Copy>(lib: &Library, name: &[u8]) -> Option<T> {
     lib.get::<T>(name).ok().map(|symbol| *symbol)
 }
 
-fn candidate_paths() -> Vec<PathBuf> {
+pub(crate) fn candidate_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Ok(p) = std::env::var("GHOSTSUN_TOUPCAM_LIB") {
         v.push(PathBuf::from(p));
@@ -267,7 +267,7 @@ impl Api {
     unsafe fn bind(lib: Library) -> crate::Result<Api> {
         Ok(Api {
             enum_v2: sym(&lib, b"Toupcam_EnumV2")?,
-            open_by_index: sym(&lib, b"Toupcam_OpenByIndex")?,
+            open: sym(&lib, b"Toupcam_Open")?,
             close: sym(&lib, b"Toupcam_Close")?,
             start_pull: sym(&lib, b"Toupcam_StartPullModeWithCallback")?,
             pull_v3: sym(&lib, b"Toupcam_PullImageV3")?,
@@ -323,6 +323,12 @@ pub fn enumerate() -> Vec<CameraInfo> {
     let n = unsafe { (api.enum_v2)(arr.as_mut_ptr()) } as usize;
     let mut out = Vec::new();
     for (i, dev) in arr.iter().enumerate().take(n.min(TOUPCAM_MAX)) {
+        // The same enumeration includes accessories with no image sensor.
+        if !dev.model.is_null()
+            && unsafe { (*dev.model).flag } & (0x0002_0000_0000_0000 | 0x0000_1000_0000_0000) != 0
+        {
+            continue;
+        }
         let name = toup_string(&dev.displayname);
         // res[0] is the largest sensor resolution; used to bound ROI sliders.
         let (mw, mh) = if dev.model.is_null() {
@@ -333,7 +339,7 @@ pub fn enumerate() -> Vec<CameraInfo> {
         };
         out.push(CameraInfo {
             backend: Backend::Toupcam,
-            id: i.to_string(), // opened by enumeration index
+            id: toup_string(&dev.id), // stable across accessory hotplug/reordering
             name: if name.is_empty() {
                 format!("ToupTek camera {i}")
             } else {
@@ -351,10 +357,15 @@ pub fn enumerate() -> Vec<CameraInfo> {
 }
 
 /// Open a handle and apply the options that hold for a whole USB session.
-fn open_handle(api: &Api, index: c_uint) -> crate::Result<HToupcam> {
-    let h = unsafe { (api.open_by_index)(index) };
+fn open_handle(api: &Api, id: &str) -> crate::Result<HToupcam> {
+    if id.is_empty() || id.contains('\0') { return Err(CameraError::NotFound); }
+    #[cfg(target_os = "windows")]
+    let encoded: Vec<ToupChar> = id.encode_utf16().chain(Some(0)).collect();
+    #[cfg(not(target_os = "windows"))]
+    let encoded: Vec<ToupChar> = id.bytes().map(|b| b as ToupChar).chain(Some(0)).collect();
+    let h = unsafe { (api.open)(encoded.as_ptr()) };
     if h.is_null() {
-        return Err(CameraError::Sdk("Toupcam_OpenByIndex returned null".into()));
+        return Err(CameraError::Sdk("Toupcam_Open returned null for the selected camera".into()));
     }
     // Disable auto-exposure — it is ON by default and overrides BOTH manual
     // exposure and gain, making the sliders appear to do nothing.
@@ -382,8 +393,7 @@ fn open_handle(api: &Api, index: c_uint) -> crate::Result<HToupcam> {
 
 pub fn open(info: &CameraInfo) -> crate::Result<Box<dyn Camera>> {
     let api = Api::load()?;
-    let index: c_uint = info.id.parse().map_err(|_| CameraError::NotFound)?;
-    let h = open_handle(&api, index)?;
+    let h = open_handle(&api, &info.id)?;
     // Replace the enumerate-time gain guess with the device's real range
     // (e.g. IMX678-class models allow far more than 1000%).
     let mut info = info.clone();
@@ -756,7 +766,6 @@ impl Camera for ToupcamCam {
     /// stayed dead across a full close/open, needing a physical replug. So a
     /// geometry change goes through a genuinely new handle instead.
     fn reopen(&mut self) -> crate::Result<()> {
-        let index: c_uint = self.info.id.parse().map_err(|_| CameraError::NotFound)?;
         self.stop();
         if !self.h.is_null() {
             unsafe { (self.api.close)(self.h) };
@@ -770,7 +779,7 @@ impl Camera for ToupcamCam {
         }
         // Let the driver release the endpoint before it is claimed again.
         std::thread::sleep(Duration::from_millis(250));
-        let h = open_handle(&self.api, index)?;
+        let h = open_handle(&self.api, &self.info.id)?;
         // A fresh channel as well: notifications from the old handle refer to
         // a geometry that no longer exists.
         let (tx, rx) = channel();

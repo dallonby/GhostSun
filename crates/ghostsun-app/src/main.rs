@@ -7,6 +7,7 @@
 
 mod acquire;
 mod applog;
+mod autofocus;
 mod focus;
 mod focusmetrics;
 mod gong;
@@ -274,6 +275,9 @@ impl App {
             return;
         }
         // leaving Focus: stop the camera stream
+        if self.mode == ViewMode::Focus {
+            self.focus.stop_autofocus();
+        }
         if self.mode == ViewMode::Focus
             && !matches!(target, ViewMode::Mount | ViewMode::Acquire)
         {

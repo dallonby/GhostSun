@@ -173,6 +173,9 @@ fn choose(lines: &[Fit], mode: LineMode, picked: Option<f64>) -> Option<Fit> {
 /// dips are **vertical** lines; `along_y` collapses columns → a vertical profile
 /// whose dips are **horizontal** lines.
 pub struct FocusUpdate {
+    pub captured_at: Instant,
+    pub limb_widths: [Option<f64>; 2],
+    pub clipped: bool,
     pub strip: Vec<u8>,
     pub strip_w: usize,
     pub strip_h: usize,
@@ -408,6 +411,37 @@ impl Smoothed {
     }
 }
 
+/// Display-only rolling 1-second edge widths. A trimmed mean suppresses brief
+/// fit spikes; raw measurements still feed autofocus and captured sweeps.
+#[derive(Default)]
+struct EdgeReadouts {
+    samples: VecDeque<(Instant, [Option<f64>; 2])>,
+}
+
+impl EdgeReadouts {
+    const WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+    fn push(&mut self, at: Instant, widths: [Option<f64>; 2]) {
+        while self.samples.front().is_some_and(|(t, _)| at.saturating_duration_since(*t) >= Self::WINDOW) {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((at, widths));
+    }
+
+    fn get(&self, side: usize, now: Instant) -> Option<f64> {
+        let mut values: Vec<f64> = self.samples.iter()
+            .filter(|(t, _)| now.checked_duration_since(*t).is_some_and(|age| age < Self::WINDOW))
+            .filter_map(|(_, widths)| widths[side])
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .collect();
+        if values.is_empty() { return None; }
+        values.sort_by(f64::total_cmp);
+        let trim = values.len() / 10;
+        let middle = &values[trim..values.len() - trim];
+        Some(middle.iter().sum::<f64>() / middle.len() as f64)
+    }
+}
+
 struct Track {
     min_hold: f64,
     history: VecDeque<f64>,
@@ -498,6 +532,7 @@ pub struct FocusState {
     pub collimator_pos_text: String,
     /// Telescope focuser reading (Stage B x-axis).
     pub focuser_pos_text: String,
+    autofocus: crate::autofocus::Controller,
     curve_spec: VCurve,
     curve_slit: VCurve,
     curve_tele: VCurve,
@@ -519,6 +554,7 @@ pub struct FocusState {
     track_x: Track, // vertical lines
     track_y: Track, // horizontal lines
     last: Option<FocusUpdate>,
+    edge_readouts: EdgeReadouts,
     frame_seq: u64,
     tex: Option<egui::TextureHandle>,
     rx: Option<Receiver<FocusMsg>>,
@@ -572,6 +608,7 @@ impl Default for FocusState {
             camera_pos_text: String::new(),
             collimator_pos_text: String::new(),
             focuser_pos_text: String::new(),
+            autofocus: crate::autofocus::Controller::default(),
             curve_spec: VCurve::new(true),
             curve_slit: VCurve::new(true),
             curve_tele: VCurve::new(true),
@@ -591,6 +628,7 @@ impl Default for FocusState {
             track_x: Track::new(),
             track_y: Track::new(),
             last: None,
+            edge_readouts: EdgeReadouts::default(),
             frame_seq: 0,
             tex: None,
             rx: None,
@@ -683,6 +721,7 @@ impl FocusState {
     }
 
     pub fn stop(&mut self) {
+        self.stop_autofocus();
         // The worker owns the camera handle; when it exits the device is
         // released and reopens full-frame, so a live ROI cannot survive.
         self.live_fps = 0.0;
@@ -718,6 +757,9 @@ impl FocusState {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
+        if self.autofocus.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let mut latest: Option<Box<FocusUpdate>> = None;
         let mut err = None;
         let mut recording_event = None;
@@ -942,9 +984,26 @@ impl FocusState {
             if u.live_fps > 0.0 {
                 self.live_fps = u.live_fps;
             }
+            if self.last.as_ref().is_some_and(|last| (last.full_w, last.full_h) != (u.full_w, u.full_h)) {
+                self.edge_readouts.samples.clear();
+            }
+            self.edge_readouts.push(u.captured_at, u.limb_widths);
+            self.autofocus.feed(crate::autofocus::FrameSample {
+                seq: self.frame_seq,
+                captured: u.captured_at,
+                widths: u.limb_widths,
+                geometry: [u.full_w, u.full_h],
+                exposure: u.cur_exposure.unwrap_or(self.exposure_us),
+                gain: u.cur_gain.unwrap_or(self.gain),
+                clipped: u.clipped,
+            });
             self.last = Some(*u);
             self.frame_seq = self.frame_seq.wrapping_add(1);
         }
+    }
+
+    pub fn stop_autofocus(&self) {
+        self.autofocus.stop();
     }
 
     pub fn prepare_sun_search(
@@ -1132,6 +1191,9 @@ impl FocusState {
         capture_height: usize,
         anchor_y: f64,
     ) -> Result<(), String> {
+        if self.autofocus.busy() {
+            return Err("Stop the focuser before recording".into());
+        }
         if self.recording {
             return Err("a SER recording is already active".into());
         }
@@ -1166,6 +1228,7 @@ impl FocusState {
     }
 
     fn reset_holds(&mut self) {
+        self.edge_readouts.samples.clear();
         self.track_x.reset();
         self.track_y.reset();
         self.smooth_spectral.0.reset();
@@ -1201,6 +1264,10 @@ impl FocusState {
 
     /// Start accumulating frames for one V-curve point.
     pub fn begin_capture(&mut self) {
+        if self.autofocus.busy() {
+            self.stage_status = "Stop the USB focuser before taking a manual focus sample".into();
+            return;
+        }
         let Some(pos) = self.active_position() else {
             self.stage_status = "enter the micrometer reading first".into();
             return;
@@ -1408,7 +1475,8 @@ impl FocusState {
                 .ok()
                 .filter(|v| v.is_finite()),
             delta: sp.map(|s| s.delta),
-            focuser: self.curve_tele.fit().map(|f| f.vertex),
+            focuser: self.autofocus.snapshot().outcome.map(|o| o.position as f64)
+                .or_else(|| self.curve_tele.fit().map(|f| f.vertex)),
         };
         match rec.save() {
             Ok(path) => {
@@ -1484,7 +1552,7 @@ impl FocusState {
         // Sensor settings are latched for the duration of a capture (the
         // worker enforces it too); grey them out rather than silently
         // deferring a change the user just made.
-        let settings_locked = self.recording;
+        let settings_locked = self.recording || self.autofocus.busy();
         if ui
             .add_enabled(
                 !settings_locked,
@@ -1550,6 +1618,7 @@ impl FocusState {
                 .clicked();
         });
         if axis_changed {
+            self.stop_autofocus();
             // Stage A only relabels, but Stage B genuinely cuts the frame the
             // other way, so the worker has to be told.
             self.send_cmd(FocusCmd::Dispersion(self.dispersion == DispAxis::Horizontal));
@@ -1728,10 +1797,12 @@ impl FocusState {
     fn stage_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.heading("Focus procedure");
+        let previous_stage = self.stage;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.stage, Stage::Spectrograph, "A · spectrograph");
             ui.selectable_value(&mut self.stage, Stage::Telescope, "B · telescope");
         });
+        if self.stage != previous_stage { self.stop_autofocus(); }
 
         match self.stage {
             Stage::Spectrograph => self.stage_a_ui(ui),
@@ -1923,6 +1994,12 @@ impl FocusState {
     }
 
     fn stage_b_ui(&mut self, ui: &mut egui::Ui) {
+        let ready = self.streaming && !self.auto_exposure && !self.recording
+            && !self.live_roi_pending && self.capture.is_none() && self.tele_metric == TeleMetric::LimbEdge
+            && self.last.as_ref().is_some_and(|u| u.limb_width.is_some() && u.captured_at.elapsed().as_secs_f32() < 3.0 && !u.clipped);
+        let motion_allowed = !self.recording && !self.live_roi_pending && self.capture.is_none();
+        self.autofocus.ui(ui, ready, motion_allowed);
+        ui.separator();
         ui.label(
             egui::RichText::new(
                 "Run only after Stage A is closed — the telescope cannot correct grating \
@@ -1941,6 +2018,7 @@ impl FocusState {
             ui.selectable_value(&mut self.tele_metric, TeleMetric::Structure, "contrast");
         });
         if before != self.tele_metric {
+            self.stop_autofocus();
             self.retarget_tele_curves();
             // Limb width and contrast are different quantities in different
             // units; without this the readout would slide from one to the other.
@@ -1950,8 +2028,8 @@ impl FocusState {
         ui.label(
             egui::RichText::new(match self.tele_metric {
                 TeleMetric::LimbEdge => {
-                    "Solar limb as a knife edge. Dust-immune, so trust this one. Needs the limb \
-                     on the slit."
+                    "Measures only the highlighted outer solar edges; the disc interior is excluded. \
+                     Lower is sharper. Keep some dark sky visible beyond each limb."
                 }
                 TeleMetric::Structure => {
                     "High-passed along-slit contrast. Always available, but slit dust adds a \
@@ -2131,7 +2209,9 @@ impl FocusState {
             let h = h.min(max_height).max(1.0);
             let w = (h * aspect).min(avail);
             ui.vertical_centered(|ui| {
-                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, h)));
+                let response =
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(w, h)));
+                Self::preview_side_borders(ui, response.rect);
             });
             true
         } else {
@@ -2148,6 +2228,15 @@ impl FocusState {
                 },
             );
             false
+        }
+    }
+
+    fn preview_side_borders(ui: &egui::Ui, rect: egui::Rect) {
+        let stroke = egui::Stroke::new(2.0, super::ACCENT);
+        // Keep the whole stroke inside the image so panel clipping cannot hide it.
+        let inset = (stroke.width / 2.0).min(rect.width() / 2.0);
+        for x in [rect.left() + inset, rect.right() - inset] {
+            ui.painter().vline(x, rect.y_range(), stroke);
         }
     }
 
@@ -2254,6 +2343,8 @@ impl FocusState {
                 );
             }
 
+            Self::preview_side_borders(ui, rect);
+
             if selectable && response.clicked() {
                 if let Some(pointer) = response.interact_pointer_pos() {
                     let sensor_y = band_y0
@@ -2310,7 +2401,85 @@ impl FocusState {
         .map(|clicked| clicked + band_y0)
     }
 
+    fn limb_focus_preview_ui(&self, ui: &mut egui::Ui) {
+        let (Some(tex), Some(last)) = (&self.tex, &self.last) else {
+            self.camera_preview_ui(ui, 180.0);
+            return;
+        };
+        let profile: Vec<f64> = last.slit_cut.iter().map(|&v| v as f64).collect();
+        let regions = focusmetrics::limb_regions(&profile);
+        let slit_is_x = self.spectral_is_y();
+        let now = Instant::now();
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        let uv_regions: Vec<_> = regions.iter().map(|(side, region)| {
+            let lo = region.start as f32 / profile.len() as f32;
+            let hi = region.end as f32 / profile.len() as f32;
+            let uv = if slit_is_x {
+                egui::Rect::from_min_max(egui::pos2(lo, 0.0), egui::pos2(hi, 1.0))
+            } else {
+                egui::Rect::from_min_max(egui::pos2(0.0, lo), egui::pos2(1.0, hi))
+            };
+            let label = match (slit_is_x, side) {
+                (true, 0) => "Left limb",
+                (true, _) => "Right limb",
+                (false, 0) => "Top limb",
+                (false, _) => "Bottom limb",
+            };
+            (uv, label, self.edge_readouts.get(*side, now))
+        }).collect();
+        ui.label(egui::RichText::new("Solar edges — telescope focus").strong().color(super::ACCENT));
+        ui.vertical_centered(|ui| {
+            let height = (ui.available_width() / tex.aspect_ratio()).min(180.0);
+            let response = ui.add(egui::Image::new(tex)
+                .fit_to_exact_size(egui::vec2(height * tex.aspect_ratio(), height)));
+            for (uv, _, _) in &uv_regions {
+                let rect = egui::Rect::from_min_max(
+                    response.rect.min + uv.min.to_vec2() * response.rect.size(),
+                    response.rect.min + uv.max.to_vec2() * response.rect.size(),
+                );
+                ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(2.0, super::ACCENT));
+            }
+            Self::preview_side_borders(ui, response.rect);
+        });
+        if uv_regions.is_empty() {
+            ui.label("No usable outer edge detected. Check the dispersion axis and include dark sky beyond at least one boundary.");
+            ui.label(if slit_is_x {
+                "Measuring left/right edges (vertical dispersion)."
+            } else {
+                "Measuring top/bottom edges (horizontal dispersion)."
+            });
+            return;
+        }
+        ui.label("Enlarged live edges · lower FWHM is sharper · no digital sharpening");
+        ui.columns(uv_regions.len(), |columns| {
+            for (ui, (uv, label, width)) in columns.iter_mut().zip(&uv_regions) {
+                ui.label(egui::RichText::new(*label).color(super::ACCENT));
+                let aspect = tex.aspect_ratio() * uv.width() / uv.height();
+                let height = (ui.available_width() / aspect).min(300.0);
+                ui.add(egui::Image::new(tex).uv(*uv)
+                    .fit_to_exact_size(egui::vec2(height * aspect, height)));
+                ui.label(width.map(|w| format!("{w:.2} px FWHM · 1 s smoothed"))
+                    .unwrap_or_else(|| "Edge fit unavailable".into()));
+            }
+        });
+    }
+
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        if self.stage == Stage::Telescope && self.tele_metric == TeleMetric::LimbEdge {
+            self.limb_focus_preview_ui(ui);
+            let af = self.autofocus.snapshot();
+            if !af.samples.is_empty() {
+                let mut curve = VCurve::new(true);
+                for sample in af.samples { curve.push(sample.pos, sample.value, sample.weight); }
+                ui.label("USB autofocus sweep — solar-edge width vs motor steps");
+                vcurve_plot(ui, "vcurve_usb_autofocus", &[("limbs", TELE_COLOR, &curve)]);
+            }
+            if !self.curve_tele.is_empty() {
+                ui.label("Solar-edge FWHM vs focuser position — lower is sharper");
+                vcurve_plot(ui, "vcurve_stage_b", &[("focus", TELE_COLOR, &self.curve_tele)]);
+            }
+            return;
+        }
         if !self.camera_preview_ui(ui, 260.0) {
             return;
         }
@@ -3303,13 +3472,23 @@ fn worker(
                     disp_h,
                     &mask,
                 );
-                let limb_width = focusmetrics::limb_edge_width(&slit_cut);
+                let limb_width = focusmetrics::outer_limb_width(&slit_cut);
+                let mut limb_widths = [None; 2];
+                for (side, region) in focusmetrics::limb_regions(&slit_cut) {
+                    limb_widths[side] = focusmetrics::limb_edge_width(&slit_cut[region]);
+                }
                 let structure = focusmetrics::structure_split(&slit_cut);
 
                 let (strip, sw, sh) = make_strip(&frame);
                 let cur_exposure = cam.current_exposure_us();
                 let cur_gain = cam.current_gain();
                 let update = Box::new(FocusUpdate {
+                    clipped: peak >= 65000.0 || focusmetrics::clipped_frame(&frame.data),
+                    captured_at: Instant::now().checked_sub(
+                        std::time::SystemTime::now().duration_since(frame.host_time).unwrap_or_default()
+                            + std::time::Duration::from_micros(cur_exposure.unwrap_or(cur_exp) as u64)
+                    ).unwrap_or_else(Instant::now),
+                    limb_widths,
                     hw_roi_active: live_roi.is_some()
                         || active_ser
                             .as_ref()
@@ -3809,6 +3988,9 @@ mod tests {
 
     fn blank_update() -> FocusUpdate {
         FocusUpdate {
+            captured_at: Instant::now(),
+            limb_widths: [None; 2],
+            clipped: false,
             strip: Vec::new(),
             strip_w: 0,
             strip_h: 0,

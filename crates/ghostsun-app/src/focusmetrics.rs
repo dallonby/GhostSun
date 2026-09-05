@@ -47,6 +47,18 @@ const ILLUM_GATE: f64 = 0.40;
 /// High-pass scale for the structure metric, in pixels along the slit.
 const STRUCTURE_SIGMA: f64 = 6.0;
 
+/// Detect a pile-up at common right/left-aligned ADC ceilings. Raw camera
+/// samples can saturate at 4095 or 16383 even though their container is u16.
+pub fn clipped_frame(data: &[u16]) -> bool {
+    let Some(&maximum) = data.iter().max() else { return false; };
+    let adc_ceiling = (8..=16).any(|bits| {
+        maximum as u32 == (1_u32 << bits) - 1
+            || maximum as u32 == 65536 - (1_u32 << (16 - bits))
+    });
+    if !adc_ceiling { return false; }
+    data.iter().filter(|&&v| v == maximum).count() * 200 >= data.len()
+}
+
 /// Dispersion positions that are continuum, i.e. not inside an absorption line.
 ///
 /// The local continuum level is estimated with a median-based trend, which
@@ -256,6 +268,64 @@ pub fn limb_edge_width(profile: &[f64]) -> Option<f64> {
     Some(2.3548 * sigma)
 }
 
+/// Outer disc-to-sky boundaries only, with enough sky and disc to fit an edge.
+/// The index identifies the low/high end of the slit even if only one is visible.
+pub fn limb_regions(profile: &[f64]) -> Vec<(usize, std::ops::Range<usize>)> {
+    if profile.len() < 48 || profile.iter().any(|v| !v.is_finite()) {
+        return Vec::new();
+    }
+    let sm = gaussian_smooth(profile, 2.0);
+    let floor = sm.iter().copied().fold(f64::INFINITY, f64::min);
+    let peak = sm.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = peak - floor;
+    if span <= 0.1 * peak.max(1.0) {
+        return Vec::new();
+    }
+    // Limb darkening makes the disc immediately inside the boundary much
+    // dimmer than its centre. Locate the sky-to-disc transition at a low level;
+    // requiring 60% of the full-frame peak here rejected real, visible limbs.
+    let threshold = floor + 0.1 * span;
+    let lo = sm.iter().position(|&v| v >= threshold).unwrap();
+    let hi = sm.iter().rposition(|&v| v >= threshold).unwrap();
+    let mut regions = Vec::new();
+    let half = (profile.len() / 100).clamp(24, 128);
+    for (side, crossing) in [lo, hi].into_iter().enumerate() {
+        // A boundary at the sensor edge has no measured sky side.
+        if crossing < 8 || crossing + 8 >= profile.len() || hi - lo < 48 {
+            continue;
+        }
+        let sign = if side == 0 { 1.0 } else { -1.0 };
+        let gradient = |i: usize| sign * (sm[i + 1] - sm[i - 1]) * 0.5;
+        let centre = (crossing.saturating_sub(half).max(8)..=(crossing + half).min(profile.len() - 9))
+            .max_by(|&a, &b| gradient(a).total_cmp(&gradient(b))).unwrap();
+        let radius = half.min(centre).min(profile.len() - 1 - centre);
+        if radius < 12 { continue; }
+        let shoulder = (radius * 4 / 5).max(8);
+        let (sky, disc) = if side == 0 {
+            (sm[centre - shoulder], sm[centre + shoulder])
+        } else {
+            (sm[centre + shoulder], sm[centre - shoulder])
+        };
+        let shoulder_gradient = (gradient(centre - shoulder).abs()
+            + gradient(centre + shoulder).abs()) * 0.5;
+        if sky < floor + 0.2 * span && disc - sky > 0.08 * span
+            && gradient(centre) > 2.5 * shoulder_gradient
+        {
+            regions.push((side, centre - radius..centre + radius + 1));
+        }
+    }
+    regions
+}
+
+/// Average the valid limb fits, excluding all interior solar structure.
+pub fn outer_limb_width(profile: &[f64]) -> Option<f64> {
+    let widths: Vec<_> = limb_regions(profile)
+        .into_iter()
+        .filter_map(|(_, region)| limb_edge_width(&profile[region]))
+        .collect();
+    (!widths.is_empty()).then(|| widths.iter().sum::<f64>() / widths.len() as f64)
+}
+
 // ---------------------------------------------------------------------------
 
 /// Rolling buffer of per-frame metric values, read out as a percentile.
@@ -345,6 +415,84 @@ mod tests {
                 500.0 * (1.0 - ghostsun_core::mathutil::erf(t)) + 20.0
             })
             .collect()
+    }
+
+    #[test]
+    fn real_preview_with_dim_limbs_detects_both_outer_edges() {
+        // Mean slit-direction profile of the supplied 2026-09-05 screenshot,
+        // cropped inside the orange border (x=68..1601, y=48..408).
+        // Display pixels are a detection regression, not a calibrated FWHM.
+        let source: Vec<f64> = include_str!("../tests/data/solar_limb_profile.csv")
+            .split(|c| c == ',' || c == '\n')
+            .filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
+        for scale in [1, 2, 4] {
+            let profile: Vec<_> = (0..source.len() * scale).map(|i| {
+                let x = i / scale;
+                let fraction = (i % scale) as f64 / scale as f64;
+                source[x] * (1.0 - fraction) + source[(x + 1).min(source.len() - 1)] * fraction
+            }).collect();
+            let regions = limb_regions(&profile);
+            assert_eq!(regions.len(), 2, "missing boundary at scale {scale}");
+            let centres: Vec<_> = regions.iter().map(|(_, r)| (r.start + r.end - 1) / 2 / scale).collect();
+            assert!((225..250).contains(&centres[0]), "left edge: {}", centres[0]);
+            assert!((1390..1430).contains(&centres[1]), "right edge: {}", centres[1]);
+            for (_, region) in &regions {
+                assert!(limb_edge_width(&profile[region.clone()]).is_some(), "no width at scale {scale}");
+            }
+        }
+    }
+
+    #[test]
+    fn gentle_illumination_ramp_is_not_a_solar_boundary() {
+        for n in [120, 500, 3840] {
+            let ramp: Vec<_> = (0..n).map(|i| 10.0 + i as f64).collect();
+            assert!(limb_regions(&ramp).is_empty());
+        }
+    }
+
+    #[test]
+    fn clipping_detects_raw_adc_limits_without_treating_one_hot_pixel_as_saturation() {
+        for ceiling in [255, 1023, 4095, 16383, 65520, 65535] {
+            let mut frame = vec![100_u16; 1000];
+            frame[0] = ceiling;
+            assert!(!clipped_frame(&frame));
+            frame[..10].fill(ceiling);
+            assert!(clipped_frame(&frame));
+        }
+        assert!(!clipped_frame(&vec![2000; 1000]));
+        assert!(!clipped_frame(&[]));
+    }
+
+    #[test]
+    fn outer_regions_ignore_interior_structure_and_measure_both_limbs() {
+        let disc = |sigma: f64| -> Vec<f64> {
+            (0..300).map(|i| {
+                let x = i as f64;
+                20.0 + 500.0 * (ghostsun_core::mathutil::erf((x - 60.0) / sigma)
+                    - ghostsun_core::mathutil::erf((x - 240.0) / sigma))
+            }).collect()
+        };
+        let sharp = disc(2.0);
+        let mut marked = sharp.clone();
+        for value in &mut marked[130..150] { *value *= 0.4; }
+        let regions = limb_regions(&marked);
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].1.contains(&60));
+        assert!(regions[1].1.contains(&240));
+        assert!((outer_limb_width(&sharp).unwrap() - outer_limb_width(&marked).unwrap()).abs() < 0.01);
+        assert!(outer_limb_width(&disc(6.0)).unwrap() > outer_limb_width(&sharp).unwrap());
+    }
+
+    #[test]
+    fn outer_regions_allow_one_limb_but_reject_flat_and_clipped_edges() {
+        let edge = erf_edge(180, 80.0, 2.0);
+        let regions = limb_regions(&edge);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].0, 1);
+        assert!(outer_limb_width(&edge).is_some());
+        assert!(limb_regions(&vec![1000.0; 180]).is_empty());
+        assert!(limb_regions(&erf_edge(180, 3.0, 1.0)).is_empty());
+        assert!(limb_regions(&vec![f64::NAN; 180]).is_empty());
     }
 
     #[test]

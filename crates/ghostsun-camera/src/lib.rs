@@ -13,6 +13,7 @@ use std::fmt;
 use std::ops::RangeInclusive;
 
 pub mod asi;
+pub mod focuser;
 pub mod qhy;
 pub mod synth;
 pub mod toupcam;
