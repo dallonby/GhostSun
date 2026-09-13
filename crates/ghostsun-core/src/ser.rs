@@ -414,11 +414,14 @@ fn monotonic_host(times: &[(i64, Option<u64>)]) -> Vec<i64> {
     out
 }
 
-/// Incremental mono16 SER writer for live acquisition.
+/// Incremental mono SER writer for live acquisition, 8- or 16-bit.
 pub struct SerRecorder {
     file: File,
     width: usize,
     height: usize,
+    /// 8 or 16. Frames always arrive as `u16`; at 8 they are packed on the way
+    /// out, which halves both the file and the disk bandwidth a scan needs.
+    bit_depth: u32,
     frame_count: usize,
     buffer: Vec<u8>,
     /// (host UTC ticks, device microseconds) per written frame.
@@ -428,6 +431,7 @@ pub struct SerRecorder {
 }
 
 impl SerRecorder {
+    /// 16-bit, the format GhostSun has always written.
     pub fn create(
         path: &Path,
         width: usize,
@@ -435,10 +439,29 @@ impl SerRecorder {
         instrument: &str,
         telescope: &str,
     ) -> io::Result<Self> {
+        Self::create_with_depth(path, width, height, instrument, telescope, 16)
+    }
+
+    /// As [`SerRecorder::create`], but choosing the sample size written to
+    /// disk. Only 8 and 16 are valid; the SER format has no other mono width.
+    pub fn create_with_depth(
+        path: &Path,
+        width: usize,
+        height: usize,
+        instrument: &str,
+        telescope: &str,
+        bit_depth: u32,
+    ) -> io::Result<Self> {
         if width == 0 || height == 0 || width > i32::MAX as usize || height > i32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "SER dimensions must be non-zero 32-bit values",
+            ));
+        }
+        if bit_depth != 8 && bit_depth != 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SER bit depth must be 8 or 16, not {bit_depth}"),
             ));
         }
         let mut file = File::create(path)?;
@@ -449,7 +472,7 @@ impl SerRecorder {
         put_i32(&mut header, 22, 0); // little endian
         put_i32(&mut header, 26, width as i32);
         put_i32(&mut header, 30, height as i32);
-        put_i32(&mut header, 34, 16);
+        put_i32(&mut header, 34, bit_depth as i32);
         put_i32(&mut header, 38, 0); // patched on finish
         put_header_str(&mut header, 42, "GhostSun");
         put_header_str(&mut header, 82, instrument);
@@ -465,8 +488,9 @@ impl SerRecorder {
             file,
             width,
             height,
+            bit_depth,
             frame_count: 0,
-            buffer: Vec::with_capacity(width * height * 2),
+            buffer: Vec::with_capacity(width * height * (bit_depth as usize / 8)),
             times: Vec::new(),
             finished: false,
             summary: None,
@@ -486,8 +510,17 @@ impl SerRecorder {
             ));
         }
         self.buffer.clear();
-        for &pixel in pixels {
-            self.buffer.extend_from_slice(&pixel.to_le_bytes());
+        if self.bit_depth == 8 {
+            // An 8-bit camera sample reaches us scaled by 257 (s<<8 | s), so
+            // the high byte is the original sample exactly. A frame that is
+            // genuinely 16-bit loses its low byte here, which is what asking
+            // for an 8-bit file means.
+            self.buffer
+                .extend(pixels.iter().map(|&pixel| (pixel >> 8) as u8));
+        } else {
+            for &pixel in pixels {
+                self.buffer.extend_from_slice(&pixel.to_le_bytes());
+            }
         }
         self.file.write_all(&self.buffer)?;
         self.frame_count += 1;
@@ -526,7 +559,12 @@ impl SerRecorder {
         // Trailer: one UTC tick count per frame, directly after the image
         // data. Position explicitly rather than trusting the cursor.
         let (ticks, device_clock, device_gaps) = trailer_ticks(&self.times);
-        let image_end = HEADER_SIZE as u64 + (self.frame_count * self.width * self.height * 2) as u64;
+        // Bytes per sample, not a hardcoded 2: at 8 bits the trailer would
+        // otherwise land past the real image end, leaving a zero hole that the
+        // reader rejects — losing the per-frame timing the scan axis needs.
+        let bytes_per_px = self.bit_depth as usize / 8;
+        let image_end =
+            HEADER_SIZE as u64 + (self.frame_count * self.width * self.height * bytes_per_px) as u64;
         self.file.seek(SeekFrom::Start(image_end))?;
         let mut trailer = Vec::with_capacity(ticks.len() * 8);
         for t in &ticks {
@@ -676,6 +714,53 @@ mod tests {
             "ghostsun-ser-{tag}-{}-{unique}.ser",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn eight_bit_writer_halves_the_file_and_round_trips_camera_samples() {
+        // An 8-bit camera sample arrives scaled by 257, and must come back out
+        // of the file unchanged — that is the whole point of writing 8-bit
+        // rather than paying for a second byte that carries no information.
+        let path = temp_ser("eightbit");
+        let (w, h) = (4usize, 2usize);
+        let samples: Vec<u8> = vec![0, 1, 17, 128, 200, 254, 255, 99];
+        let scaled: Vec<u16> = samples.iter().map(|&s| s as u16 * 257).collect();
+        let mut rec = SerRecorder::create_with_depth(&path, w, h, "cam", "shg", 8).unwrap();
+        rec.write_frame(&scaled, FrameTime { host: SystemTime::now(), device_us: None })
+            .unwrap();
+        rec.finish().unwrap();
+
+        let reader = SerReader::open(&path).unwrap();
+        assert_eq!(reader.header.bit_depth, 8);
+        assert_eq!(reader.header.frame_count, 1);
+        // The reader rescales 8-bit samples by 257, so what comes back is what
+        // the writer was handed, exactly.
+        let frame = reader.frame(0);
+        for (got, &want) in frame.data.iter().zip(&scaled) {
+            assert_eq!(*got, want as f32, "8-bit sample survives the round trip");
+        }
+        // One byte per pixel on disk, not two: an identical 16-bit recording
+        // differs by exactly the frame payload.
+        let twin = temp_ser("eightbit-twin");
+        let mut rec16 = SerRecorder::create_with_depth(&twin, w, h, "cam", "shg", 16).unwrap();
+        rec16
+            .write_frame(&scaled, FrameTime { host: SystemTime::now(), device_us: None })
+            .unwrap();
+        rec16.finish().unwrap();
+        let small = std::fs::metadata(&path).unwrap().len() as usize;
+        let large = std::fs::metadata(&twin).unwrap().len() as usize;
+        assert_eq!(large - small, w * h, "8-bit saves one byte per pixel");
+        // The trailer must still be found: it is the scan-axis coordinate.
+        assert!(reader.timestamps.is_some(), "8-bit file keeps per-frame timing");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(twin).unwrap();
+    }
+
+    #[test]
+    fn eight_bit_depth_is_the_only_alternative_the_format_allows() {
+        let path = temp_ser("baddepth");
+        assert!(SerRecorder::create_with_depth(&path, 1, 1, "cam", "shg", 12).is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -980,6 +1065,9 @@ pub struct AsyncSerRecorder {
 impl AsyncSerRecorder {
     /// `depth` frames of slack absorb write-latency spikes; 64 frames of a
     /// 3840x120 16-bit band is about 59 MB.
+    ///
+    /// `bit_depth` is the sample size written to disk (8 or 16). The queue
+    /// always carries `u16`, so this only changes the file, not the pipeline.
     pub fn create(
         path: &Path,
         width: usize,
@@ -987,8 +1075,10 @@ impl AsyncSerRecorder {
         instrument: &str,
         telescope: &str,
         depth: usize,
+        bit_depth: u32,
     ) -> io::Result<Self> {
-        let mut rec = SerRecorder::create(path, width, height, instrument, telescope)?;
+        let mut rec =
+            SerRecorder::create_with_depth(path, width, height, instrument, telescope, bit_depth)?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u16>, FrameTime)>(depth.max(2));
         let handle = std::thread::spawn(move || -> io::Result<SerSummary> {
             while let Ok((px, t)) = rx.recv() {
@@ -1058,7 +1148,7 @@ mod async_tests {
         let path = std::env::temp_dir()
             .join(format!("ghostsun-async-{}-{unique}.ser", std::process::id()));
         let (w, h) = (64usize, 8usize);
-        let mut rec = AsyncSerRecorder::create(&path, w, h, "test", "test", 8).unwrap();
+        let mut rec = AsyncSerRecorder::create(&path, w, h, "test", "test", 8, 16).unwrap();
         let base = SystemTime::now();
         let mut accepted = 0usize;
         for i in 0..200 {
