@@ -10,6 +10,7 @@ mod applog;
 mod autofocus;
 mod focus;
 mod focusmetrics;
+mod streakquality;
 mod gong;
 mod mount;
 mod process;

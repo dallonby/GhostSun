@@ -54,7 +54,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -169,10 +169,19 @@ fn choose(lines: &[Fit], mode: LineMode, picked: Option<f64>) -> Option<Fit> {
     }
 }
 
+/// Keep a companion tied to its selected pixel, even if another line is deeper.
+fn companion_line(lines: &[Fit], picked: Option<f64>) -> Option<Fit> {
+    choose(lines, LineMode::Manual, picked).filter(|f| {
+        f.center.is_finite() && f.fwhm.is_finite() && f.fwhm > 0.0
+            && (f.center - picked.unwrap()).abs() <= 3.0
+    })
+}
+
 /// Per-axis measurement. `along_x` collapses rows → a horizontal profile whose
 /// dips are **vertical** lines; `along_y` collapses columns → a vertical profile
 /// whose dips are **horizontal** lines.
 pub struct FocusUpdate {
+    pub streaks: Option<crate::streakquality::Measurement>,
     pub captured_at: Instant,
     pub limb_widths: [Option<f64>; 2],
     pub clipped: bool,
@@ -238,6 +247,10 @@ enum FocusMsg {
     /// Non-fatal status the user needs to see (e.g. a stalled stream), which
     /// would otherwise only exist in the log file.
     Note(String),
+    /// The sensor readout depth the camera actually accepted. A backend that
+    /// only does 16-bit reports 16 here, so the control snaps back rather
+    /// than claiming a mode that is not running.
+    BitDepth(u8),
     /// The live (outside-recording) hardware ROI was applied or released.
     LiveRoi {
         active: bool,
@@ -249,6 +262,7 @@ enum FocusMsg {
 }
 
 enum FocusCmd {
+    StreakTarget(LineMode, Option<f64>),
     Exposure(u32),
     Gain(u16),
     AutoExposure(bool),
@@ -261,6 +275,15 @@ enum FocusCmd {
         anchor_y: f64,
     },
     StopSer,
+    /// How the live preview maps counts to grey. Display only — it never
+    /// touches what is measured or recorded.
+    PreviewStretch(PreviewStretch),
+    /// Read the sensor at 8 or 16 bits. 8-bit halves the bytes per frame on
+    /// the USB link and on disk, which is what decides whether the camera's
+    /// native rate can actually be delivered; it costs the low byte of every
+    /// sample. Applied outside recordings only — the SER's sample size is
+    /// fixed at its header.
+    BitDepth(u8),
     /// Apply (or release) the hardware ROI OUTSIDE a recording, so the live
     /// preview is the real capture band at the real cropped frame rate. The
     /// recording path is unchanged; this only decides what the sensor reads
@@ -411,7 +434,7 @@ impl Smoothed {
     }
 }
 
-/// Display-only rolling 1-second edge widths. A trimmed mean suppresses brief
+/// Display-only rolling 5-second edge widths. A trimmed mean suppresses brief
 /// fit spikes; raw measurements still feed autofocus and captured sweeps.
 #[derive(Default)]
 struct EdgeReadouts {
@@ -419,7 +442,7 @@ struct EdgeReadouts {
 }
 
 impl EdgeReadouts {
-    const WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
     fn push(&mut self, at: Instant, widths: [Option<f64>; 2]) {
         while self.samples.front().is_some_and(|(t, _)| at.saturating_duration_since(*t) >= Self::WINDOW) {
@@ -481,6 +504,14 @@ pub struct FocusState {
     pub exposure_us: u32,
     pub gain: u16,
     pub auto_exposure: bool,
+    /// Sensor readout depth, 8 or 16. Mirrors what the camera accepted, not
+    /// what was asked for.
+    pub bit_depth: u8,
+    /// Live-preview rendering. Display only.
+    pub preview_stretch: PreviewStretch,
+    /// A depth change is in flight; like a ROI change it replaces the device
+    /// handle, so the control is held until the worker confirms.
+    bit_depth_pending: bool,
     pub recording: bool,
     pub recorded_frames: usize,
     pub recording_path: Option<PathBuf>,
@@ -504,6 +535,17 @@ pub struct FocusState {
     pub dispersion_a_per_px: f64,
     pub line_mode: LineMode,
     pub picked_center: Option<f64>,
+    companion_center: Option<f64>,
+    companion_readouts: EdgeReadouts,
+    companion_fit: Option<Fit>,
+    preview_zoom: f32,
+    streak_follow_selected: bool,
+    streak_history: VecDeque<(Instant, f64, f64)>,
+    streak_center: Option<f64>,
+    streak_motion: crate::streakquality::MotionTracker,
+    streak_moving: Vec<usize>,
+    streak_moving_only: bool,
+    streak_geometry: Option<(usize, usize, bool, Option<u32>, Option<u16>)>,
     /// Target selection for the slit/dust family, mirroring the spectral one.
     ///
     /// Stage A only works if the SAME feature is measured at every camera
@@ -578,6 +620,9 @@ impl Default for FocusState {
             exposure_us: 10_000,
             gain: 200,
             auto_exposure: false,
+            bit_depth: 16,
+            preview_stretch: PreviewStretch::Linear,
+            bit_depth_pending: false,
             recording: false,
             recorded_frames: 0,
             recording_path: None,
@@ -591,6 +636,17 @@ impl Default for FocusState {
             dispersion_a_per_px: 0.085,
             line_mode: LineMode::Narrowest,
             picked_center: None,
+            companion_center: None,
+            companion_readouts: EdgeReadouts::default(),
+            companion_fit: None,
+            preview_zoom: 2.0,
+            streak_follow_selected: false,
+            streak_history: VecDeque::new(),
+            streak_center: None,
+            streak_motion: Default::default(),
+            streak_moving: Vec::new(),
+            streak_moving_only: false,
+            streak_geometry: None,
             slit_line_mode: LineMode::Narrowest,
             slit_picked_center: None,
             identify_lines: false,
@@ -692,6 +748,8 @@ impl FocusState {
         let exposure = self.exposure_us;
         let gain = self.gain;
         let auto = self.auto_exposure;
+        let bits = self.bit_depth;
+        let stretch = self.preview_stretch;
         let disp_h = self.dispersion == DispAxis::Horizontal;
 
         let handle = std::thread::spawn(move || {
@@ -704,6 +762,8 @@ impl FocusState {
                 exposure,
                 gain,
                 auto,
+                bits,
+                stretch,
                 disp_h,
                 frame_pending_thread,
             )
@@ -721,6 +781,9 @@ impl FocusState {
     }
 
     pub fn stop(&mut self) {
+        self.companion_center = None;
+        self.companion_fit = None;
+        self.companion_readouts.samples.clear();
         self.stop_autofocus();
         // The worker owns the camera handle; when it exits the device is
         // released and reopens full-frame, so a live ROI cannot survive.
@@ -793,7 +856,14 @@ impl FocusState {
                     Ok(FocusMsg::Note(note)) => {
                         self.status = note;
                     }
+                    Ok(FocusMsg::BitDepth(bits)) => {
+                        self.bit_depth = bits;
+                        self.bit_depth_pending = false;
+                    }
                     Ok(FocusMsg::LiveRoi { active, y0, h }) => {
+                        self.companion_center = None;
+                        self.companion_fit = None;
+                        self.companion_readouts.samples.clear();
                         self.live_roi_active = active;
                         self.live_roi_pending = false;
                         self.live_roi_y0 = if active { y0 } else { 0 };
@@ -854,6 +924,7 @@ impl FocusState {
                 FocusMsg::Opened(_)
                 | FocusMsg::Frame(_)
                 | FocusMsg::Note(_)
+                | FocusMsg::BitDepth(_)
                 | FocusMsg::LiveRoi { .. }
                 | FocusMsg::Error(_) => unreachable!(),
             }
@@ -868,6 +939,38 @@ impl FocusState {
             return;
         }
         if let Some(u) = latest {
+            let geometry = (u.full_w, u.full_h, self.spectral_is_y(), u.cur_exposure, u.cur_gain);
+            if self.streak_geometry != Some(geometry) {
+                self.streak_history.clear();
+                self.streak_motion = Default::default();
+                self.streak_moving.clear();
+                self.streak_geometry = Some(geometry);
+            }
+            self.send_cmd(FocusCmd::StreakTarget(
+                if self.streak_follow_selected { self.line_mode } else { LineMode::Deepest },
+                if self.streak_follow_selected { self.picked_center } else { None },
+            ));
+            if let Some(m) = &u.streaks {
+                if self.streak_center.is_some_and(|c| (c - m.center).abs() > 3.0) {
+                    self.streak_history.clear();
+                    self.streak_motion = Default::default();
+                }
+                self.streak_center = Some(m.center);
+                self.streak_moving = self.streak_motion.update(u.captured_at, &m.regions,
+                    !self.spectral_is_y(), if self.spectral_is_y() { u.full_w } else { u.full_h });
+                while self.streak_history.front().is_some_and(|(t, _, _)|
+                    u.captured_at.saturating_duration_since(*t) >= std::time::Duration::from_secs(5)) {
+                    self.streak_history.pop_front();
+                }
+                let (clarity, count) = if self.streak_moving_only {
+                    (m.moving_clarity(&self.streak_moving), self.streak_moving.len())
+                } else { (m.clarity, m.regions.len()) };
+                self.streak_history.push_back((u.captured_at, clarity, count as f64));
+            } else {
+                self.streak_history.clear();
+                self.streak_motion = Default::default();
+                self.streak_moving.clear();
+            }
             if u.strip_w > 0 && u.strip_h > 0 {
                 let pixels = u
                     .strip
@@ -920,6 +1023,11 @@ impl FocusState {
                 self.track_y.push(&slit);
             }
             self.sel_spectral = spec;
+            let companion_lines = if spec_is_y { &u.lines_y } else { &u.lines_x };
+            self.companion_fit = if u.clipped { None } else {
+                companion_line(companion_lines, self.companion_center)
+            };
+            self.companion_readouts.push(u.captured_at, [self.companion_fit.map(|f| f.fwhm), None]);
             self.sel_slit = slit;
             // Only a fit the readout would actually show is fed in; letting a
             // rejected frame through would drag the number toward noise.
@@ -1228,6 +1336,11 @@ impl FocusState {
     }
 
     fn reset_holds(&mut self) {
+        self.streak_motion = Default::default();
+        self.streak_moving.clear();
+        self.streak_geometry = None;
+        self.streak_history.clear();
+        self.streak_center = None;
         self.edge_readouts.samples.clear();
         self.track_x.reset();
         self.track_y.reset();
@@ -1563,6 +1676,41 @@ impl FocusState {
         {
             self.send_cmd(FocusCmd::AutoExposure(self.auto_exposure));
         }
+
+        // Readout depth. This is a throughput control, not an image-quality
+        // one: it halves the bytes per frame on the USB link and on disk, and
+        // that is usually what decides whether the camera's native rate is
+        // actually delivered or silently decimated.
+        ui.horizontal(|ui| {
+            ui.label("readout");
+            let live = !settings_locked && !self.bit_depth_pending && self.streaming;
+            let mut want = self.bit_depth;
+            let changed = ui
+                .add_enabled_ui(live, |ui| {
+                    let a = ui.selectable_value(&mut want, 16u8, "16-bit").clicked();
+                    let b = ui.selectable_value(&mut want, 8u8, "8-bit").clicked();
+                    a || b
+                })
+                .inner;
+            if changed && want != self.bit_depth {
+                self.bit_depth_pending = true;
+                self.send_cmd(FocusCmd::BitDepth(want));
+            }
+            if self.bit_depth_pending {
+                ui.label("applying…");
+            }
+        });
+        ui.label(if self.bit_depth == 8 {
+            "8-bit: half the data rate, low byte discarded"
+        } else {
+            "16-bit: full depth, twice the data rate"
+        })
+        .on_hover_text(
+            "The sensor's native frame rate is only delivered if the link and disk can carry \
+             it. At 3840x120 a 16-bit frame is 922 kB, an 8-bit one 461 kB. Changing this \
+             restarts the stream and is refused during a recording.",
+        );
+
         let manual = !self.auto_exposure && !settings_locked;
 
         let (emin, emax) = self
@@ -1618,6 +1766,9 @@ impl FocusState {
                 .clicked();
         });
         if axis_changed {
+            self.companion_center = None;
+            self.companion_fit = None;
+            self.companion_readouts.samples.clear();
             self.stop_autofocus();
             // Stage A only relabels, but Stage B genuinely cuts the frame the
             // other way, so the worker has to be told.
@@ -2428,8 +2579,8 @@ impl FocusState {
             (uv, label, self.edge_readouts.get(*side, now))
         }).collect();
         ui.label(egui::RichText::new("Solar edges — telescope focus").strong().color(super::ACCENT));
-        ui.vertical_centered(|ui| {
-            let height = (ui.available_width() / tex.aspect_ratio()).min(180.0);
+        let height = (ui.available_width() / tex.aspect_ratio()).min(180.0) * self.preview_zoom;
+        egui::ScrollArea::horizontal().id_salt("focus_limb_preview_zoom").show(ui, |ui| {
             let response = ui.add(egui::Image::new(tex)
                 .fit_to_exact_size(egui::vec2(height * tex.aspect_ratio(), height)));
             for (uv, _, _) in &uv_regions {
@@ -2440,6 +2591,7 @@ impl FocusState {
                 ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(2.0, super::ACCENT));
             }
             Self::preview_side_borders(ui, response.rect);
+            self.streak_overlay(ui, response.rect);
         });
         if uv_regions.is_empty() {
             ui.label("No usable outer edge detected. Check the dispersion axis and include dark sky beyond at least one boundary.");
@@ -2458,15 +2610,134 @@ impl FocusState {
                 let height = (ui.available_width() / aspect).min(300.0);
                 ui.add(egui::Image::new(tex).uv(*uv)
                     .fit_to_exact_size(egui::vec2(height * aspect, height)));
-                ui.label(width.map(|w| format!("{w:.2} px FWHM · 1 s smoothed"))
+                ui.label(width.map(|w| format!("{w:.2} px FWHM · 5 s smoothed"))
                     .unwrap_or_else(|| "Edge fit unavailable".into()));
             }
         });
     }
 
+    fn streak_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if self.streak_summary(Instant::now()).is_none() { return; }
+        if let Some(m) = self.last.as_ref().and_then(|u| u.streaks.as_ref()) {
+            for (i, r) in m.regions.iter().enumerate() {
+                let moving = self.streak_moving.contains(&i);
+                if self.streak_moving_only && !moving { continue; }
+                let color = if moving { egui::Color32::LIGHT_GREEN } else { egui::Color32::LIGHT_BLUE };
+                let region = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(r[0], r[1]) * rect.size(),
+                    rect.min + egui::vec2(r[2], r[3]) * rect.size(),
+                );
+                ui.painter().rect_stroke(region, 0.0,
+                    egui::Stroke::new(1.0, color));
+                ui.painter().text(region.min, egui::Align2::LEFT_BOTTOM,
+                    format!("{}", i + 1), egui::FontId::proportional(11.0), color);
+            }
+        }
+    }
+
+    fn streak_summary(&self, now: Instant) -> Option<(f64, f64)> {
+        let samples: Vec<_> = self.streak_history.iter().filter(|(t, _, _)|
+            now.checked_duration_since(*t).is_some_and(|age| age < std::time::Duration::from_secs(5))).collect();
+        if samples.is_empty() { return None; }
+        let mut clarity: Vec<_> = samples.iter().map(|(_, q, _)| *q).collect();
+        clarity.sort_by(f64::total_cmp);
+        let trim = clarity.len() / 10;
+        let middle = &clarity[trim..clarity.len() - trim];
+        Some((middle.iter().sum::<f64>() / middle.len() as f64,
+            samples.iter().map(|(_, _, n)| *n).sum::<f64>() / samples.len() as f64))
+    }
+
+    fn streak_ui(&mut self, ui: &mut egui::Ui) {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Streak clarity · experimental").color(egui::Color32::LIGHT_GREEN));
+            if let Some((clarity, count)) = self.streak_summary(Instant::now()) {
+                let current = self.last.as_ref().and_then(|u| u.streaks.as_ref()).map(|m| m.regions.len()).unwrap_or(0);
+                ui.label(format!("{clarity:.3} %/px · {count:.1} average · {current} detected / {} moving now · 5 s smoothed", self.streak_moving.len()));
+            } else {
+                ui.label("Unavailable — need an unclipped line and enough illuminated slit");
+            }
+            if ui.checkbox(&mut self.streak_follow_selected, "Use main spectral target").changed() {
+                self.streak_history.clear();
+                self.streak_center = None;
+                self.streak_motion = Default::default();
+                self.streak_moving.clear();
+            }
+            if ui.checkbox(&mut self.streak_moving_only, "Moving only").changed() {
+                self.streak_history.clear();
+            }
+        });
+        ui.small("Higher means sharper line-local detail. Blue: detected; green: tracked movement. Moving only filters the score and average count. Defaults to the deepest line; keep pointing and exposure fixed for comparisons.");
+        ui.small("Motion can suppress stationary dust, but is not proof of a solar feature. Still solar features are excluded by Moving only. This is not a filament count or Doppler velocity.");
+    }
+
+    fn companion_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Companion spectral line").color(SPECTRAL_COLOR));
+            let width = self.companion_fit.and_then(|_| {
+                self.companion_readouts.get(0, Instant::now())
+            });
+            ui.label(match (self.companion_center, width) {
+                (Some(center), Some(width)) => format!("{width:.2} px FWHM · 5 s smoothed · selected @ {center:.1} px"),
+                (Some(_), None) => "Selected line unavailable".into(),
+                (None, _) => "Select a telluric or other absorption line below".into(),
+            });
+            if self.companion_center.is_some() && ui.small_button("Clear").clicked() {
+                self.companion_center = None;
+                self.companion_fit = None;
+                self.companion_readouts.samples.clear();
+            }
+        });
+        egui::CollapsingHeader::new("Select companion line")
+            .show(ui, |ui| {
+                ui.label("Click a detected absorption dip. This is independent of the main focus target.");
+                let Some(last) = &self.last else { ui.label("Start the camera to see the spectrum."); return; };
+                let (profile, lines) = if self.spectral_is_y() {
+                    (&last.prof_y, &last.lines_y)
+                } else { (&last.prof_x, &last.lines_x) };
+                if profile.is_empty() { return; }
+                let candidates: Vec<f64> = lines.iter().filter(|f| f.depth > DEPTH_GATE).map(|f| f.center).collect();
+                let labels: Vec<_> = self.labels.iter()
+                    .map(|l| (l.x, format!("{} {:.1}", l.element, l.wavelength))).collect();
+                if let Some(x) = profile_plot(ui, "focus_companion", profile,
+                    self.companion_fit, &candidates, self.companion_center,
+                    &labels, SPECTRAL_COLOR, 150.0)
+                {
+                    self.companion_center = companion_line(lines, Some(x)).map(|f| f.center);
+                    self.companion_fit = None;
+                    self.companion_readouts.samples.clear();
+                }
+                ui.small("Measured profile width in camera pixels; blended or unresolved lines can give biased widths. Selection clears when the camera geometry changes.");
+            });
+        ui.separator();
+    }
+
     pub fn view_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label("Preview zoom");
+            ui.add(egui::Slider::new(&mut self.preview_zoom, 1.0..=3.0).suffix("×"));
+            ui.small("Scroll horizontally to see the full width when enlarged.");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Preview stretch");
+            let mut want = self.preview_stretch;
+            ui.selectable_value(&mut want, PreviewStretch::Linear, "linear");
+            ui.selectable_value(&mut want, PreviewStretch::Detail, "detail");
+            if want != self.preview_stretch {
+                self.preview_stretch = want;
+                self.send_cmd(FocusCmd::PreviewStretch(want));
+            }
+            ui.small(match self.preview_stretch {
+                PreviewStretch::Linear => "absolute level — judge exposure and clipping here",
+                PreviewStretch::Detail => {
+                    "contrast across the slit, mid-grey = flat — sharpest is best focus"
+                }
+            });
+        });
         if self.stage == Stage::Telescope && self.tele_metric == TeleMetric::LimbEdge {
             self.limb_focus_preview_ui(ui);
+            self.streak_ui(ui);
+            self.companion_ui(ui);
             let af = self.autofocus.snapshot();
             if !af.samples.is_empty() {
                 let mut curve = VCurve::new(true);
@@ -2480,9 +2751,19 @@ impl FocusState {
             }
             return;
         }
-        if !self.camera_preview_ui(ui, 260.0) {
+        let Some(tex) = &self.tex else {
+            self.camera_preview_ui(ui, 520.0);
             return;
-        }
+        };
+        let height = (ui.available_width() / tex.aspect_ratio()).min(260.0) * self.preview_zoom;
+        egui::ScrollArea::horizontal().id_salt("focus_preview_zoom").show(ui, |ui| {
+            let response = ui.add(egui::Image::new(tex)
+                .fit_to_exact_size(egui::vec2(height * tex.aspect_ratio(), height)));
+            Self::preview_side_borders(ui, response.rect);
+            self.streak_overlay(ui, response.rect);
+        });
+        self.streak_ui(ui);
+        self.companion_ui(ui);
 
         let spec_is_y = self.spectral_is_y();
         // Clone what the plots need so the borrow of self.last is released before
@@ -2534,7 +2815,7 @@ impl FocusState {
             picked,
             &spec_labels,
             SPECTRAL_COLOR,
-            170.0,
+            100.0,
         ) {
             self.picked_center = Some(x);
             self.line_mode = LineMode::Manual;
@@ -2556,7 +2837,7 @@ impl FocusState {
             slit_picked,
             &[],
             SLIT_COLOR,
-            150.0,
+            85.0,
         ) {
             self.slit_picked_center = Some(x);
             self.slit_line_mode = LineMode::Manual;
@@ -2576,7 +2857,7 @@ impl FocusState {
             let kh: Vec<f64> = slit_track.history.iter().copied().collect();
             let (smin, kmin) = (spec_track.min_hold, slit_track.min_hold);
             Plot::new("focus_trend")
-                .height(110.0)
+                .height(70.0)
                 .allow_scroll(false)
                 .show(ui, |p| {
                     let sp: PlotPoints =
@@ -3087,10 +3368,16 @@ fn worker(
     exposure_us: u32,
     gain: u16,
     auto_exposure: bool,
+    bit_depth: u8,
+    preview_stretch_initial: PreviewStretch,
     dispersion_horizontal: bool,
     frame_pending: Arc<AtomicBool>,
 ) {
     let mut disp_h = dispersion_horizontal;
+    // Seeded from the UI, not hardcoded: a stretch chosen while the camera was
+    // stopped must survive the Start that creates this worker.
+    let mut preview_stretch = preview_stretch_initial;
+    let mut streak_target = (LineMode::Deepest, None);
     let mut cam = match open(&info) {
         Ok(c) => c,
         Err(e) => {
@@ -3105,6 +3392,22 @@ fn worker(
         info.max_height
     );
     let _ = tx.send(FocusMsg::Opened(cam.info().clone()));
+    // Depth before the stream starts: it reconfigures the readout, and the
+    // backends refuse it once running. A camera that only does 16-bit says so
+    // here, and the UI is told what is actually in force.
+    let mut cur_bits = 16u8;
+    if bit_depth != 16 {
+        match cam.set_bit_depth(bit_depth) {
+            Ok(()) => cur_bits = bit_depth,
+            Err(e) => {
+                crate::applog!("camera: {bit_depth}-bit refused, staying 16-bit: {e}");
+                let _ = tx.send(FocusMsg::Note(format!(
+                    "this camera would not read at {bit_depth}-bit: {e}"
+                )));
+            }
+        }
+    }
+    let _ = tx.send(FocusMsg::BitDepth(cur_bits));
     cam.set_exposure_us(exposure_us).ok();
     cam.set_gain(gain).ok();
     cam.set_auto_exposure(auto_exposure).ok();
@@ -3131,6 +3434,26 @@ fn worker(
     let mut fps_frames: u32 = 0;
     let mut fps_since = Instant::now();
     let mut live_fps: f64 = 0.0;
+    // Live analysis runs on its own thread. A rendezvous channel: a frame is
+    // handed over only if that thread is idle and waiting, so the preview is
+    // always the newest frame it could take and the capture loop never
+    // blocks or queues on it.
+    let (analysis_tx, analysis_rx) = std::sync::mpsc::sync_channel::<AnalysisJob>(0);
+    let analysis = {
+        let tx = tx.clone();
+        let frame_pending = frame_pending.clone();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("focus-analysis".into())
+            .spawn(move || analysis_worker(analysis_rx, tx, frame_pending, ctx))
+    };
+    let analysis = match analysis {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = tx.send(FocusMsg::Error(format!("could not start focus analysis: {error}")));
+            return;
+        }
+    };
     // A geometry change replaces the device handle, and a fresh handle has
     // none of these — track the live values so they can be re-applied.
     let mut cur_exp = exposure_us;
@@ -3170,6 +3493,52 @@ fn worker(
                     }
                 }
                 FocusCmd::Dispersion(h) => disp_h = h,
+                FocusCmd::StreakTarget(mode, picked) => streak_target = (mode, picked),
+                FocusCmd::PreviewStretch(mode) => {
+                    preview_stretch = mode;
+                }
+                FocusCmd::BitDepth(bits) => {
+                    // Same rule as the ROI: the readout cannot change under a
+                    // recording, whose SER header fixed the sample size at its
+                    // first frame.
+                    if active_ser.is_some() || pending_ser.is_some() {
+                        let _ = tx.send(FocusMsg::Error(
+                            "the sensor bit depth cannot change while recording".into(),
+                        ));
+                        let _ = tx.send(FocusMsg::BitDepth(cur_bits));
+                    } else if bits == cur_bits {
+                        let _ = tx.send(FocusMsg::BitDepth(cur_bits));
+                    } else {
+                        crate::applog!("camera: bit depth {cur_bits} -> {bits}");
+                        // set_bit_depth needs the stream stopped, and the
+                        // geometry must be reinstated on the fresh handle the
+                        // reopen inside apply_roi hands back. start() re-applies
+                        // the depth from the backend's own field, so the order
+                        // here is: stop, request, then rebuild the stream.
+                        cam.stop();
+                        match cam.set_bit_depth(bits) {
+                            Ok(()) => cur_bits = bits,
+                            Err(e) => {
+                                crate::applog!("camera: set_bit_depth({bits}) FAILED: {e}");
+                                let _ = tx.send(FocusMsg::Error(format!(
+                                    "this camera would not read at {bits}-bit: {e}"
+                                )));
+                            }
+                        }
+                        let settings = CamSettings {
+                            exposure_us: cur_exp,
+                            gain: cur_gain,
+                            auto_exposure: cur_auto,
+                        };
+                        if let Err(error) = apply_roi(&mut *cam, current_roi, settings) {
+                            let _ = tx.send(FocusMsg::Error(format!(
+                                "the camera did not restart after the bit-depth change: {error}"
+                            )));
+                            return;
+                        }
+                        let _ = tx.send(FocusMsg::BitDepth(cur_bits));
+                    }
+                }
                 FocusCmd::LiveRoi {
                     capture_height,
                     anchor_y,
@@ -3269,7 +3638,7 @@ fn worker(
                     // them, so the state at each capture start is worth a line
                     // in the log to settle what actually changes.
                     crate::applog!(
-                        "ser: start {} (sensor {}x{}+{}+{}, {}) exposure {:?} us, gain {:?}, speed {:?}, live {:.1} fps",
+                        "ser: start {} (sensor {}x{}+{}+{}, {}, {cur_bits}-bit) exposure {:?} us, gain {:?}, speed {:?}, live {:.1} fps",
                         path.display(),
                         current_roi.w,
                         current_roi.h,
@@ -3363,6 +3732,7 @@ fn worker(
                         &info.name,
                         "Spectroheliograph",
                         64,
+                        cur_bits as u32,
                     ) {
                         Ok(recorder) => {
                             let _ = tx.send(FocusMsg::RecordingStarted {
@@ -3434,94 +3804,35 @@ fn worker(
                     let _ = tx.send(FocusMsg::RecordingError(error));
                 }
 
-                // Always acquire (and therefore drain the camera/SDK), but do
-                // not spend time processing or queueing another preview while
-                // egui still has one waiting. This bounds preview latency.
+                // Always acquire (and therefore drain the camera/SDK); analysis
+                // happens elsewhere. The SDK keeps only the newest frame, so
+                // any time spent here is frames lost from the scan — this
+                // thread only snapshots what needs the camera handle and hands
+                // the frame over. A busy analysis thread costs a preview,
+                // never a recorded frame; a waiting preview in egui costs
+                // nothing at all.
                 if frame_pending.load(Ordering::Acquire) {
                     continue;
                 }
-                // Both axes, every frame: the two line families separate cleanly
-                // because averaging one axis cancels lines parallel to it.
-                let prof_x = frame.mean_profile(true); // dips = vertical lines
-                let prof_y = frame.mean_profile(false); // dips = horizontal lines
-                let lines_x: Vec<Fit> = fit_lines_1d(&prof_x, 0.02)
-                    .into_iter()
-                    .map(Fit::from)
-                    .collect();
-                let lines_y: Vec<Fit> = fit_lines_1d(&prof_y, 0.02)
-                    .into_iter()
-                    .map(Fit::from)
-                    .collect();
-                let mean = if prof_x.is_empty() {
-                    0.0
-                } else {
-                    (prof_x.iter().map(|&v| v as f64).sum::<f64>() / prof_x.len() as f64) as f32
-                };
-                let peak = robust_peak_signal(&frame.data);
-                // Stage B: cut the frame along the slit using continuum
-                // dispersion positions only. The line core is low-contrast
-                // chromosphere and its focus curve is flattened by scattered
-                // light; the continuum carries granulation and a hard limb.
-                let spec_prof = if disp_h { &prof_x } else { &prof_y };
-                let mask = focusmetrics::continuum_mask(spec_prof);
-                let n_continuum = mask.iter().filter(|&&m| m).count();
-                let slit_cut = focusmetrics::slit_profile_continuum(
-                    &frame.data,
-                    frame.width,
-                    frame.height,
+                let job = AnalysisJob {
                     disp_h,
-                    &mask,
-                );
-                let limb_width = focusmetrics::outer_limb_width(&slit_cut);
-                let mut limb_widths = [None; 2];
-                for (side, region) in focusmetrics::limb_regions(&slit_cut) {
-                    limb_widths[side] = focusmetrics::limb_edge_width(&slit_cut[region]);
-                }
-                let structure = focusmetrics::structure_split(&slit_cut);
-
-                let (strip, sw, sh) = make_strip(&frame);
-                let cur_exposure = cam.current_exposure_us();
-                let cur_gain = cam.current_gain();
-                let update = Box::new(FocusUpdate {
-                    clipped: peak >= 65000.0 || focusmetrics::clipped_frame(&frame.data),
-                    captured_at: Instant::now().checked_sub(
-                        std::time::SystemTime::now().duration_since(frame.host_time).unwrap_or_default()
-                            + std::time::Duration::from_micros(cur_exposure.unwrap_or(cur_exp) as u64)
-                    ).unwrap_or_else(Instant::now),
-                    limb_widths,
+                    streak_target,
+                    preview_stretch,
+                    live_fps,
+                    cur_exposure: cam.current_exposure_us(),
+                    cur_gain: cam.current_gain(),
+                    exposure_fallback: cur_exp,
                     hw_roi_active: live_roi.is_some()
                         || active_ser
                             .as_ref()
                             .map(|active| active.hw_roi_y0.is_some())
                             .unwrap_or(false),
-                    slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
-                    n_continuum,
-                    limb_width,
-                    structure,
-                    strip,
-                    strip_w: sw,
-                    strip_h: sh,
-                    prof_x: prof_x.iter().map(|&v| v as f32).collect(),
-                    prof_y: prof_y.iter().map(|&v| v as f32).collect(),
-                    lines_x,
-                    lines_y,
-                    mean,
-                    peak,
-                    full_w: frame.width,
-                    full_h: frame.height,
-                    live_fps,
-                    cur_exposure,
-                    cur_gain,
-                });
-                if frame_pending
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    if tx.send(FocusMsg::Frame(update)).is_err() {
-                        frame_pending.store(false, Ordering::Release);
-                        break;
-                    }
-                    ctx.request_repaint();
+                    frame,
+                };
+                match analysis_tx.try_send(job) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    // The analysis thread only exits when the UI has gone.
+                    Err(TrySendError::Disconnected(_)) => break,
                 }
             }
             Err(ghostsun_camera::CameraError::Timeout) => {
@@ -3561,6 +3872,138 @@ fn worker(
     }
     crate::applog!("camera: worker exiting, closing device");
     cam.stop();
+    // Closing the channel ends the analysis thread after its current pass.
+    drop(analysis_tx);
+    let _ = analysis.join();
+}
+
+/// Everything one analysis pass needs. Gathered on the capture thread, which
+/// owns the camera handle, and moved whole to the analysis thread.
+struct AnalysisJob {
+    frame: ghostsun_camera::Frame,
+    disp_h: bool,
+    streak_target: (LineMode, Option<f64>),
+    preview_stretch: PreviewStretch,
+    live_fps: f64,
+    cur_exposure: Option<u32>,
+    cur_gain: Option<u16>,
+    /// Last requested exposure, for when the camera cannot report one.
+    exposure_fallback: u32,
+    hw_roi_active: bool,
+}
+
+/// Takes frames the capture thread offers and publishes one analysis at a
+/// time to the UI, gated by the same `frame_pending` flag as before.
+fn analysis_worker(
+    jobs: Receiver<AnalysisJob>,
+    tx: Sender<FocusMsg>,
+    frame_pending: Arc<AtomicBool>,
+    ctx: egui::Context,
+) {
+    while let Ok(job) = jobs.recv() {
+        let update = analyse_frame(job);
+        if frame_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if tx.send(FocusMsg::Frame(update)).is_err() {
+                frame_pending.store(false, Ordering::Release);
+                break;
+            }
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn analyse_frame(job: AnalysisJob) -> Box<FocusUpdate> {
+    let AnalysisJob {
+        frame,
+        disp_h,
+        streak_target,
+        preview_stretch,
+        live_fps,
+        cur_exposure,
+        cur_gain,
+        exposure_fallback,
+        hw_roi_active,
+    } = job;
+        // Both axes, every frame: the two line families separate cleanly
+        // because averaging one axis cancels lines parallel to it.
+        let prof_x = frame.mean_profile(true); // dips = vertical lines
+        let prof_y = frame.mean_profile(false); // dips = horizontal lines
+        let lines_x: Vec<Fit> = fit_lines_1d(&prof_x, 0.02)
+            .into_iter()
+            .map(Fit::from)
+            .collect();
+        let lines_y: Vec<Fit> = fit_lines_1d(&prof_y, 0.02)
+            .into_iter()
+            .map(Fit::from)
+            .collect();
+        let mean = if prof_x.is_empty() {
+            0.0
+        } else {
+            (prof_x.iter().map(|&v| v as f64).sum::<f64>() / prof_x.len() as f64) as f32
+        };
+        let peak = robust_peak_signal(&frame.data);
+        // Stage B: cut the frame along the slit using continuum
+        // dispersion positions only. The line core is low-contrast
+        // chromosphere and its focus curve is flattened by scattered
+        // light; the continuum carries granulation and a hard limb.
+        let spec_prof = if disp_h { &prof_x } else { &prof_y };
+        let mask = focusmetrics::continuum_mask(spec_prof);
+        let n_continuum = mask.iter().filter(|&&m| m).count();
+        let slit_cut = focusmetrics::slit_profile_continuum(
+            &frame.data,
+            frame.width,
+            frame.height,
+            disp_h,
+            &mask,
+        );
+        let limb_width = focusmetrics::outer_limb_width(&slit_cut);
+        let mut limb_widths = [None; 2];
+        for (side, region) in focusmetrics::limb_regions(&slit_cut) {
+            limb_widths[side] = focusmetrics::limb_edge_width(&slit_cut[region]);
+        }
+        let structure = focusmetrics::structure_split(&slit_cut);
+        let clipped = peak >= 65000.0 || focusmetrics::clipped_frame(&frame.data);
+        let streak_lines = if disp_h { &lines_x } else { &lines_y };
+        let streak_line = if streak_target.0 == LineMode::Manual {
+            companion_line(streak_lines, streak_target.1)
+        } else { choose(streak_lines, streak_target.0, None) };
+        let streaks = if clipped { None } else { streak_line.and_then(|line| {
+            crate::streakquality::measure(&frame.data, frame.width, frame.height,
+                disp_h, line.center, line.fwhm, &slit_cut)
+        }) };
+
+        let (strip, sw, sh) = make_strip(&frame, preview_stretch, disp_h);
+        Box::new(FocusUpdate {
+            streaks,
+            clipped,
+            captured_at: Instant::now().checked_sub(
+                std::time::SystemTime::now().duration_since(frame.host_time).unwrap_or_default()
+                    + std::time::Duration::from_micros(cur_exposure.unwrap_or(exposure_fallback) as u64)
+            ).unwrap_or_else(Instant::now),
+            limb_widths,
+            hw_roi_active,
+            slit_cut: slit_cut.iter().map(|&v| v as f32).collect(),
+            n_continuum,
+            limb_width,
+            structure,
+            strip,
+            strip_w: sw,
+            strip_h: sh,
+            prof_x: prof_x.iter().map(|&v| v as f32).collect(),
+            prof_y: prof_y.iter().map(|&v| v as f32).collect(),
+            lines_x,
+            lines_y,
+            mean,
+            peak,
+            full_w: frame.width,
+            full_h: frame.height,
+            live_fps,
+            cur_exposure,
+            cur_gain,
+        })
 }
 
 fn finish_ser(active: ActiveSer, tx: &Sender<FocusMsg>) {
@@ -3761,7 +4204,29 @@ fn vertical_crop_bounds(
     (y0, height)
 }
 
-fn make_strip(frame: &ghostsun_camera::Frame) -> (Vec<u8>, usize, usize) {
+/// How the live preview maps sensor counts to grey.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PreviewStretch {
+    /// Min-to-max over the strip. Shows absolute level, so it is the one to
+    /// judge exposure and clipping on.
+    Linear,
+    /// Fractional contrast across the slit, mid-grey = flat.
+    ///
+    /// Solar structure along the slit is only a couple of percent of the
+    /// continuum, and a linear ramp spanning line core to continuum gives it
+    /// about five of 255 grey levels — invisible. Dividing by a baseline
+    /// smoothed ALONG THE SLIT leaves exactly that structure, and it is
+    /// divided rather than subtracted so the dim line core and the bright
+    /// continuum are shown at the same contrast rather than the core being
+    /// crushed.
+    Detail,
+}
+
+fn make_strip(
+    frame: &ghostsun_camera::Frame,
+    stretch: PreviewStretch,
+    dispersion_horizontal: bool,
+) -> (Vec<u8>, usize, usize) {
     let (fw, fh) = (frame.width, frame.height);
     if fw == 0 || fh == 0 {
         return (Vec::new(), 0, 0);
@@ -3781,12 +4246,142 @@ fn make_strip(frame: &ghostsun_camera::Frame) -> (Vec<u8>, usize, usize) {
             hi = hi.max(v);
         }
     }
-    let span = (hi.saturating_sub(lo)).max(1) as f32;
-    let out: Vec<u8> = samp
+    if stretch == PreviewStretch::Linear {
+        let span = (hi.saturating_sub(lo)).max(1) as f32;
+        let out: Vec<u8> = samp
+            .iter()
+            .map(|&v| (((v.saturating_sub(lo)) as f32 / span) * 255.0).clamp(0.0, 255.0) as u8)
+            .collect();
+        return (out, sw, sh);
+    }
+    (detail_strip(&samp, sw, sh, dispersion_horizontal), sw, sh)
+}
+
+/// Box-average `win` samples along the dispersion axis, in place.
+///
+/// Display only, and deliberately one-directional: it raises the visibility of
+/// along-slit structure without touching its sharpness along the slit, which
+/// is the thing the focuser changes.
+fn smooth_across_dispersion(
+    data: &mut [f32],
+    sw: usize,
+    sh: usize,
+    dispersion_horizontal: bool,
+    win: usize,
+) {
+    // Walk along dispersion: x when it runs horizontally, y otherwise.
+    let (lines, len, stride, step) = if dispersion_horizontal {
+        (sh, sw, sw, 1usize) // one row per slit position, walking across x
+    } else {
+        (sw, sh, 1usize, sw) // one column per slit position, walking down y
+    };
+    if win < 3 || len < win {
+        return;
+    }
+    let half = win / 2;
+    let mut line = vec![0f32; len];
+    for l in 0..lines {
+        let base = l * stride;
+        for (i, slot) in line.iter_mut().enumerate() {
+            *slot = data[base + i * step];
+        }
+        let mut acc: f64 = line[..half.min(len)].iter().map(|&v| v as f64).sum();
+        let mut count = half.min(len);
+        for i in 0..len {
+            if i + half < len {
+                acc += line[i + half] as f64;
+                count += 1;
+            }
+            if i > half {
+                acc -= line[i - half - 1] as f64;
+                count -= 1;
+            }
+            data[base + i * step] = (acc / count.max(1) as f64) as f32;
+        }
+    }
+}
+
+/// Fractional-contrast rendering of a downsampled strip.
+///
+/// The baseline is a box mean along the slit, wide enough to leave the
+/// structure alone (it lives at a few pixels) while following vignetting and
+/// limb darkening (hundreds). The final stretch is a fixed multiple of the
+/// residual RMS rather than a percentile: a percentile recomputed per frame
+/// visibly breathes, and a steady scale is what makes a change at the focuser
+/// readable.
+fn detail_strip(samp: &[u16], sw: usize, sh: usize, dispersion_horizontal: bool) -> Vec<u8> {
+    // Dispersion along x means the slit runs down y, and structure along the
+    // slit then draws horizontal lines; the baseline follows the same axis.
+    let (lines, len, stride, step) = if dispersion_horizontal {
+        (sw, sh, 1usize, sw) // one line per column, walking down
+    } else {
+        (sh, sw, sw, 1usize) // one line per row, walking across
+    };
+    let win = (len / 24).max(9) | 1;
+    let half = win / 2;
+    let mut baseline = vec![0f32; sw * sh];
+    let mut line = vec![0f32; len];
+    let mut peak = 0f32;
+    for l in 0..lines {
+        let base = l * stride;
+        for (i, slot) in line.iter_mut().enumerate() {
+            *slot = samp[base + i * step] as f32;
+        }
+        // Running box mean, edges shrinking rather than wrapping.
+        let mut acc: f64 = line[..half.min(len)].iter().map(|&v| v as f64).sum();
+        let mut count = half.min(len);
+        for i in 0..len {
+            if i + half < len {
+                acc += line[i + half] as f64;
+                count += 1;
+            }
+            if i > half {
+                acc -= line[i - half - 1] as f64;
+                count -= 1;
+            }
+            let mean = (acc / count.max(1) as f64) as f32;
+            baseline[base + i * step] = mean;
+            peak = peak.max(mean);
+        }
+    }
+    // Beyond the ends of the slit there is no signal, only read noise, and a
+    // ratio there amplifies it to full scale — which both looks alarming and,
+    // by dominating the RMS, crushes the real structure. Gate on illumination
+    // and render everything outside it flat.
+    let gate = 0.25 * peak;
+    let mut residual = vec![0f32; sw * sh];
+    let mut sum_sq = 0f64;
+    let mut counted = 0usize;
+    for (i, (&v, &mean)) in samp.iter().zip(&baseline).enumerate() {
+        if mean <= gate || mean <= 0.0 {
+            continue;
+        }
+        let r = v as f32 / mean - 1.0;
+        residual[i] = r;
+        sum_sq += (r as f64) * (r as f64);
+        counted += 1;
+    }
+    // Structure along the slit is coherent ACROSS dispersion — one slit
+    // position is bright at many wavelengths — while read noise is not. On
+    // this camera the per-pixel SNR of that structure is around 0.4, so the
+    // eye is shown three times more noise than signal; averaging a few
+    // dispersion rows lifts it by the square root of the count. It costs
+    // nothing that matters, because focus sharpness lives along the SLIT and
+    // this smooths the perpendicular axis only.
+    let blur = (lines / 32).max(3) | 1;
+    smooth_across_dispersion(&mut residual, sw, sh, dispersion_horizontal, blur);
+    let rms = if counted == 0 {
+        0.0
+    } else {
+        (sum_sq / counted as f64).sqrt() as f32
+    };
+    // A floor keeps a genuinely flat frame grey instead of amplifying its
+    // read noise to full scale.
+    let scale = 1.0 / (2.5 * rms).max(0.004);
+    residual
         .iter()
-        .map(|&v| (((v.saturating_sub(lo)) as f32 / span) * 255.0).clamp(0.0, 255.0) as u8)
-        .collect();
-    (out, sw, sh)
+        .map(|&r| ((r * scale * 0.5 + 0.5) * 255.0).clamp(0.0, 255.0) as u8)
+        .collect()
 }
 
 /// Mean of the brightest one percent of a 16-bit frame.
@@ -3988,6 +4583,7 @@ mod tests {
 
     fn blank_update() -> FocusUpdate {
         FocusUpdate {
+            streaks: None,
             captured_at: Instant::now(),
             limb_widths: [None; 2],
             clipped: false,
@@ -4039,6 +4635,40 @@ mod tests {
             sigma: fwhm / 2.3548,
             continuum: 1000.0,
         }
+    }
+
+    #[test]
+    fn companion_stays_on_selected_line_and_rejects_missing_or_invalid_fits() {
+        let primary = Fit { center: 60.0, ..fit_deep(12.0, 0.5) };
+        let companion = Fit { center: 30.5, ..fit_deep(2.5, 0.08) };
+        assert_eq!(companion_line(&[primary, companion], Some(30.0)).unwrap().center, 30.5);
+        assert!(companion_line(&[primary], Some(30.0)).is_none());
+        assert!(companion_line(&[companion], None).is_none());
+        assert!(companion_line(&[Fit { fwhm: f64::NAN, ..companion }], Some(30.0)).is_none());
+    }
+
+    #[test]
+    fn companion_readout_retains_five_seconds_then_expires() {
+        let now = Instant::now();
+        let mut readouts = EdgeReadouts::default();
+        readouts.push(now, [Some(2.0), None]);
+        readouts.push(now + std::time::Duration::from_secs(4), [Some(4.0), None]);
+        assert_eq!(readouts.get(0, now + std::time::Duration::from_secs(4)), Some(3.0));
+        assert_eq!(readouts.get(0, now + std::time::Duration::from_secs(5)), Some(4.0));
+        assert_eq!(readouts.get(0, now + std::time::Duration::from_secs(9)), None);
+    }
+
+    #[test]
+    fn streak_summary_includes_zero_detections_and_expires_stale_scores() {
+        let now = Instant::now();
+        let mut state = FocusState::default();
+        state.streak_history.push_back((now, 2.0, 4.0));
+        state.streak_history.push_back((now + std::time::Duration::from_secs(4), 0.0, 0.0));
+        assert_eq!(state.streak_summary(now + std::time::Duration::from_secs(4)), Some((1.0, 2.0)));
+        assert_eq!(state.streak_summary(now + std::time::Duration::from_secs(5)), Some((0.0, 0.0)));
+        assert_eq!(state.streak_summary(now + std::time::Duration::from_secs(9)), None);
+        state.reset_holds();
+        assert!(state.streak_history.is_empty());
     }
 
     #[test]

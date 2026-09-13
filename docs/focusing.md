@@ -287,6 +287,56 @@ value, bank a third point, and it will bracket.
 
 ## Stage B — telescope
 
+### Live companion spectral width
+
+Both focus stages show an independent **Companion spectral line** readout.
+The camera preview starts at 2× its previous height. **Preview zoom** adjusts
+the enlargement from 1× to 3×; scroll horizontally if the enlarged image is
+wider than the panel. The image keeps its original proportions, and the
+spectral, slit and history graphs use less vertical space.
+
+Expand **Select companion line** and click a detected absorption dip in the
+spectral profile, for example a telluric beside Hα. The main spectral focus
+target and autofocus metric are unaffected. The readout reports fitted FWHM
+in camera pixels with five-second trimmed-mean smoothing.
+
+The measurement requires a detected line deeper than 3% and within three
+pixels of the selected position. Missing or clipped fits show unavailable;
+the selection does not follow a distant stronger line. Camera restart, ROI
+changes and dispersion-axis changes clear the selection. These are observed
+profile widths, including instrumental broadening and possible blends, not
+an intrinsic line-width calibration.
+
+### Live streak clarity
+
+Both stages show **Streak clarity · experimental** below the enlarged preview.
+The deepest detected absorption line is used by default. Enable **Use main
+spectral target** to follow the line chosen by the spectral-target controls or
+by clicking the main spectral plot. Clarity is a noise-subtracted spatial
+gradient in percent continuum per camera pixel: higher values indicate sharper,
+higher-contrast line-local structure. Compare at the same pointing, exposure,
+gain and camera geometry; it is not an absolute image-quality rating.
+
+The score uses a five-second trimmed mean. The separate count shows the
+five-second mean number of detected regions and the current count. Blue boxes
+mark detections; green boxes mark tracks with evidence of movement. **Moving
+only** filters the score and average count to those moving tracks, which can
+help exclude stationary slit dust. Motion requires at least five observations
+over 300 ms, with a robust excursion greater than three camera pixels or a
+quarter of the feature width, whichever is larger. A gap of 750 ms restarts
+tracking. This can miss motion faster than the delivered preview rate.
+
+The calculation normalizes raw intensities using the continuum at each slit
+position, removes slowly varying line structure, and requires residuals across
+adjacent wavelength pixels above a noise threshold. Saturated frames, cropped
+line windows and insufficient illumination are unavailable rather than scored.
+Target, exposure, gain and geometry changes reset the history. Stationary solar
+features can also be excluded by the motion filter; moving artefacts can pass.
+These are candidate structure counts, not identified filaments or calibrated
+Doppler velocities. The metric has synthetic regression tests; repeatability
+as a real-sky focusing indicator still needs validation. No accelerometer or
+gyroscope is required by this image-based implementation.
+
 ### ToupTek USB autofocus
 
 GhostSun can control a ToupTek AAF directly through the bundled ToupCam SDK on
@@ -370,7 +420,7 @@ With **limb edge** selected, the telescope view highlights the detected outer
 solar boundaries in orange and shows enlarged live crops of those regions.
 The spectral/dust plots are hidden in this view. Only the highlighted regions
 contribute to the limb score; interior disc structure is excluded. Each crop
-shows FWHM smoothed over the last 1,000 ms of valid measurements. The outer
+shows FWHM smoothed over the last 5 seconds of valid measurements. The outer
 10% at either end are trimmed to suppress brief fit spikes; this affects the
 display only. Autofocus uses the raw measurements, while the main readout retains the burst-based
 best-decile measurement. When both limb fits are valid, their widths are averaged.
