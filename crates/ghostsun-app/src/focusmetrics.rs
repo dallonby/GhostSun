@@ -424,7 +424,9 @@ mod tests {
         // Display pixels are a detection regression, not a calibrated FWHM.
         let source: Vec<f64> = include_str!("../tests/data/solar_limb_profile.csv")
             .split(|c| c == ',' || c == '\n')
-            .filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
+            // Trim: a Windows checkout gives the fixture CRLF endings, and the
+            // stray '\r' made the last value on each line fail to parse.
+            .map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse().unwrap()).collect();
         for scale in [1, 2, 4] {
             let profile: Vec<_> = (0..source.len() * scale).map(|i| {
                 let x = i / scale;
